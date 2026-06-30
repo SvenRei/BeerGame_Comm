@@ -48,6 +48,35 @@ ADJ_TOPOLOGIES = {
                            [1.0, 0.0, 0.0, 0.0],
                            [1.0, 0.0, 0.0, 0.0],
                            [1.0, 0.0, 0.0, 0.0]],
+
+    # upstream_only: each stage hears ONLY its immediate DOWNSTREAM neighbor (the one closer to
+    # the customer). Demand belief propagates UP the chain, hop by hop -- the Lee-correct direction.
+    # This is the realistic VMI-style local sharing and the theory-predicted beneficial geometry.
+    "upstream_only":   [[0.0, 0.0, 0.0, 0.0],   # retailer hears no one (observes demand directly)
+                        [1.0, 0.0, 0.0, 0.0],   # wholesaler  <- retailer
+                        [0.0, 1.0, 0.0, 0.0],   # distributor <- wholesaler
+                        [0.0, 0.0, 1.0, 0.0]],  # manufacturer<- distributor
+
+    # downstream_only: each stage hears ONLY its immediate UPSTREAM neighbor (its supplier). Info
+    # flows DOWN -- the WRONG direction for demand sharing (you'd be hearing a MORE-distorted upstream
+    # belief). A sharper placebo than no_neighbor: ADJACENT but wrong-direction, isolating direction alone.
+    "downstream_only": [[0.0, 1.0, 0.0, 0.0],   # retailer    <- wholesaler  (useless: already sees demand)
+                        [0.0, 0.0, 1.0, 0.0],   # wholesaler  <- distributor
+                        [0.0, 0.0, 0.0, 1.0],   # distributor <- manufacturer
+                    [0.0, 0.0, 0.0, 0.0]],  # manufacturer hears no one
+    # manufacturer_broadcast: directional MIRROR of retailer_broadcast -- the LEAST-informed stage
+    # broadcasts to everyone. Its belief is the most bullwhip-distorted, so this should NOT help.
+    # A decisive control: retailer_broadcast helping while this does not pins the value to the clean
+    # demand signal, not to "broadcasting" per se.
+    "manufacturer_broadcast": [[0.0, 0.0, 0.0, 1.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                            [0.0, 0.0, 0.0, 0.0]],
+
+    # single-link probes: share at ONE link only, to ask whether the value concentrates at the
+    # most-upstream link (worst bullwhip) vs the cleanest downstream link.
+    "link_top_only":    [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,1,0]],  # only manufacturer <- distributor
+    "link_bottom_only": [[0,0,0,0],[1,0,0,0],[0,0,0,0],[0,0,0,0]],  # only wholesaler 
 }
 
 

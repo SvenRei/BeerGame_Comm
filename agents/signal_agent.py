@@ -68,20 +68,36 @@ def order_from_S(S, obs, max_order):
 # Actor: GRU belief + linear base-stock head + linear demand readout + message  #
 # ============================================================================ #
 class SIGNALActor(nn.Module):
-    def __init__(self, obs_dim, msg_dim, hidden, content, learned_msg_dim=3):
+    def __init__(self, obs_dim, msg_dim, hidden, content, learned_msg_dim=3, s_init=50.0,
+                 log_std_init=-0.5, use_dhat_head=False, dhat_coef=5.0, dhat_init=0.0):
         super().__init__()
         self.content = content
         self.msg_dim = msg_dim
         self.hidden = hidden
+        self.use_dhat_head = bool(use_dhat_head)
         # (1) BELIEF. Input = [local obs, received message] so communication can update the belief.
         #     One GRU layer; its hidden state is the entire memory the agent has. No KL, no ELBO.
         self.gru = nn.GRU(obs_dim + msg_dim, hidden)                 # (seq, batch, feat)
         # (2) BASE-STOCK HEAD. ONE linear layer -> scalar S (softplus = positivity link only).
-        self.head = nn.Linear(obs_dim + hidden + msg_dim, 1)
-        self.log_std = nn.Parameter(torch.zeros(1) - 0.5)            # learnable exploration noise on S
-        # (3) DEMAND READOUT. Linear belief -> d_hat (>=0). Serves as the 'dhat' message AND is
-        #     lightly grounded against realized demand so the message stays interpretable.
+        #     use_dhat_head appends the SMOOTHED, grounded demand estimate d_hat to the head input so S
+        #     can condition on the demand regime: S ~= dhat_coef*d_hat + safety (textbook (lead+1)*demand
+        #     + safety). Using d_hat -- not raw last_demand -- keeps Poisson noise OUT of S (no bullwhip).
+        #     This is the deliberate demand->S coupling (OFF by default): the sweep showed optimization
+        #     alone cannot make the constant base-stock adapt, and the retailer fails to scale S even
+        #     with perfect local demand. It also gives COMM a path to S: a received message updates the
+        #     belief h -> d_hat -> S, so sharing can change ordering (testable with topology/AR1).
+        head_in = obs_dim + hidden + msg_dim + (1 if self.use_dhat_head else 0)
+        self.head = nn.Linear(head_in, 1)
+        nn.init.constant_(self.head.bias, float(s_init))            # safety floor / constant level
+        if self.use_dhat_head:
+            with torch.no_grad():
+                self.head.weight[0, -1] = float(dhat_coef)         # weight on the appended d_hat ~ lead+1
+        self.log_std = nn.Parameter(torch.zeros(1) + float(log_std_init))   # exploration noise on S (init std=exp(log_std_init))
+        # (3) DEMAND READOUT. Linear belief -> d_hat (>=0). The 'dhat' message, grounded to realized
+        #     demand by the aux loss, AND (if use_dhat_head) the driver of the base-stock above.
         self.d_head = nn.Linear(hidden, 1)
+        if dhat_init:                                               # start d_hat ~ mean demand (softplus link)
+            nn.init.constant_(self.d_head.bias, float(dhat_init))
         # (4) LEARNED message head: ONLY built for the interpretability-control rung.
         self.msg_head = (nn.Linear(obs_dim + hidden, learned_msg_dim)
                          if content == "learned" else None)
@@ -94,16 +110,24 @@ class SIGNALActor(nn.Module):
         return F.softplus(self.d_head(h))
 
     def base_stock(self, obs, h, msg):                             # -> (S_mu>=0, S_std)
-        S_mu = F.softplus(self.head(torch.cat([obs, h, msg], dim=-1)))
+        feats = [obs, h, msg] + ([self.demand_estimate(h)] if self.use_dhat_head else [])
+        S_mu = F.softplus(self.head(torch.cat(feats, dim=-1)))
         return S_mu, self.log_std.exp().clamp(1e-2, 3.0)
 
     def message(self, obs, h):
-        """The semantic ladder. Each rung is a NAMED supply-chain signal except 'learned'."""
-        IP = (obs[..., 0:1] - obs[..., 1:2] + obs[..., 2:3]) / 100.0       # inventory-position signal (VMI)
-        dh = self.demand_estimate(h) / 100.0                              # demand signal (Lee)
+        """The semantic ladder. Each rung is a NAMED supply-chain signal except 'learned'.
+        SCALE: the named messages ride at NATURAL units (demand/inventory, ~O(10)) so they are
+        COMMENSURATE with the raw-unit observations they sit beside in the receiver's GRU input and
+        base-stock head. An earlier /100 scaling made the message ~100x smaller than obs, so the
+        receiver could not give it usable weight -- the positive-listening probe read dS/dmsg ~ 0
+        (honest messages, but the agent was deaf). See eval_signal.positive_listening + _MSG_SCALE."""
+        IP = (obs[..., 0:1] - obs[..., 1:2] + obs[..., 2:3])              # inventory-position signal (VMI), natural units
+        dh = self.demand_estimate(h)                                     # demand signal (Lee), natural units
         if self.content == "dhat":     return dh
         if self.content == "ip":       return IP
         if self.content == "dhat_ip":  return torch.cat([dh, IP], dim=-1)
+        # 'learned' stays tanh-bounded (the interpretability control); it rides at O(1), so to make it
+        # commensurate with obs it would need a gain -- out of scope for the dhat/ip listening fix.
         if self.content == "learned":  return torch.tanh(self.msg_head(torch.cat([obs, h], dim=-1)))
         raise ValueError(self.content)
 
@@ -135,8 +159,15 @@ class SIGNALTrainer:
         self.msg_dim = msg_dim_of(self.content, cfg.get("learned_msg_dim", 3))
         self.adj = torch.tensor(adj, dtype=torch.float32, device=self.device)     # row-stochastic topology
         H = int(cfg.get("hidden", 64))
+        s_init = float(cfg.get("s_init", 50.0))                    # base-stock head bias / safety term (see SIGNALActor)
+        log_std_init = float(cfg.get("log_std_init", -0.5))        # initial exploration std on S = exp(log_std_init)
+        use_dhat_head = bool(cfg.get("use_dhat_head", False))      # condition S on the smoothed d_hat (regime-adaptive)
+        dhat_coef = float(cfg.get("dhat_coef", 5.0))               # init weight on d_hat in the S-head (~ lead+1)
+        dhat_init = float(cfg.get("dhat_init", 0.0))               # init d_hat ~ mean demand so S starts sensible
         self.actors = nn.ModuleList([                              # per-agent actors (chain is heterogeneous)
-            SIGNALActor(obs_dim, self.msg_dim, H, self.content, cfg.get("learned_msg_dim", 3))
+            SIGNALActor(obs_dim, self.msg_dim, H, self.content, cfg.get("learned_msg_dim", 3),
+                        s_init=s_init, log_std_init=log_std_init, use_dhat_head=use_dhat_head,
+                        dhat_coef=dhat_coef, dhat_init=dhat_init)
             for _ in range(n_agents)]).to(self.device)
         self.critic = SIGNALCritic(state_dim, H, n_agents).to(self.device)
         # --- optimisation (textbook PPO) ---
@@ -145,6 +176,10 @@ class SIGNALTrainer:
         self.ent_coef = float(cfg.get("entropy_coef", 0.0)); self.vf_coef = float(cfg.get("vf_coef", 0.5))
         self.aux_coef = float(cfg.get("aux_coef", 0.1))           # d_hat grounding (message interpretability)
         self.max_grad_norm = float(cfg.get("max_grad_norm", 0.5))
+        # reward_scale DIVIDES the shaped reward -> shrinks the critic's target/loss/gradient so it no
+        # longer dominates the shared grad-clip and starve the (standardized-advantage) actor. The gate
+        # still scores RAW env cost, so it stays comparable across reward_scale values. 1.0 = unchanged.
+        self.reward_scale = float(cfg.get("reward_scale", 1.0))
         self.params = list(self.actors.parameters()) + list(self.critic.parameters())
         self.opt = torch.optim.Adam(self.params, lr=float(cfg.get("lr", 3e-4)))
         # --- economics layer (independent of the agent) ---
@@ -221,7 +256,7 @@ class SIGNALTrainer:
             back = d["obs"][..., 1]                                # [T,N] backlog (obs index 1)
             transfer = self.tau_vec * back                        # paid BY each stage for its backorders
             credit = torch.zeros_like(transfer); credit[..., :-1] = transfer[..., 1:]  # credit its customer
-            d["rew"] = -(c + self.srdqn_beta * others) - transfer + credit
+            d["rew"] = (-(c + self.srdqn_beta * others) - transfer + credit) / self.reward_scale
         # (B) advantages from the centralized critic (per-agent) ------------------------------------
         with torch.no_grad():
             for d in episodes:

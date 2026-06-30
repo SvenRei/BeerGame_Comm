@@ -34,6 +34,7 @@ Run examples:
 """
 import os
 import sys
+from collections import deque
 import hydra
 import numpy as np
 import torch
@@ -96,21 +97,40 @@ def make_heldout_envs(base, A):
 
 # ------------------------------------------------------------------ refs + gate
 def load_refs(A):
-    """BAR (fixed_ref) and CEILING (oracle_ref) from results/baselines_regime_v2.json, averaged over
-    the gate lambdas. Falls back to config scalars if the json is absent. Regenerate the json with the
-    SAME cost model (env.penalty_at_retailer_only) as training, or the gap is meaningless."""
+    """BAR (fixed_ref) and CEILING (oracle_ref) for the held-out gate, resolved in THREE tiers so the
+    printed refs are never silently wrong:
+      1. per-lambda means over the GATE lambdas from results/baselines_regime_v2.json -- the ideal,
+         used only when those exact lambdas are in the json;
+      2. the json's OVERALL means (over whatever lambdas it holds) when the gate lambdas are NOT in
+         the json -- real benchmark numbers averaged over a different lambda grid (flagged as such);
+      3. the config scalars heldout_fixed_ref/heldout_oracle_ref when the json is absent/unreadable.
+    These refs are only a MONOTONE normalizer for checkpoint selection; the headline gap is scored
+    post-hoc by eval_signal on the test lambdas. Regenerate the json with the SAME cost model
+    (env.penalty_at_retailer_only) as training, or the gap is meaningless."""
     path = os.path.join(_ROOT, "results", "baselines_regime_v2.json")
+    cfg_bar = float(A.get("heldout_fixed_ref", 4726.0)); cfg_ceil = float(A.get("heldout_oracle_ref", 2202.0))
     try:
         from scripts.c1_stats import load_rungs, mean_refs
-        m = mean_refs(load_rungs(path), A.get("heldout_lambdas", None))
-        bar = m.get("BAR_static", A.get("heldout_fixed_ref", 4726.0))
-        ceil = m.get("Oracle", A.get("heldout_oracle_ref", 2202.0))
-        print(f"[signal] refs from baselines_regime_v2.json: BAR={bar:.1f}  CEILING={ceil:.1f}")
-        return float(bar), float(ceil)
-    except Exception as ex:                                          # noqa: BLE001 -- want any failure -> fallback
-        bar = float(A.get("heldout_fixed_ref", 4726.0)); ceil = float(A.get("heldout_oracle_ref", 2202.0))
-        print(f"[signal] refs json unavailable ({ex}); using config scalars BAR={bar:.1f} CEILING={ceil:.1f}")
-        return bar, ceil
+        rungs = load_rungs(path)
+        gate_lams = A.get("heldout_lambdas", None)
+        m = mean_refs(rungs, gate_lams)                              # tier 1: gate lambdas present in json
+        if "BAR_static" in m and "Oracle" in m:
+            bar, ceil = float(m["BAR_static"]), float(m["Oracle"])
+            print(f"[signal] refs from baselines_regime_v2.json @ gate lambdas {gate_lams}: "
+                  f"BAR={bar:.1f}  CEILING={ceil:.1f}")
+            return bar, ceil
+        full = mean_refs(rungs, None)                               # tier 2: json's own lambda grid
+        if "BAR_static" in full and "Oracle" in full:
+            bar, ceil = float(full["BAR_static"]), float(full["Oracle"])
+            json_lams = sorted(next(iter(rungs.values())))
+            print(f"[signal] gate lambdas {gate_lams} not in baselines_regime_v2.json; using its "
+                  f"OVERALL means (lambdas {[f'{l:g}' for l in json_lams]}): BAR={bar:.1f} CEILING={ceil:.1f}")
+            return bar, ceil
+        raise KeyError("no BAR_static/Oracle rungs in baselines_regime_v2.json")
+    except Exception as ex:                                          # noqa: BLE001 -- any failure -> config scalars
+        print(f"[signal] baselines refs unavailable ({type(ex).__name__}: {ex}); "
+              f"using config scalars BAR={cfg_bar:.1f} CEILING={cfg_ceil:.1f}")
+        return cfg_bar, cfg_ceil
 
 
 @torch.no_grad()
@@ -172,24 +192,35 @@ def main(cfg: DictConfig):
     warm_up = int(A.get("warm_up_episodes", 0))                     # 0 for SIGNAL: belief trains with policy
     eval_every = int(A.get("heldout_every", 200))
     eval_eps = int(A.get("heldout_episodes", 8))
-    best = float("inf")
+    log_every = int(A.get("log_every", 100))                        # heartbeat cadence in episodes (0 = silent between gates)
+    patience = int(A.get("patience", 0))                            # early stop: episodes w/o held-out improvement (0 = off)
+    best = float("inf"); best_ep = -1                               # we KEEP the best-gated checkpoint, never the last one
     train_rng = np.random.default_rng(cfg.seed + 12345)            # training seeds, DISJOINT from SEED_BASE
 
     batch = []
+    recent_cost = deque(maxlen=50)                                  # running TRAIN-episode team cost (liveness + learning signal)
+    last_a = last_c = float("nan")
     for ep in range(int(cfg.total_episodes)):
-        batch.append(trainer.collect(train_env, seed=int(train_rng.integers(0, 2**31 - 1))))
+        buf = trainer.collect(train_env, seed=int(train_rng.integers(0, 2**31 - 1)))
+        recent_cost.append(float(buf["cost"].sum().item()))
+        batch.append(buf)
         log = {}
         if len(batch) >= batch_eps:
             if ep >= warm_up:
-                a_loss, c_loss = trainer.update(batch)
-                log.update({"train/actor_loss": a_loss, "train/critic_loss": c_loss})
+                last_a, last_c = trainer.update(batch)
+                log.update({"train/actor_loss": last_a, "train/critic_loss": last_c})
             batch = []
+
+        # heartbeat: a long, improvement-free stretch between gates never looks like a hang again.
+        if log_every and ep % log_every == 0:
+            print(f"[signal] ep {ep}/{int(cfg.total_episodes)}  train_team_cost~{np.mean(recent_cost):.0f}"
+                  f"  a_loss={last_a:+.3f} c_loss={last_c:.0f}", flush=True)
 
         if ep > warm_up and ep % eval_every == 0:
             elog, mean_cost = heldout_eval(trainer, heldout_envs, eval_eps, fixed_ref, oracle_ref)
             log.update(elog)
-            if mean_cost < best:                                   # checkpoint on the held-out gate ONLY
-                best = mean_cost
+            if mean_cost < best:                                   # save the BEST held-out point (not the last)
+                best = mean_cost; best_ep = ep
                 torch.save({"actors": [ac.state_dict() for ac in trainer.actors],
                             "critic": trainer.critic.state_dict(),
                             "config": A, "adj": adj.tolist(),
@@ -200,13 +231,17 @@ def main(cfg: DictConfig):
                 log["Eval/best_heldout_cost"] = best
                 print(f"[signal] ep {ep}: held-out mean cost {mean_cost:.1f}  "
                       f"Gap_Recovered {elog['Eval/Gap_Recovered']:+.3f}  (checkpoint saved)")
+            elif patience and best_ep >= 0 and (ep - best_ep) >= patience:
+                print(f"[signal] EARLY STOP at ep {ep}: no held-out improvement for {ep - best_ep} eps "
+                      f"(best {best:.1f} @ ep {best_ep}; checkpoint kept)", flush=True)
+                break
 
         if log:
             log["episode"] = ep
             wandb.log(log)
 
     wandb.finish()
-    print(f"[signal] done. best held-out mean cost = {best:.1f}   ->  {run_dir}")
+    print(f"[signal] done. best held-out mean cost = {best:.1f} @ ep {best_ep}   ->  {run_dir}", flush=True)
 
 
 if __name__ == "__main__":
