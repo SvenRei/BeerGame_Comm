@@ -1,0 +1,299 @@
+"""
+signal_agent.py
+================================================================================
+SIGNAL (Strategic Information-sharing for Game-theoretic, Networked, Adaptive
+Logistics) -- a deliberately MINIMAL communicating MAPPO agent for the value-of-
+information-sharing study. The agent is an INSTRUMENT, not the contribution: it
+is kept as simple as possible so that any measured effect of communication is
+attributable to the message channel, not to architectural cleverness.
+
+Three parts, and nothing else:
+  (1) BELIEF  : one small GRU per agent over its local-observation history. The
+                hidden state IS the demand-regime belief. Trained end-to-end by
+                the policy gradient -- no separate ELBO/KL/reconstruction.
+  (2) HEAD    : ONE linear layer mapping [obs, belief, message] -> an order-up-to
+                level S. softplus is only a positivity link. No lead/safety/corr.
+  (3) MESSAGE : the semantic ladder {dhat | ip | dhat_ip | learned}, routed along
+                a topology with a one-step delay. This is the ONLY part we engineer
+                with care, because it is the object of study.
+Underneath: textbook CTDE-MAPPO (centralized per-agent critic on the global state
+during training, decentralized execution; PPO-clip; GAE). The economics layer
+(srdqn_beta cost-sharing + the coordinating transfer tau) rides on the reward in a
+few lines and is independent of the agent.
+
+DATA FLOW (one timestep t), per agent i in [retailer, wholesaler, distributor, manufacturer]:
+
+        local obs_i,t ----+
+        (4 scalars)       |
+                          v
+   incoming msg_i,t --> [ GRU ] --> belief h_i,t --+--> [ linear head ] --> S_i,t --> order_i,t = clip(S - IP)
+   (routed, 1-step delay)                          |
+                                                   +--> [ linear d-readout ] --> d_hat_i,t
+                                                                                   |
+                                          message m_i,t = ladder(d_hat, IP, learned) --> routed by ADJ (delay) --> incoming_*,t+1
+
+   TRAINING ONLY: global state s_t --> [ MLP critic ] --> V_i(s_t)  (baseline; not used at execution)
+   REWARD:        r_i,t = -(own_cost_i + beta*others_cost) - tau*backlog_i (+ credit to customer)   <-- economics layer
+
+Honest status: this file is SYNTAX-checked (py_compile) and ships a shape self-test
+(`python signal_agent.py`, needs torch but NO env). Smoke-test it against the real env
+before trusting numbers.
+================================================================================
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
+
+AGENTS = ["retailer", "wholesaler", "distributor", "manufacturer"]
+
+# message dimensionality per content type ("learned" uses cfg.learned_msg_dim)
+_FIXED_MSG_DIMS = {"dhat": 1, "ip": 1, "dhat_ip": 2}
+
+
+def msg_dim_of(content, learned_dim):
+    return int(learned_dim) if content == "learned" else _FIXED_MSG_DIMS[content]
+
+
+def order_from_S(S, obs, max_order):
+    """Convert an order-up-to level S into the env order. Inventory position
+    IP = on_hand - backlog + on_order; order = clip(S - IP, 0, max_order)."""
+    inv, back, onord = obs[..., 0:1], obs[..., 1:2], obs[..., 2:3]
+    IP = inv - back + onord
+    return torch.clamp(S - IP, 0.0, max_order), IP
+
+
+# ============================================================================ #
+# Actor: GRU belief + linear base-stock head + linear demand readout + message  #
+# ============================================================================ #
+class SIGNALActor(nn.Module):
+    def __init__(self, obs_dim, msg_dim, hidden, content, learned_msg_dim=3):
+        super().__init__()
+        self.content = content
+        self.msg_dim = msg_dim
+        self.hidden = hidden
+        # (1) BELIEF. Input = [local obs, received message] so communication can update the belief.
+        #     One GRU layer; its hidden state is the entire memory the agent has. No KL, no ELBO.
+        self.gru = nn.GRU(obs_dim + msg_dim, hidden)                 # (seq, batch, feat)
+        # (2) BASE-STOCK HEAD. ONE linear layer -> scalar S (softplus = positivity link only).
+        self.head = nn.Linear(obs_dim + hidden + msg_dim, 1)
+        self.log_std = nn.Parameter(torch.zeros(1) - 0.5)            # learnable exploration noise on S
+        # (3) DEMAND READOUT. Linear belief -> d_hat (>=0). Serves as the 'dhat' message AND is
+        #     lightly grounded against realized demand so the message stays interpretable.
+        self.d_head = nn.Linear(hidden, 1)
+        # (4) LEARNED message head: ONLY built for the interpretability-control rung.
+        self.msg_head = (nn.Linear(obs_dim + hidden, learned_msg_dim)
+                         if content == "learned" else None)
+
+    def belief(self, obs_seq, msg_seq, h0=None):
+        """obs_seq [T,B,obs], msg_seq [T,B,msg] -> (h_seq [T,B,hidden], hN [1,B,hidden])."""
+        return self.gru(torch.cat([obs_seq, msg_seq], dim=-1), h0)
+
+    def demand_estimate(self, h):                                   # belief -> nonneg demand forecast
+        return F.softplus(self.d_head(h))
+
+    def base_stock(self, obs, h, msg):                             # -> (S_mu>=0, S_std)
+        S_mu = F.softplus(self.head(torch.cat([obs, h, msg], dim=-1)))
+        return S_mu, self.log_std.exp().clamp(1e-2, 3.0)
+
+    def message(self, obs, h):
+        """The semantic ladder. Each rung is a NAMED supply-chain signal except 'learned'."""
+        IP = (obs[..., 0:1] - obs[..., 1:2] + obs[..., 2:3]) / 100.0       # inventory-position signal (VMI)
+        dh = self.demand_estimate(h) / 100.0                              # demand signal (Lee)
+        if self.content == "dhat":     return dh
+        if self.content == "ip":       return IP
+        if self.content == "dhat_ip":  return torch.cat([dh, IP], dim=-1)
+        if self.content == "learned":  return torch.tanh(self.msg_head(torch.cat([obs, h], dim=-1)))
+        raise ValueError(self.content)
+
+
+# ============================================================================ #
+# Critic: centralized, per-agent value of the global state (CTDE, training only) #
+# ============================================================================ #
+class SIGNALCritic(nn.Module):
+    def __init__(self, state_dim, hidden, n_agents):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, n_agents))                            # one value per agent (per-agent rewards)
+
+    def forward(self, s):                                          # s [.., state_dim] -> [.., N]
+        return self.net(s)
+
+
+# ============================================================================ #
+# Trainer: plain MAPPO (PPO-clip + GAE) + the economics (beta cost-share, tau)   #
+# ============================================================================ #
+class SIGNALTrainer:
+    def __init__(self, cfg, n_agents, obs_dim, state_dim, adj, device="cpu"):
+        self.device = torch.device(device)
+        self.N = n_agents
+        self.max_order = float(cfg.get("max_order", 100.0))
+        self.content = cfg.get("msg_content", "dhat")
+        self.msg_dim = msg_dim_of(self.content, cfg.get("learned_msg_dim", 3))
+        self.adj = torch.tensor(adj, dtype=torch.float32, device=self.device)     # row-stochastic topology
+        H = int(cfg.get("hidden", 64))
+        self.actors = nn.ModuleList([                              # per-agent actors (chain is heterogeneous)
+            SIGNALActor(obs_dim, self.msg_dim, H, self.content, cfg.get("learned_msg_dim", 3))
+            for _ in range(n_agents)]).to(self.device)
+        self.critic = SIGNALCritic(state_dim, H, n_agents).to(self.device)
+        # --- optimisation (textbook PPO) ---
+        self.gamma = float(cfg.get("gamma", 0.99)); self.lam = float(cfg.get("gae_lambda", 0.95))
+        self.eps = float(cfg.get("eps_clip", 0.2)); self.k_epochs = int(cfg.get("k_epochs", 4))
+        self.ent_coef = float(cfg.get("entropy_coef", 0.0)); self.vf_coef = float(cfg.get("vf_coef", 0.5))
+        self.aux_coef = float(cfg.get("aux_coef", 0.1))           # d_hat grounding (message interpretability)
+        self.max_grad_norm = float(cfg.get("max_grad_norm", 0.5))
+        self.params = list(self.actors.parameters()) + list(self.critic.parameters())
+        self.opt = torch.optim.Adam(self.params, lr=float(cfg.get("lr", 3e-4)))
+        # --- economics layer (independent of the agent) ---
+        self.srdqn_beta = float(cfg.get("srdqn_beta", 1.0))       # 1=cooperative, 0=self-interested
+        tau = float(cfg.get("tau", 0.0))                          # coordinating transfer (0=no contract)
+        self.tau_vec = torch.tensor([0.0] + [tau] * (n_agents - 1),
+                                    device=self.device).view(1, -1)  # charged on UPSTREAM backorders only
+
+    # ---------------------------------------------------------------- rollout
+    @torch.no_grad()
+    def collect(self, env, seed, deterministic=False):
+        """Roll ONE episode. Messages are stored as RECEIVED and DETACHED, so in the update they are
+        fixed extended observations (plain MAPPO; no DIAL gradient -- a clean, defensible default)."""
+        dev = self.device
+        obs, _ = env.reset(seed=seed)
+        h = [torch.zeros(1, 1, self.actors[i].hidden, device=dev) for i in range(self.N)]
+        m_prev = torch.zeros(self.N, self.msg_dim, device=dev)
+        O, MIN, GS, SA, LP, C, DT, DN = ([] for _ in range(8))
+        while True:
+            o = torch.tensor(np.stack([obs[a] for a in AGENTS]), dtype=torch.float32, device=dev)  # [N,obs]
+            incoming = self.adj @ m_prev                                       # [N,msg] (delivered next step)
+            S = torch.zeros(self.N, 1, device=dev)
+            logp = torch.zeros(self.N, device=dev)
+            m_out = torch.zeros(self.N, self.msg_dim, device=dev)
+            for i in range(self.N):
+                h_seq, h[i] = self.actors[i].belief(o[i].view(1, 1, -1), incoming[i].view(1, 1, -1), h[i])
+                hi = h_seq[-1]                                                 # [1,hidden]
+                S_mu, S_std = self.actors[i].base_stock(o[i:i + 1], hi, incoming[i:i + 1])
+                Si = S_mu if deterministic else Normal(S_mu, S_std).sample()
+                logp[i] = Normal(S_mu, S_std).log_prob(Si).sum()
+                S[i] = Si
+                m_out[i] = self.actors[i].message(o[i:i + 1], hi).reshape(-1)
+            order, _ = order_from_S(S, o, self.max_order)
+            frac = (order / self.max_order).clamp(0.0, 1.0)
+            gstate = torch.tensor(env.get_global_state(), dtype=torch.float32, device=dev).view(-1)
+            nobs, _r, terms, truncs, infos = env.step({a: [float(frac[i, 0])] for i, a in enumerate(AGENTS)})
+            cost = torch.tensor([infos[a]["local_cost"] for a in AGENTS], dtype=torch.float32, device=dev)
+            dtgt = torch.tensor([infos[a]["training_targets"]["demand"] for a in AGENTS],
+                                dtype=torch.float32, device=dev)
+            done = bool(any(terms.values()) or any(truncs.values()))
+            O.append(o); MIN.append(incoming.detach()); GS.append(gstate)
+            SA.append(S.detach()); LP.append(logp.detach()); C.append(cost); DT.append(dtgt)
+            DN.append(torch.tensor(1.0 if done else 0.0, device=dev))
+            m_prev = m_out.detach()                                            # ONE-STEP message delay
+            obs = nobs
+            if done:
+                break
+        return dict(obs=torch.stack(O), msg_in=torch.stack(MIN), gstate=torch.stack(GS),
+                    S=torch.stack(SA), logp=torch.stack(LP), cost=torch.stack(C),
+                    dtgt=torch.stack(DT), done=torch.stack(DN))                # all [T, N, *] or [T,*]
+
+    # ------------------------------------------------------------------- GAE
+    def _gae(self, rew, V, done):
+        # NOTE (truncation vs termination): episodes end by TIME-LIMIT truncation (the env's
+        # terminations are always False), but `done` marks the final step, so the last step is treated
+        # as terminal -- no value bootstrap from V(s_T). At the fixed horizon this is a small CONSTANT
+        # bias; bootstrap the truncated tail if you ever vary the horizon or need the absolute return scale.
+        T = rew.size(0); adv = torch.zeros_like(rew); last = torch.zeros((), device=rew.device)
+        for t in reversed(range(T)):
+            nonterm = 1.0 - done[t]
+            v_next = V[t + 1] if t + 1 < T else torch.zeros((), device=rew.device)
+            delta = rew[t] + self.gamma * v_next * nonterm - V[t]
+            last = delta + self.gamma * self.lam * nonterm * last
+            adv[t] = last
+        return adv
+
+    # ---------------------------------------------------------------- update
+    def update(self, episodes):
+        dev = self.device
+        # (A) shaped reward = own + beta*others + coordinating transfer (money-conserving) ----------
+        for d in episodes:
+            c = d["cost"]                                          # [T,N] per-agent local cost
+            others = c.sum(-1, keepdim=True) - c
+            back = d["obs"][..., 1]                                # [T,N] backlog (obs index 1)
+            transfer = self.tau_vec * back                        # paid BY each stage for its backorders
+            credit = torch.zeros_like(transfer); credit[..., :-1] = transfer[..., 1:]  # credit its customer
+            d["rew"] = -(c + self.srdqn_beta * others) - transfer + credit
+        # (B) advantages from the centralized critic (per-agent) ------------------------------------
+        with torch.no_grad():
+            for d in episodes:
+                V = self.critic(d["gstate"])                      # [T,N]
+                adv = torch.stack([self._gae(d["rew"][:, i], V[:, i], d["done"]) for i in range(self.N)], dim=1)
+                d["V"], d["adv"] = V, adv
+                d["vtarget"] = (adv + V).detach()                 # GAE lambda-return
+            all_adv = torch.cat([d["adv"] for d in episodes], 0)  # standardize advantages (PPO practice)
+            a_mu, a_sd = all_adv.mean(0), all_adv.std(0) + 1e-8
+            for d in episodes:
+                d["adv"] = (d["adv"] - a_mu) / a_sd
+        # (C) PPO-clip actor + MSE critic, re-running the GRU over stored sequences (BPTT) ----------
+        a_loss = c_loss = 0.0
+        for _ in range(self.k_epochs):
+            self.opt.zero_grad()
+            total = torch.zeros((), device=dev)
+            for d in episodes:
+                # critic (shared across agents; messages do not enter the critic)
+                V = self.critic(d["gstate"])                      # [T,N]
+                closs = F.mse_loss(V, d["vtarget"])
+                ploss = torch.zeros((), device=dev)
+                for i in range(self.N):
+                    obs_i = d["obs"][:, i, :].unsqueeze(1)        # [T,1,obs]
+                    msg_i = d["msg_in"][:, i, :].unsqueeze(1)     # [T,1,msg]  (fixed/detached from rollout)
+                    h_seq, _ = self.actors[i].belief(obs_i, msg_i)
+                    h = h_seq.squeeze(1)                          # [T,hidden]
+                    S_mu, S_std = self.actors[i].base_stock(d["obs"][:, i, :], h, d["msg_in"][:, i, :])
+                    logp_new = Normal(S_mu, S_std).log_prob(d["S"][:, i, :]).sum(-1)   # [T]
+                    ratio = torch.exp(logp_new - d["logp"][:, i])                       # pi_new/pi_old
+                    A = d["adv"][:, i]
+                    surr = torch.min(ratio * A, torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * A)
+                    ent = Normal(S_mu, S_std).entropy().mean()
+                    ploss = ploss - surr.mean() - self.ent_coef * ent
+                    # d_hat grounding: keeps the demand message INTERPRETABLE as a forecast (light)
+                    dhat = self.actors[i].demand_estimate(h)                            # [T,1]
+                    ploss = ploss + self.aux_coef * F.mse_loss(dhat, d["dtgt"][:, i].unsqueeze(-1))
+                total = total + (ploss + self.vf_coef * closs) / len(episodes)
+                a_loss += float(ploss.item()); c_loss += float(closs.item())
+            total.backward()
+            nn.utils.clip_grad_norm_(self.params, self.max_grad_norm)
+            self.opt.step()
+        k = max(1, self.k_epochs * len(episodes))
+        return a_loss / k, c_loss / k
+
+
+# ============================================================================ #
+# Shape self-test (run: `python signal_agent.py`). Needs torch, NOT the env.     #
+# ============================================================================ #
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    OBS, N, H, T = 4, 4, 64, 20
+    for content in ["dhat", "ip", "dhat_ip", "learned"]:
+        md = msg_dim_of(content, 3)
+        STATE = OBS * N
+        cfg = {"msg_content": content, "hidden": H, "learned_msg_dim": 3,
+               "srdqn_beta": 0.0, "tau": 9.5, "k_epochs": 2}
+        adj = np.array([[0, 1, 0, 0], [.5, 0, .5, 0], [0, .5, 0, .5], [0, 0, 1, 0]], float)
+        tr = SIGNALTrainer(cfg, N, OBS, STATE, adj, device="cpu")
+        # fabricate a buffer with the exact shapes collect() produces, then run an update
+        ep = {"obs": torch.rand(T, N, OBS) * 20, "msg_in": torch.rand(T, N, md),
+              "gstate": torch.rand(T, STATE) * 20, "S": torch.rand(T, N, 1) * 40,
+              "logp": torch.randn(T, N), "cost": torch.rand(T, N) * 50,
+              "dtgt": torch.rand(T, N) * 20, "done": torch.zeros(T)}
+        ep["done"][-1] = 1.0
+        a, c = tr.update([ep, dict(ep)])
+        # exercise a single-agent forward at one step
+        h0 = torch.zeros(1, 1, H)
+        hs, _ = tr.actors[0].belief(torch.rand(1, 1, OBS), torch.rand(1, 1, md), h0)
+        Smu, Ssd = tr.actors[0].base_stock(torch.rand(1, OBS), hs[-1], torch.rand(1, md))
+        m = tr.actors[0].message(torch.rand(1, OBS), hs[-1])
+        assert Smu.shape == (1, 1) and m.shape[-1] == md
+        n_params = sum(p.numel() for p in tr.params)
+        print(f"  content={content:<8} msg_dim={md}  params={n_params:>7,}  "
+              f"a_loss={a:+.3f} c_loss={c:+.3f}  S={float(Smu):.1f}  msg_dim_out={m.shape[-1]}  OK")
+    print("signal_agent shape self-test PASS (all four message rungs build, update, and act)")

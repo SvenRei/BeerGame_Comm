@@ -1,0 +1,63 @@
+# conf/agent/signal.yaml
+# SIGNAL (Strategic Information-sharing for Game-theoretic, Networked, Adaptive
+# Logistics) -- minimal communicating MAPPO agent. Select with `agent=signal`.
+# The agent is an INSTRUMENT; the message channel + economics are the study.
+algorithm: signal
+
+# ===================== communication (the object of study) =====================
+use_comm: true            # false -> ADJ is zeroed (no-comm control, IDENTICAL architecture)
+msg_content: dhat         # dhat | ip | dhat_ip | learned   (the semantic ladder)
+learned_msg_dim: 3        # message width when msg_content=learned (interpretability control)
+comm_topology: neighbor   # neighbor | skip | full | retailer_broadcast | no_neighbor
+
+# ===================== economics layer (rides on the reward) =====================
+srdqn_beta: 1.0           # 1.0 = cooperative (team cost) ; 0.0 = self-interested (price of anarchy)
+tau: 0.0                  # coordinating transfer on UPSTREAM backorders; tau* = p - b ; 0 = no contract
+
+# ===================== agent size =====================
+hidden: 64                # GRU hidden = belief width AND critic width
+max_order: 100            # must match env.max_order
+
+# ===================== training env =====================
+train_env: dr_poisson     # dr_poisson | ar1 | family
+dr_lambda_lo: 4.0
+dr_lambda_hi: 24.0
+dr_p_shift: 0.0           # 0 = stationary (matches the stationary held-out gate)
+dr_shift_scale: 2.5
+ar1_mu: 12.0
+ar1_rho: 0.6              # set per-rho for the autocorrelation sweep (H2): {0,.3,.6,.9}
+ar1_sigma: 3.0
+dr_families: [poisson, negbin]   # when train_env=family; ar1 held out for the distribution-shift test
+nb_mu_lo: 4.0
+nb_mu_hi: 24.0
+nb_dispersion_lo: 2.0
+nb_dispersion_hi: 12.0
+ar1_mu_lo: 4.0
+ar1_mu_hi: 24.0
+ar1_rho_lo: 0.0
+ar1_rho_hi: 0.8
+
+# ===================== PPO / optimisation =====================
+gamma: 0.99
+gae_lambda: 0.95
+eps_clip: 0.2
+k_epochs: 4
+entropy_coef: 0.0
+vf_coef: 0.5
+aux_coef: 0.1             # d_hat grounding (keeps the demand message interpretable as a forecast)
+max_grad_norm: 0.5
+lr: 3.0e-4
+
+# ===================== training loop =====================
+batch_episodes: 8
+warm_up_episodes: 0       # 0: SIGNAL's belief is trained by the policy gradient (no pre-train)
+use_gpu: false            # training is CPU-bound (sequential per-step encode); CPU torch wheels
+
+# ===================== held-out gate (leakage-safe selection) =====================
+heldout_mode: poisson     # poisson | ar1
+heldout_lambdas: [8, 12, 16, 20]        # VALIDATION split; TEST {6,10,14,18,22} scored post-hoc
+heldout_ar1_rhos: [0.15, 0.45, 0.75]    # validation rho (disjoint from test rho) when heldout_mode=ar1
+heldout_every: 200        # eval cadence (episodes); 100 dense pilot, 400 sweep
+heldout_episodes: 8       # episodes per regime; 8 fast pilot, 20 clean
+heldout_fixed_ref: 4726.0  # BAR     fallback if results/baselines_regime_v2.json is absent
+heldout_oracle_ref: 2202.0 # CEILING fallback
