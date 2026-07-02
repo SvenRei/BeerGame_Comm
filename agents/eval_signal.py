@@ -15,6 +15,12 @@ The saved ADJ (already zeroed for a use_comm=false checkpoint) is used directly,
 messages route exactly as trained; ablate=True is the comm-OFF counterfactual on the
 SAME weights.
 
+THE ENV IS THE TRAINED ENV. Every probe below rebuilds its env from the env config
+PERSISTED IN THE CHECKPOINT (train_signal saves cfg.env), resolved by resolve_env_base:
+CLI --env-json > ckpt['env'] > module ENV_BASE fallback (pre-fix checkpoints, with a
+warning). Without this, a canonical-cost (penalty_at_retailer_only) or lead-time run
+was silently scored on the default env against the wrong references.
+
 WHAT IT COMPUTES (each part names the question it answers):
   * STANDARD BENCHMARK (per regime poisson/black_swan/extreme_chaos): mean/CVaR cost,
     bullwhip, Type-1 (alpha) service, Type-2 (beta) fill, jitter, and the zero-message
@@ -27,8 +33,12 @@ WHAT IT COMPUTES (each part names the question it answers):
     bullwhip/inventory/backlog split and the per-echelon UPSTREAM forecast-error delta
     vs CUSTOMER demand. delta>0 => the shared signal cuts upstream forecast error.
   * HONESTY PROBE: each message COMPONENT vs the sender's true demand / inventory position.
+  * POSITIVE LISTENING: causal dS/d(told) PER MESSAGE COMPONENT (components swept one at
+    a time, the others held at their actually-received values).
   * PRODUCERS: --dump-c1 (per-seed {lambda: cost} for scripts/c1_stats.py) and --dump-comm
     (per-seed {lambda: cost} + per-echelon forecast error for scripts/comm_stats.py).
+    --dump-comm + --dump-ar1 "0,0.3,0.6,0.9" keys the SAME dump format by AR(1) rho
+    instead of Poisson lambda (the H2 producer; comm_stats' loaders are key-agnostic).
 
 TWO SEED SPACES (do not conflate):
   SEED_BASE=2000          -> standard-benchmark / message rollouts.
@@ -40,6 +50,8 @@ Usage:
   python agents/eval_signal.py --ckpt ... --episodes 100 --full
   python agents/eval_signal.py --ckpt ... --dump-c1   results/signal_c1
   python agents/eval_signal.py --ckpt ... --dump-comm results/comm_on
+  python agents/eval_signal.py --ckpt ... --dump-comm results/comm_on_ar1 --dump-ar1 "0,0.3,0.6,0.9"
+  python agents/eval_signal.py --ckpt ... --env-json conf/env_canonical.json   # override the saved env
 """
 import os
 import sys
@@ -60,9 +72,10 @@ SCENARIOS = ["poisson", "black_swan", "extreme_chaos"]
 SEED_BASE = 2000
 HELDOUT_SEED_BASE = 100000          # matches baselines.py SEED_BASE (CRN with the BAR/CEILING)
 HELDOUT_LAMBDAS = [6.0, 10.0, 14.0, 18.0, 22.0]
-ENV_BASE = {"horizon": 50, "max_order": 100}
-H_COST = 0.5     # holding cost/unit/week -- MUST match the env/config (config.yaml: holding_cost)
-B_COST = 1.0     # backorder cost/unit/week -- MUST match the env/config (config.yaml: backorder_cost)
+ENV_BASE = {"horizon": 50, "max_order": 100}   # FALLBACK ONLY: probes use resolve_env_base(ckpt)
+H_COST = 0.5     # FALLBACK ONLY: run_episode reads h from the LIVE env (env.h); this constant is
+#                  used only if an exotic env object lacks the attribute.
+B_COST = 1.0     # FALLBACK ONLY: as above (env.b), incl. the canonical-cost flag.
 
 # message-component layout per content type (which slot carries which named signal).
 # 'dhat' and 'ip' messages now ride at NATURAL units (see SIGNALActor.message), so the honesty probe
@@ -71,13 +84,39 @@ B_COST = 1.0     # backorder cost/unit/week -- MUST match the env/config (config
 _MSG_SCALE = 1.0
 
 
-def make_ar1_env(rho, mu=12.0, sigma=3.0):
+def resolve_env_base(ckpt, env_json=None):
+    """The env config the checkpoint was TRAINED on, resolved with explicit provenance:
+         CLI --env-json  >  ckpt['env'] (train_signal persists cfg.env)  >  module ENV_BASE.
+    The fallback exists only for pre-fix checkpoints and WARNS, because a canonical-cost
+    (penalty_at_retailer_only) or lead-time run would otherwise be silently scored on the
+    default env against the wrong references. demand_type is stripped: each probe sets its
+    own demand regime on top of this base."""
+    if env_json:
+        with open(env_json) as f:
+            base = json.load(f)
+        print(f"  env config <- {env_json} (CLI override)")
+    elif isinstance(ckpt.get("env"), dict) and ckpt["env"]:
+        base = dict(ckpt["env"])
+        print(f"  env config <- checkpoint (as trained): h={base.get('holding_cost', 0.5)} "
+              f"b={base.get('backorder_cost', 1.0)} "
+              f"penalty_at_retailer_only={base.get('penalty_at_retailer_only', False)}")
+    else:
+        base = dict(ENV_BASE)
+        print("  [WARN] checkpoint has no saved env config (pre-fix trainer); using module ENV_BASE "
+              "defaults. If this run used a non-default env (canonical cost, lead-time ranges), "
+              "re-run with --env-json or retrain with the updated train_signal.py.")
+    base.pop("demand_type", None)               # each probe sets its own demand regime
+    return base
+
+
+def make_ar1_env(rho, mu=12.0, sigma=3.0, env_base=None):
     """AR(1) eval env at a fixed rho (built exactly as train_signal builds the ar1 train env:
     demand_type='poisson' + family='ar1'). Use this so an AR(1)-trained checkpoint is measured
     IN its training regime -- evaluating it on Poisson (the default probes) tests white noise,
     where comm value is null by construction (Axsater-Rosling)."""
+    base = dict(ENV_BASE if env_base is None else env_base)
     AR1, _NegBin, _Family = make_demand_family_envs(BeerGameParallelEnv)
-    return AR1({**ENV_BASE, "demand_type": "poisson", "family": "ar1",
+    return AR1({**base, "demand_type": "poisson", "family": "ar1",
                 "ar1_mu": float(mu), "ar1_rho": float(rho), "ar1_sigma": float(sigma)})
 
 
@@ -175,12 +214,16 @@ class SIGNALPolicy:
         return {a: float(frac[i, 0].item()) for i, a in enumerate(AGENTS)}
 
     @torch.no_grad()
-    def probe_S(self, agent_idx, msg_value):
-        """Order-up-to S that actor `agent_idx` WOULD output at the LAST step's (obs, belief) if its
-        incoming message were `msg_value` (in the message's natural-unit scale). dS/d(message) measures
-        causal positive listening: does the receiver act on message CONTENT?"""
-        o_t, hi_list, _inc = self.last_ctx
-        m = torch.full((1, self.msg_dim), float(msg_value), device=DEVICE)
+    def probe_S(self, agent_idx, msg_value, component=0):
+        """Order-up-to S that actor `agent_idx` WOULD output at the LAST step's (obs, belief) if
+        component `component` of its incoming message were `msg_value` (message natural units),
+        ALL OTHER components held at their actually-received values. dS/d(message component)
+        measures causal positive listening PER NAMED SIGNAL.
+        [FIX: the old probe filled EVERY column with the scalar, so for dhat_ip the told-demand
+        sweep also swept the IP channel 0..30 and the slope conflated dS/d(dhat) + dS/d(ip).]"""
+        o_t, hi_list, inc = self.last_ctx
+        m = inc[agent_idx:agent_idx + 1].clone()    # observed incoming as the baseline
+        m[0, int(component)] = float(msg_value)
         s_mu, _ = self.actors[agent_idx].base_stock(o_t[agent_idx:agent_idx + 1], hi_list[agent_idx], m)
         return float(s_mu.reshape(-1)[0].item())
 
@@ -233,6 +276,12 @@ def run_episode(policy, env, seed, trace=False):
     all_back = np.concatenate([back[a] for a in AGENTS])
     cust_arr = np.asarray(cust_series, float)
     cust_var = float(np.var(cust_arr))
+    # cost-split parameters from the LIVE env (single source of truth; canonical-cost aware).
+    # The per-stage $ split must reproduce what the env actually CHARGED: under
+    # penalty_at_retailer_only, upstream stages pay holding but NOT backorder penalties.
+    h_cost = float(getattr(env, "h", H_COST))
+    b_cost = float(getattr(env, "b", B_COST))
+    pen_ret_only = bool(getattr(env, "_penalty_at_retailer_only", False))
     bw_stage, ovar, dvar, bw_cum, nsamp = {}, {}, {}, {}, {}
     mean_inv, mean_back, mean_netstock = {}, {}, {}
     serv_alpha, fill_beta_s, stockout_freq, hold_c, back_c, total_c = {}, {}, {}, {}, {}, {}
@@ -248,8 +297,9 @@ def run_episode(policy, env, seed, trace=False):
         serv_alpha[a] = float(np.mean(bk == 0))
         fill_beta_s[a] = _safe_ratio(fill_m[a], fill_d[a])
         stockout_freq[a] = float(np.mean(bk > 0))
-        hold_c[a] = H_COST * float(iv.sum())
-        back_c[a] = B_COST * float(bk.sum())
+        hold_c[a] = h_cost * float(iv.sum())
+        bc = b_cost * float(bk.sum())
+        back_c[a] = 0.0 if (pen_ret_only and a != "retailer") else bc    # matches env local_cost
         total_c[a] = hold_c[a] + back_c[a]
     hold_total = float(sum(hold_c.values())); back_total = float(sum(back_c.values()))
 
@@ -288,13 +338,14 @@ def evaluate(policy, env, episodes, trace=False):
 # ==============================================================================
 # Regime-uncertainty table (C1): per-lambda cost + Gap_Recovered vs BAR/CEILING
 # ==============================================================================
-def regime_uncertainty(ckpt, episodes, bar, ceiling, lambdas=HELDOUT_LAMBDAS):
+def regime_uncertainty(ckpt, episodes, bar, ceiling, lambdas=HELDOUT_LAMBDAS, env_base=None):
+    base = dict(ENV_BASE if env_base is None else env_base)
     print(f"\n  regime-uncertainty (C1)   BAR={bar:.0f}  CEILING={ceiling:.0f}"
           f"   [{episodes} eps/lambda, CRN seeds {HELDOUT_SEED_BASE}+]")
     print(f"    {'lambda':>7}{'mean cost':>12}{'S_mean':>9}")
     per = {}
     for lam in lambdas:
-        env = DemandRandomizedBeerGame({**ENV_BASE, "demand_type": "poisson"},
+        env = DemandRandomizedBeerGame({**base, "demand_type": "poisson"},
                                        lam_lo=float(lam), lam_hi=float(lam), p_shift=0.0)
         pol = SIGNALPolicy(ckpt, env, ablate=False)
         costs, smeans = [], []
@@ -320,32 +371,35 @@ def _upstream_forecast_error(traces):
     return {a: float(np.nanmean(np.abs(dhat[:, i] - cust))) for i, a in enumerate(AGENTS)}
 
 
-def ar1_comm_vs_rho(ckpt, episodes, rhos, mu=12.0, sigma=3.0):
+def ar1_comm_vs_rho(ckpt, episodes, rhos, mu=12.0, sigma=3.0, env_base=None):
     """The headline autocorrelation view: comm value as a function of AR(1) rho. Deterministic team
     cost with messages ON vs OFF (same weights, CRN-paired seeds) at each rho. Lee-So-Tang (2000)
     predicts comm value (OFF-ON) ~ 0 at rho=0 and RISING with rho. For a use_comm=false checkpoint
     ON==OFF (ADJ already zero), so the table just reports that model's cost per rho (cross-model ref)."""
-    print(f"\n  AR(1) comm-value vs autocorrelation   [{episodes} eps/rho, CRN seeds {SEED_BASE}+, "
+    print(f"\n  AR(1) message-RELIANCE vs autocorrelation   [{episodes} eps/rho, CRN seeds {SEED_BASE}+, "
           f"mu={mu:g} sigma={sigma:g}]")
-    print(f"    {'rho':>6}{'cost_ON':>10}{'cost_OFF':>10}{'comm_value%':>13}")
+    print(f"    {'rho':>6}{'cost_ON':>10}{'cost_OFF':>10}{'reliance%':>13}")
     out = {}
     for rho in rhos:
-        env = make_ar1_env(rho, mu, sigma)
+        env = make_ar1_env(rho, mu, sigma, env_base)
         pol_on = SIGNALPolicy(ckpt, env, ablate=False)
         pol_off = SIGNALPolicy(ckpt, env, ablate=True)
         c_on = float(np.mean([run_episode(pol_on, env, SEED_BASE + e)["cost"] for e in range(episodes)]))
         c_off = float(np.mean([run_episode(pol_off, env, SEED_BASE + e)["cost"] for e in range(episodes)]))
         cv = 100.0 * (c_off - c_on) / max(1e-6, c_off)
-        out[float(rho)] = {"cost_on": c_on, "cost_off": c_off, "comm_value_pct": cv}
+        out[float(rho)] = {"cost_on": c_on, "cost_off": c_off, "reliance_pct": cv}
         print(f"    {rho:>6g}{c_on:>10.1f}{c_off:>10.1f}{cv:>+12.2f}%")
-    print("    (comm_value% = (OFF-ON)/OFF, positive => comm helps. Should be ~0 at rho=0 and rise with")
-    print("     rho if the value of demand-sharing tracks autocorrelation, NOT topology.)")
+    print("    (reliance% = (OFF-ON)/OFF for the SAME comm-trained model = how much it DEPENDS on its")
+    print("     messages. This is NOT the value of sharing V -- a comm-trained model over-relies on the")
+    print("     channel, so this OVERSTATES V. True V = cross-arm: this model's cost_ON vs a SEPARATELY")
+    print("     no-comm-TRAINED model's cost (use comm_stats.py on dumps of both arms).)")
     return out
 
 
-def comm_value_decomposition(ckpt, episodes=40, scenario="poisson", env=None, label=None):
+def comm_value_decomposition(ckpt, episodes=40, scenario="poisson", env=None, label=None, env_base=None):
     if env is None:
-        env = BeerGameParallelEnv({**ENV_BASE, "demand_type": scenario})
+        env = BeerGameParallelEnv({**(ENV_BASE if env_base is None else env_base),
+                                   "demand_type": scenario})
     label = label or scenario
     pol_on = SIGNALPolicy(ckpt, env, ablate=False)
     if not pol_on.use_comm:
@@ -393,12 +447,13 @@ def _corr(x, y):
     return float(np.corrcoef(x[ok], y[ok])[0, 1])
 
 
-def honesty_probe(ckpt, episodes=40, scenario="poisson", env=None, label=None):
+def honesty_probe(ckpt, episodes=40, scenario="poisson", env=None, label=None, env_base=None):
     """Does each message component report the sender's truth? For 'dhat' compare component*100 to
     the sender's OWN realized demand; for 'ip' to the sender's true inventory position (recoverable
     from its obs, so this is honest by construction); 'learned' channels are scored against both."""
     if env is None:
-        env = BeerGameParallelEnv({**ENV_BASE, "demand_type": scenario})
+        env = BeerGameParallelEnv({**(ENV_BASE if env_base is None else env_base),
+                                   "demand_type": scenario})
     label = label or scenario
     pol = SIGNALPolicy(ckpt, env, ablate=False)
     if not pol.use_comm:
@@ -415,11 +470,14 @@ def honesty_probe(ckpt, episodes=40, scenario="poisson", env=None, label=None):
     if pol.content == "learned":
         print(f"    {'sender':<13}{'channel':>8}{'|msg|':>8}{'sat>0.9':>9}{'corr(demand)':>14}{'corr(IP)':>10}")
         for i, a in enumerate(AGENTS):
+            gain = float(pol.actors[i].msg_gain) if pol.actors[i].msg_gain is not None else 1.0
             for c in range(pol.msg_dim):
                 ch = msg[:, i, c]
-                print(f"    {a:<13}{c:>8}{np.mean(np.abs(ch)):>8.3f}{np.mean(np.abs(ch) > 0.9):>9.2f}"
+                sat = float(np.mean(np.abs(ch) > 0.9 * abs(gain)))      # tanh saturates near +-gain, not +-1
+                print(f"    {a:<13}{c:>8}{np.mean(np.abs(ch)):>8.3f}{sat:>9.2f}"
                       f"{_corr(ch, dem[:, i]):>14.3f}{_corr(ch, ipv[:, i]):>10.3f}")
-        print("    (learned has no named ground truth; high corr(demand) on a channel = it encodes demand.)")
+        print("    (learned has no named ground truth; high corr(demand) on a channel = it encodes demand.")
+        print("     sat>0.9 is vs the learned gain |g|; the message rides at +-g, not +-1.)")
         return out
 
     print(f"    {'sender':<13}{'component':>10}{'mean(msg*100)':>14}{'mean(truth)':>12}"
@@ -445,16 +503,22 @@ def honesty_probe(ckpt, episodes=40, scenario="poisson", env=None, label=None):
 # DOES THE AGENT LISTEN? two reports that separate "comm redundant" from "comm ignored"
 # (cost-based comm value cannot tell these apart; these can).
 # ==============================================================================
-def positive_listening(ckpt, episodes=20, env=None, label=None, demand_grid=None):
-    """CAUSAL listening probe. At every state actually visited, hold the receiver's (obs, belief)
-    FIXED and sweep ONLY its incoming message across a demand grid (0..30), recording the order-up-to
-    S it would emit (probe_S). The slope dS/d(demand-it-is-told) is positive listening: a base-stock
-    that uses the message as a forecast raises S by ~(lead+1) per unit; slope ~ 0 means the receiver
-    IGNORES message content. This is the test cost cannot do -- a 0 here + honest messages = the agent
-    is deaf, not the channel empty. (Probes the DIRECT head path; the recurrent belief path is covered
-    by the comm-on/off cost ablation, which is ~0 here too.)"""
+def positive_listening(ckpt, episodes=20, env=None, label=None, demand_grid=None, env_base=None):
+    """CAUSAL listening probe, PER MESSAGE COMPONENT. At every state actually visited, hold the
+    receiver's (obs, belief) FIXED and sweep ONE component of its incoming message across a value
+    grid (0..30, the component's natural units), ALL OTHER components held at their actually-
+    received values, recording the order-up-to S it would emit (probe_S).
+    [FIX: the old probe filled EVERY column with the swept scalar, so for dhat_ip the 'told-demand'
+    slope conflated dS/d(dhat) + dS/d(ip); components are now swept one at a time.]
+    dS/d(told) on the DHAT component ~ (lead+1) means the receiver fully acts on the demand message;
+    ~0 means deaf to it. The IP component has no such textbook target -- its slope is reported for
+    sign and size (the VMI channel; a NEGATIVE slope, order less when the sender holds more, is the
+    theory-consistent direction). This is the test cost cannot do -- a 0 here + honest messages =
+    the agent is deaf, not the channel empty. (Probes the DIRECT head path; the recurrent belief
+    path is covered by the comm-on/off cost ablation.)"""
     if env is None:
-        env = BeerGameParallelEnv({**ENV_BASE, "demand_type": "poisson"})
+        env = BeerGameParallelEnv({**(ENV_BASE if env_base is None else env_base),
+                                   "demand_type": "poisson"})
     label = label or "poisson"
     if demand_grid is None:
         demand_grid = np.array([0., 5., 10., 15., 20., 25., 30.])
@@ -463,43 +527,56 @@ def positive_listening(ckpt, episodes=20, env=None, label=None, demand_grid=None
     if not pol.use_comm:
         print(f"\n  positive-listening ({label}): use_comm=false checkpoint. skipped.")
         return None
+    if pol.content == "learned":                                     # no demand semantics -> the told-demand sweep is meaningless
+        print(f"\n  positive-listening ({label}): content=learned has no demand semantics, so the injected")
+        print("    told-demand sweep does not apply. Use message_weight_audit (scale-agnostic) as the")
+        print("    listening check for this rung, and the comm-on/off cost ablation for the net effect.")
+        return None
+    layout = _component_layout(pol.content)                          # {name: column}
     receivers = [i for i in range(pol.N) if float(pol.adj[i].abs().sum()) > 0]   # only stages that HEAR someone
-    slopes = {i: [] for i in receivers}; swings = {i: [] for i in receivers}
+    slopes = {i: {nm: [] for nm in layout} for i in receivers}
+    swings = {i: {nm: [] for nm in layout} for i in receivers}
     for e in range(episodes):
         obs, _ = env.reset(seed=SEED_BASE + e)
         pol.reset()
         while True:
             acts = pol.act(obs)                              # sets pol.last_ctx for THIS step
             for i in receivers:
-                S_vals = np.array([pol.probe_S(i, m) for m in msg_grid])
-                slopes[i].append(float(np.polyfit(demand_grid, S_vals, 1)[0]))   # dS per unit told-demand
-                swings[i].append(float(S_vals[-1] - S_vals[0]))                  # S(told=30) - S(told=0)
+                for nm, col in layout.items():
+                    S_vals = np.array([pol.probe_S(i, m, component=col) for m in msg_grid])
+                    slopes[i][nm].append(float(np.polyfit(demand_grid, S_vals, 1)[0]))   # dS per unit told-value
+                    swings[i][nm].append(float(S_vals[-1] - S_vals[0]))                  # S(told=30) - S(told=0)
             obs, _r, _t, truncs, _info = env.step({a: [acts[a]] for a in AGENTS})
             if any(truncs.values()):
                 break
-    print(f"\n  positive-listening probe ({label}, {episodes} eps; sweep told-demand {demand_grid[0]:g}..{demand_grid[-1]:g})")
-    print(f"    {'receiver':<13}{'dS/dTold':>10}{'S swing 0->30':>15}")
+    print(f"\n  positive-listening probe ({label}, {episodes} eps; per-component sweep, told "
+          f"{demand_grid[0]:g}..{demand_grid[-1]:g}, other components at received values)")
+    print(f"    {'receiver':<13}{'component':>10}{'dS/dTold':>10}{'S swing 0->30':>15}")
     out = {}
     for i, a in enumerate(AGENTS):
         if i not in receivers:
             print(f"    {a:<13}{'(hears no one)':>10}")
             continue
-        ms = float(np.mean(slopes[i])); sw = float(np.mean(swings[i]))
-        out[a] = {"dS_dTold": ms, "S_swing": sw}
-        print(f"    {a:<13}{ms:>10.3f}{sw:>15.2f}")
-    print("    (dS/dTold ~ (lead+1) => the receiver fully acts on the message; ~0 => deaf to content.")
+        out[a] = {}
+        for nm in layout:
+            ms = float(np.mean(slopes[i][nm])); sw = float(np.mean(swings[i][nm]))
+            out[a][nm] = {"dS_dTold": ms, "S_swing": sw}
+            print(f"    {a:<13}{nm:>10}{ms:>10.3f}{sw:>15.2f}")
+    print("    (dhat component: dS/dTold ~ (lead+1) => the receiver fully acts on the demand message;")
+    print("     ~0 => deaf to content. ip component: sign/size only (negative = VMI-consistent).")
     print("     Honest messages (high corr in the probe above) + dS/dTold~0 = the agent is IGNORING a")
     print("     usable signal -- an optimization/architecture finding, NOT 'communication has no value'.)")
     return out
 
 
-def message_weight_audit(ckpt, env=None):
+def message_weight_audit(ckpt, env=None, env_base=None):
     """Structural companion: the L2 norm the TRAINED actor places on its MESSAGE inputs relative to
     its OBS inputs, at (1) the GRU input gate and (2) the base-stock head. ratio ~ 0 => the optimizer
     pruned the channel (dead by construction); a sizeable ratio => the channel is wired in and the
     null must be redundancy, not pruning. Cheap, weights-only, no rollout."""
     if env is None:
-        env = BeerGameParallelEnv({**ENV_BASE, "demand_type": "poisson"})
+        env = BeerGameParallelEnv({**(ENV_BASE if env_base is None else env_base),
+                                   "demand_type": "poisson"})
     pol = SIGNALPolicy(ckpt, env, ablate=False)
     if not pol.use_comm:
         print("\n  message-weight audit: use_comm=false checkpoint. skipped.")
@@ -525,9 +602,10 @@ def message_weight_audit(ckpt, env=None):
 # ==============================================================================
 # Per-stage dashboard (OM dashboard; reuses a rollout if given)
 # ==============================================================================
-def per_stage_dashboard(ckpt, episodes, scenario, eps=None):
+def per_stage_dashboard(ckpt, episodes, scenario, eps=None, env_base=None):
     if eps is None:
-        env = BeerGameParallelEnv({**ENV_BASE, "demand_type": scenario})
+        env = BeerGameParallelEnv({**(ENV_BASE if env_base is None else env_base),
+                                   "demand_type": scenario})
         eps = evaluate(SIGNALPolicy(ckpt, env, ablate=False), env, episodes)
     n = len(eps)
 
@@ -546,14 +624,15 @@ def per_stage_dashboard(ckpt, episodes, scenario, eps=None):
 # ==============================================================================
 # Producers: per-seed dumps for the cross-seed aggregators
 # ==============================================================================
-def dump_c1(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS):
+def dump_c1(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS, env_base=None):
     """PRODUCER for scripts/c1_stats.py: write {lambda: mean_cost} for THIS checkpoint to
     out_dir/seed{S}.json (+ seed{S}_bw.json), scored on the EVAL seeds (CRN with baselines)."""
+    base = dict(ENV_BASE if env_base is None else env_base)
     if seed is None:
-        seed = ckpt.get("config", {}).get("seed", 0)
+        seed = ckpt.get("seed", ckpt.get("config", {}).get("seed", 0))   # top-level seed first (see train_signal save)
     per, per_bw = {}, {}
     for lam in lambdas:
-        env = DemandRandomizedBeerGame({**ENV_BASE, "demand_type": "poisson"},
+        env = DemandRandomizedBeerGame({**base, "demand_type": "poisson"},
                                        lam_lo=float(lam), lam_hi=float(lam), p_shift=0.0)
         pol = SIGNALPolicy(ckpt, env, ablate=False)
         rs = [run_episode(pol, env, HELDOUT_SEED_BASE + e) for e in range(episodes)]
@@ -570,28 +649,40 @@ def dump_c1(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS):
     return path
 
 
-def dump_comm(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS):
-    """PRODUCER for scripts/comm_stats.py: write per-seed {lambda: cost} (the comm/no-comm arm's
+def dump_comm(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS, env_base=None,
+              ar1_rhos=None, ar1_mu=12.0, ar1_sigma=3.0):
+    """PRODUCER for scripts/comm_stats.py: write per-seed {key: cost} (the comm/no-comm arm's
     cost vector) AND the per-echelon upstream forecast error to out_dir/seed{S}.json /
     seed{S}_ferr.json. Run once per checkpoint into a comm-on dir and a comm-off (use_comm=false)
-    dir; comm_stats CRN-pairs them across seeds."""
+    dir; comm_stats CRN-pairs them across seeds.
+    KEYS: Poisson lambdas by default. Pass ar1_rhos=[0,0.3,0.6,0.9] (CLI --dump-ar1) to key the
+    SAME format by AR(1) rho instead -- the H2 producer. comm_stats' loaders and
+    value_of_sharing are key-agnostic, and prereg.h2_slope consumes the per-rho structure."""
+    base = dict(ENV_BASE if env_base is None else env_base)
     if seed is None:
-        seed = ckpt.get("config", {}).get("seed", 0)
+        seed = ckpt.get("seed", ckpt.get("config", {}).get("seed", 0))   # top-level seed first (see train_signal save)
+    if ar1_rhos:
+        keyed_envs = {float(r): make_ar1_env(r, ar1_mu, ar1_sigma, base) for r in ar1_rhos}
+        mode = f"AR(1) rhos {[f'{r:g}' for r in ar1_rhos]} (mu={ar1_mu:g} sigma={ar1_sigma:g})"
+    else:
+        keyed_envs = {float(lam): DemandRandomizedBeerGame({**base, "demand_type": "poisson"},
+                                                           lam_lo=float(lam), lam_hi=float(lam),
+                                                           p_shift=0.0)
+                      for lam in lambdas}
+        mode = f"Poisson lambdas {[f'{l:g}' for l in lambdas]}"
     per, per_ferr = {}, {}
-    for lam in lambdas:
-        env = DemandRandomizedBeerGame({**ENV_BASE, "demand_type": "poisson"},
-                                       lam_lo=float(lam), lam_hi=float(lam), p_shift=0.0)
+    for key, env in keyed_envs.items():
         pol = SIGNALPolicy(ckpt, env, ablate=False)
         rs = [run_episode(pol, env, HELDOUT_SEED_BASE + e, trace=True) for e in range(episodes)]
-        per[float(lam)] = float(np.mean([r["cost"] for r in rs]))
-        per_ferr[float(lam)] = _upstream_forecast_error([r["trace"] for r in rs])
+        per[key] = float(np.mean([r["cost"] for r in rs]))
+        per_ferr[key] = _upstream_forecast_error([r["trace"] for r in rs])
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"seed{int(seed)}.json")
     with open(path, "w") as f:
         json.dump(per, f, indent=2)
     with open(os.path.join(out_dir, f"seed{int(seed)}_ferr.json"), "w") as f:
         json.dump(per_ferr, f, indent=2)
-    print(f"\n  [dump-comm] wrote {path} (+ seed{int(seed)}_ferr.json)  use_comm={pol.use_comm}")
+    print(f"\n  [dump-comm] wrote {path} (+ seed{int(seed)}_ferr.json)  use_comm={pol.use_comm}  [{mode}]")
     return path
 
 
@@ -625,6 +716,9 @@ def main():
                     help="four-rung refs from `python scripts/baselines.py regime` (derives BAR/CEILING)")
     ap.add_argument("--bar", type=float, default=None, help="override fixed-policy BAR")
     ap.add_argument("--ceiling", type=float, default=None, help="override per-lambda CEILING")
+    ap.add_argument("--env-json", default=None, metavar="PATH",
+                    help="override the checkpoint's saved env config with this json (rare; the "
+                         "default is the env AS TRAINED, persisted in the checkpoint)")
     ap.add_argument("--regime-episodes", type=int, default=20, help="episodes per held-out lambda")
     ap.add_argument("--messages", action="store_true", help="run the comm decomposition + honesty probe")
     ap.add_argument("--full", action="store_true", help="standard benchmark + dashboard + C1 + messages")
@@ -639,18 +733,25 @@ def main():
                     help="PRODUCER: write per-seed {lambda: cost} to DIR for scripts/c1_stats.py, then exit")
     ap.add_argument("--dump-comm", default=None, metavar="DIR",
                     help="PRODUCER: write per-seed {lambda: cost}+forecast-error to DIR for comm_stats.py, then exit")
+    ap.add_argument("--dump-ar1", default=None, metavar="RHOS",
+                    help="with --dump-comm: key the dump by AR(1) rho instead of Poisson lambda, e.g. "
+                         "\"0,0.3,0.6,0.9\" (the H2 producer; uses --ar1-mu/--ar1-sigma)")
     ap.add_argument("--dump-episodes", type=int, default=200, help="episodes/lambda for the producers")
     ap.add_argument("--seed", type=int, default=None, help="seed label for the producers (default: ckpt's seed)")
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location=DEVICE, weights_only=False)
     cfg = ckpt.get("config", {})
+    env_base = resolve_env_base(ckpt, args.env_json)      # the env AS TRAINED, for every probe below
 
     if args.dump_c1:
-        dump_c1(ckpt, args.dump_episodes, args.dump_c1, seed=args.seed)
+        dump_c1(ckpt, args.dump_episodes, args.dump_c1, seed=args.seed, env_base=env_base)
         return
     if args.dump_comm:
-        dump_comm(ckpt, args.dump_episodes, args.dump_comm, seed=args.seed)
+        rhos = ([float(x) for x in args.dump_ar1.split(",") if x.strip() != ""]
+                if args.dump_ar1 else None)
+        dump_comm(ckpt, args.dump_episodes, args.dump_comm, seed=args.seed, env_base=env_base,
+                  ar1_rhos=rhos, ar1_mu=args.ar1_mu, ar1_sigma=args.ar1_sigma)
         return
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -666,7 +767,7 @@ def main():
     print(header); print("-" * len(header))
     eps_by_scenario = {}
     for scenario in SCENARIOS:
-        env = BeerGameParallelEnv({**ENV_BASE, "demand_type": scenario})
+        env = BeerGameParallelEnv({**env_base, "demand_type": scenario})
         eps = evaluate(SIGNALPolicy(ckpt, env, ablate=False), env, args.episodes)
         eps_by_scenario[scenario] = eps
         costs = np.array([e["cost"] for e in eps])
@@ -687,24 +788,26 @@ def main():
 
     if args.full:
         for scenario in SCENARIOS:
-            per_stage_dashboard(ckpt, args.episodes, scenario, eps=eps_by_scenario[scenario])
+            per_stage_dashboard(ckpt, args.episodes, scenario, eps=eps_by_scenario[scenario],
+                                env_base=env_base)
 
-    regime_uncertainty(ckpt, args.regime_episodes, bar, ceiling)
+    regime_uncertainty(ckpt, args.regime_episodes, bar, ceiling, env_base=env_base)
 
     if args.ar1:
         rhos = [float(x) for x in args.ar1_rhos.split(",") if x.strip() != ""]
-        ar1_comm_vs_rho(ckpt, args.regime_episodes, rhos, mu=args.ar1_mu, sigma=args.ar1_sigma)
-        ar1_env = make_ar1_env(args.ar1_rho, args.ar1_mu, args.ar1_sigma)
+        ar1_comm_vs_rho(ckpt, args.regime_episodes, rhos, mu=args.ar1_mu, sigma=args.ar1_sigma,
+                        env_base=env_base)
+        ar1_env = make_ar1_env(args.ar1_rho, args.ar1_mu, args.ar1_sigma, env_base)
         lbl = f"ar1 rho={args.ar1_rho:g}"
         comm_value_decomposition(ckpt, episodes=min(40, args.episodes), env=ar1_env, label=lbl)
         honesty_probe(ckpt, episodes=min(40, args.episodes), env=ar1_env, label=lbl)
         positive_listening(ckpt, episodes=min(20, args.episodes), env=ar1_env, label=lbl)
         message_weight_audit(ckpt, env=ar1_env)
     elif args.messages or args.full:
-        comm_value_decomposition(ckpt, episodes=min(40, args.episodes))
-        honesty_probe(ckpt, episodes=min(40, args.episodes))
-        positive_listening(ckpt, episodes=min(20, args.episodes))
-        message_weight_audit(ckpt)
+        comm_value_decomposition(ckpt, episodes=min(40, args.episodes), env_base=env_base)
+        honesty_probe(ckpt, episodes=min(40, args.episodes), env_base=env_base)
+        positive_listening(ckpt, episodes=min(20, args.episodes), env_base=env_base)
+        message_weight_audit(ckpt, env_base=env_base)
     print()
 
 

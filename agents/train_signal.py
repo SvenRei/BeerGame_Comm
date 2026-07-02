@@ -4,7 +4,9 @@ train_signal.py -- Hydra/W&B training entry point for the MINIMAL SIGNAL agent.
 SIGNAL (Strategic Information-sharing for Game-theoretic, Networked, Adaptive
 Logistics). The agent (signal_agent.SIGNALTrainer) owns the rollout (collect) and
 the MAPPO update; THIS file owns only: env construction, the training loop, the
-held-out-lambda gate, checkpointing, and W&B logging.
+held-out-lambda gate, checkpointing (incl. PERSISTING cfg.env in the checkpoint so
+eval_signal can rebuild the EXACT training env -- cost model, lead times), and W&B
+logging.
 
 Dependency set (self-contained; no legacy DRACO modules):
   agents.signal_agent        the agent + trainer + AGENTS (self-contained: torch only)
@@ -224,8 +226,16 @@ def main(cfg: DictConfig):
                 torch.save({"actors": [ac.state_dict() for ac in trainer.actors],
                             "critic": trainer.critic.state_dict(),
                             "config": A, "adj": adj.tolist(),
+                            "env": base,                # cfg.env AS TRAINED (cost model, lead times, ...).
+                            #                             eval_signal rebuilds its envs from THIS -- without
+                            #                             it, a canonical-cost (penalty_at_retailer_only) or
+                            #                             lead-time run is silently scored on the DEFAULT env
+                            #                             against the wrong references.
                             "obs_dim": obs_dim, "state_dim": state_dim,
                             "msg_content": A.get("msg_content"), "episode": ep,
+                            "seed": int(cfg.seed),      # TOP-LEVEL Hydra seed (NOT in agent cfg); the per-seed
+                            #                             dumps key filenames off this -- without it every
+                            #                             checkpoint mislabels as seed0 and CRN pairing breaks.
                             "best_heldout_cost": best},
                            os.path.join(run_dir, "signal_checkpoint_best.pt"))
                 log["Eval/best_heldout_cost"] = best

@@ -11,11 +11,23 @@ Three parts, and nothing else:
   (1) BELIEF  : one small GRU per agent over its local-observation history. The
                 hidden state IS the demand-regime belief. Trained end-to-end by
                 the policy gradient -- no separate ELBO/KL/reconstruction.
-  (2) HEAD    : ONE linear layer mapping [obs, belief, message] -> an order-up-to
-                level S. softplus is only a positivity link. No lead/safety/corr.
+  (2) HEAD    : ONE linear layer over [obs, belief, message] (and, when use_dhat_head,
+                the smoothed demand estimate d_hat) -> an order-up-to level S. softplus is
+                only a positivity link. d_hat is appended because gradient descent alone
+                failed to learn the demand-dependence within budget; its head weight is
+                warm-started near the textbook (lead+1) protection-interval multiplier.
+                It remains a fully-learnable linear layer -- no frozen lead/safety/corr prior.
   (3) MESSAGE : the semantic ladder {dhat | ip | dhat_ip | learned}, routed along
                 a topology with a one-step delay. This is the ONLY part we engineer
                 with care, because it is the object of study.
+                TRAINING OF THE LADDER (deliberate asymmetry, declared in the paper):
+                the NAMED rungs (dhat/ip/dhat_ip) have FIXED semantics -- their channel is
+                detached, and their content trains only through the sender's own objectives
+                (aux grounding, own S-head), which is what keeps d_hat an honest forecast.
+                The 'learned' rung is BY DEFINITION content optimized end-to-end for team
+                benefit, so its channel is DIFFERENTIABLE in the update (DIAL, Foerster et
+                al. 2016) -- see SIGNALTrainer._coupled_forward. Without that, msg_head/
+                msg_gain receive no gradient and the rung is a frozen random projection.
 Underneath: textbook CTDE-MAPPO (centralized per-agent critic on the global state
 during training, decentralized execution; PPO-clip; GAE). The economics layer
 (srdqn_beta cost-sharing + the coordinating transfer tau) rides on the reward in a
@@ -36,8 +48,10 @@ DATA FLOW (one timestep t), per agent i in [retailer, wholesaler, distributor, m
    REWARD:        r_i,t = -(own_cost_i + beta*others_cost) - tau*backlog_i (+ credit to customer)   <-- economics layer
 
 Honest status: this file is SYNTAX-checked (py_compile) and ships a shape self-test
-(`python signal_agent.py`, needs torch but NO env). Smoke-test it against the real env
-before trusting numbers.
+(`python signal_agent.py`, needs torch but NO env). The self-test now ALSO asserts the
+'learned' channel receives gradient (msg_head/msg_gain move after one update -- the DIAL
+fix). Smoke-test against the real env before trusting numbers. Pre-DIAL 'learned'
+checkpoints were trained with a FROZEN random-projection channel and must be retrained.
 ================================================================================
 """
 import numpy as np
@@ -69,7 +83,8 @@ def order_from_S(S, obs, max_order):
 # ============================================================================ #
 class SIGNALActor(nn.Module):
     def __init__(self, obs_dim, msg_dim, hidden, content, learned_msg_dim=3, s_init=50.0,
-                 log_std_init=-0.5, use_dhat_head=False, dhat_coef=5.0, dhat_init=0.0):
+                 log_std_init=-0.5, use_dhat_head=False, dhat_coef=5.0, dhat_init=0.0,
+                 learned_msg_gain=10.0):
         super().__init__()
         self.content = content
         self.msg_dim = msg_dim
@@ -98,8 +113,16 @@ class SIGNALActor(nn.Module):
         self.d_head = nn.Linear(hidden, 1)
         if dhat_init:                                               # start d_hat ~ mean demand (softplus link)
             nn.init.constant_(self.d_head.bias, float(dhat_init))
-        # (4) LEARNED message head: ONLY built for the interpretability-control rung.
+        # (4) LEARNED message head: ONLY built for the interpretability-control rung. A learnable GAIN
+        #     lifts the tanh output (bounded [-1,1]) to the SAME O(10) natural-unit scale as the dhat/ip
+        #     messages, so the receiver can weight it comparably -- without it the learned rung is
+        #     scale-handicapped (the /100 bug, but for learned) and a null result would be uninterpretable
+        #     (deaf receiver vs redundant content). Init = learned_msg_gain; the optimizer can adjust it.
+        #     NOTE: these parameters are trained ONLY via the DIAL path in SIGNALTrainer.update()
+        #     (_coupled_forward); they appear in no other loss.
         self.msg_head = (nn.Linear(obs_dim + hidden, learned_msg_dim)
+                         if content == "learned" else None)
+        self.msg_gain = (nn.Parameter(torch.tensor(float(learned_msg_gain)))
                          if content == "learned" else None)
 
     def belief(self, obs_seq, msg_seq, h0=None):
@@ -126,9 +149,9 @@ class SIGNALActor(nn.Module):
         if self.content == "dhat":     return dh
         if self.content == "ip":       return IP
         if self.content == "dhat_ip":  return torch.cat([dh, IP], dim=-1)
-        # 'learned' stays tanh-bounded (the interpretability control); it rides at O(1), so to make it
-        # commensurate with obs it would need a gain -- out of scope for the dhat/ip listening fix.
-        if self.content == "learned":  return torch.tanh(self.msg_head(torch.cat([obs, h], dim=-1)))
+        # 'learned' = gain * tanh(...) so its bounded code rides at the SAME O(10) scale as dhat/ip and is
+        # audible to the receiver (see msg_gain). tanh keeps it bounded; the gain restores the magnitude.
+        if self.content == "learned":  return self.msg_gain * torch.tanh(self.msg_head(torch.cat([obs, h], dim=-1)))
         raise ValueError(self.content)
 
 
@@ -167,7 +190,8 @@ class SIGNALTrainer:
         self.actors = nn.ModuleList([                              # per-agent actors (chain is heterogeneous)
             SIGNALActor(obs_dim, self.msg_dim, H, self.content, cfg.get("learned_msg_dim", 3),
                         s_init=s_init, log_std_init=log_std_init, use_dhat_head=use_dhat_head,
-                        dhat_coef=dhat_coef, dhat_init=dhat_init)
+                        dhat_coef=dhat_coef, dhat_init=dhat_init,
+                        learned_msg_gain=float(cfg.get("learned_msg_gain", 10.0)))
             for _ in range(n_agents)]).to(self.device)
         self.critic = SIGNALCritic(state_dim, H, n_agents).to(self.device)
         # --- optimisation (textbook PPO) ---
@@ -191,8 +215,11 @@ class SIGNALTrainer:
     # ---------------------------------------------------------------- rollout
     @torch.no_grad()
     def collect(self, env, seed, deterministic=False):
-        """Roll ONE episode. Messages are stored as RECEIVED and DETACHED, so in the update they are
-        fixed extended observations (plain MAPPO; no DIAL gradient -- a clean, defensible default)."""
+        """Roll ONE episode. Messages are stored as RECEIVED and DETACHED. In the update they are
+        fixed extended observations for the NAMED contents (plain MAPPO -- a clean, defensible
+        default that keeps d_hat/ip semantics grounded). For content='learned' the update IGNORES
+        the stored messages and recomputes them IN-GRAPH (_coupled_forward), so the channel trains
+        (DIAL). The rollout itself is identical either way: deterministic messages, one-step delay."""
         dev = self.device
         obs, _ = env.reset(seed=seed)
         h = [torch.zeros(1, 1, self.actors[i].hidden, device=dev) for i in range(self.N)]
@@ -246,6 +273,54 @@ class SIGNALTrainer:
             adv[t] = last
         return adv
 
+    # ------------------------------------------- DIAL forward (learned rung ONLY)
+    def _coupled_forward(self, obs_seq):
+        """Joint IN-GRAPH forward of all agents, coupled through ADJ with the SAME one-step message
+        delay as collect(): incoming_t = ADJ @ msg_{t-1}, msg_t = f_i(obs_t, h_t). Used by update()
+        ONLY when content='learned', so gradients flow  receiver-loss -> incoming -> ADJ -> sender
+        msg_gain / msg_head / GRU  (DIAL; Foerster et al. 2016) and the channel actually TRAINS.
+
+        [FIX: previously the learned message was collected DETACHED and never re-entered any loss,
+        so msg_head/msg_gain received no gradient and stayed at initialization forever -- a frozen
+        random projection. The H5 'unconstrained learned channel' rung was therefore vacuous.
+        Pre-fix 'learned' checkpoints must be retrained.]
+
+        FRAMING (why this does not change PPO's semantics): with the one-step delay, the four actors
+        + channel are ONE joint recurrent policy; the messages are cross-agent hidden state.
+        Recomputing them across the k_epochs is exactly what recurrent PPO already does with h --
+        at epoch 1 the recomputed messages equal the stored rollout messages bit-for-bit (same
+        parameters, deterministic channel), and later epochs drift the same way h drifts.
+
+        WHY the NAMED rungs are excluded: dhat must remain a demand forecast grounded by the aux
+        loss -- a team-gradient through the channel would co-opt it into an arbitrary control signal
+        and void the honesty probe's premise; ip is a parameter-free obs readout with nothing to
+        train. Detaching the named channels is therefore load-bearing, not a shortcut.
+
+        COST: stepwise T*N single-step GRU calls instead of fused per-agent sequences (~0.3-0.5 s
+        per update at T=50, N=4, hidden=64 on CPU) -- learned arm only; named arms keep the fast
+        path byte-identical.
+
+        obs_seq [T,N,obs] -> (h_all [T,N,hidden], msg_in_live [T,N,msg])."""
+        T = obs_seq.size(0)
+        dev = obs_seq.device
+        h = [torch.zeros(1, 1, self.actors[i].hidden, device=dev) for i in range(self.N)]
+        m_prev = torch.zeros(self.N, self.msg_dim, device=dev)
+        H_all, MIN = [], []
+        for t in range(T):
+            incoming = self.adj @ m_prev                          # [N,msg] (t-1 messages, IN-graph)
+            o = obs_seq[t]                                        # [N,obs]
+            h_t, m_t = [], []
+            for i in range(self.N):
+                h_seq, h[i] = self.actors[i].belief(o[i].view(1, 1, -1),
+                                                    incoming[i].view(1, 1, -1), h[i])
+                hi = h_seq[-1]                                    # [1,hidden]
+                h_t.append(hi.squeeze(0))                         # [hidden]
+                m_t.append(self.actors[i].message(o[i:i + 1], hi).reshape(-1))
+            H_all.append(torch.stack(h_t))                        # [N,hidden]
+            MIN.append(incoming)                                  # [N,msg]
+            m_prev = torch.stack(m_t)                             # NOT detached -- the DIAL edge
+        return torch.stack(H_all), torch.stack(MIN)               # [T,N,hidden], [T,N,msg]
+
     # ---------------------------------------------------------------- update
     def update(self, episodes):
         dev = self.device
@@ -268,7 +343,10 @@ class SIGNALTrainer:
             a_mu, a_sd = all_adv.mean(0), all_adv.std(0) + 1e-8
             for d in episodes:
                 d["adv"] = (d["adv"] - a_mu) / a_sd
-        # (C) PPO-clip actor + MSE critic, re-running the GRU over stored sequences (BPTT) ----------
+        # (C) PPO-clip actor + MSE critic, re-running the GRU over stored sequences (BPTT). ---------
+        #     For content='learned' the MESSAGES are also recomputed in-graph via _coupled_forward
+        #     (DIAL), so the channel is trainable. Named contents keep the stored, DETACHED messages
+        #     (fixed semantics; grounded content). Same PPO surrogate either way.
         a_loss = c_loss = 0.0
         for _ in range(self.k_epochs):
             self.opt.zero_grad()
@@ -278,12 +356,19 @@ class SIGNALTrainer:
                 V = self.critic(d["gstate"])                      # [T,N]
                 closs = F.mse_loss(V, d["vtarget"])
                 ploss = torch.zeros((), device=dev)
+                if self.content == "learned":                     # DIAL: one joint in-graph forward
+                    h_live, min_live = self._coupled_forward(d["obs"])   # [T,N,hid], [T,N,msg]
                 for i in range(self.N):
-                    obs_i = d["obs"][:, i, :].unsqueeze(1)        # [T,1,obs]
-                    msg_i = d["msg_in"][:, i, :].unsqueeze(1)     # [T,1,msg]  (fixed/detached from rollout)
-                    h_seq, _ = self.actors[i].belief(obs_i, msg_i)
-                    h = h_seq.squeeze(1)                          # [T,hidden]
-                    S_mu, S_std = self.actors[i].base_stock(d["obs"][:, i, :], h, d["msg_in"][:, i, :])
+                    if self.content == "learned":
+                        h = h_live[:, i, :]                       # [T,hidden]  (channel in-graph)
+                        msg_i_used = min_live[:, i, :]            # [T,msg]     (channel in-graph)
+                    else:
+                        obs_i = d["obs"][:, i, :].unsqueeze(1)    # [T,1,obs]
+                        msg_i = d["msg_in"][:, i, :].unsqueeze(1) # [T,1,msg]  (fixed/detached from rollout)
+                        h_seq, _ = self.actors[i].belief(obs_i, msg_i)
+                        h = h_seq.squeeze(1)                      # [T,hidden]
+                        msg_i_used = d["msg_in"][:, i, :]
+                    S_mu, S_std = self.actors[i].base_stock(d["obs"][:, i, :], h, msg_i_used)
                     logp_new = Normal(S_mu, S_std).log_prob(d["S"][:, i, :]).sum(-1)   # [T]
                     ratio = torch.exp(logp_new - d["logp"][:, i])                       # pi_new/pi_old
                     A = d["adv"][:, i]
@@ -304,6 +389,8 @@ class SIGNALTrainer:
 
 # ============================================================================ #
 # Shape self-test (run: `python signal_agent.py`). Needs torch, NOT the env.     #
+# Now also asserts the DIAL fix: for content='learned', msg_head/msg_gain MOVE   #
+# after one update (they receive gradient through the coupled in-graph channel). #
 # ============================================================================ #
 if __name__ == "__main__":
     torch.manual_seed(0)
@@ -321,7 +408,24 @@ if __name__ == "__main__":
               "logp": torch.randn(T, N), "cost": torch.rand(T, N) * 50,
               "dtgt": torch.rand(T, N) * 20, "done": torch.zeros(T)}
         ep["done"][-1] = 1.0
+        # DIAL gradient-flow assertion: snapshot the learned channel's params before the update.
+        pre_w = pre_g = None
+        if content == "learned":
+            pre_w = tr.actors[0].msg_head.weight.detach().clone()
+            pre_g = float(tr.actors[0].msg_gain.detach())
+            hh, mm = tr._coupled_forward(ep["obs"])                 # shape contract of the DIAL path
+            assert hh.shape == (T, N, H) and mm.shape == (T, N, md), (hh.shape, mm.shape)
+            assert mm.requires_grad, "coupled messages must be IN-graph (DIAL edge)"
+        else:
+            assert tr.actors[0].msg_head is None and tr.actors[0].msg_gain is None
         a, c = tr.update([ep, dict(ep)])
+        dial_note = ""
+        if content == "learned":
+            dw = float((tr.actors[0].msg_head.weight.detach() - pre_w).abs().max())
+            dg = abs(float(tr.actors[0].msg_gain.detach()) - pre_g)
+            assert dw > 1e-9 and dg > 1e-12, \
+                f"DIAL broken: learned channel got no gradient (dW={dw:.2e}, dGain={dg:.2e})"
+            dial_note = f"  DIAL: dW={dw:.1e} dGain={dg:.1e} (channel trains)"
         # exercise a single-agent forward at one step
         h0 = torch.zeros(1, 1, H)
         hs, _ = tr.actors[0].belief(torch.rand(1, 1, OBS), torch.rand(1, 1, md), h0)
@@ -330,5 +434,6 @@ if __name__ == "__main__":
         assert Smu.shape == (1, 1) and m.shape[-1] == md
         n_params = sum(p.numel() for p in tr.params)
         print(f"  content={content:<8} msg_dim={md}  params={n_params:>7,}  "
-              f"a_loss={a:+.3f} c_loss={c:+.3f}  S={float(Smu):.1f}  msg_dim_out={m.shape[-1]}  OK")
-    print("signal_agent shape self-test PASS (all four message rungs build, update, and act)")
+              f"a_loss={a:+.3f} c_loss={c:+.3f}  S={float(Smu):.1f}  msg_dim_out={m.shape[-1]}  OK{dial_note}")
+    print("signal_agent shape self-test PASS (all four message rungs build, update, and act;")
+    print("                                  'learned' channel verified TRAINABLE via DIAL)")

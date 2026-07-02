@@ -8,6 +8,8 @@ algorithm: signal
 use_comm: true            # false -> ADJ is zeroed (no-comm control, IDENTICAL architecture)
 msg_content: dhat         # dhat | ip | dhat_ip | learned   (the semantic ladder)
 learned_msg_dim: 3        # message width when msg_content=learned (interpretability control)
+learned_msg_gain: 10.0    # gain on the tanh learned message so it rides at the same O(10) scale as dhat/ip
+                          # (bounded but AUDIBLE; without it the learned rung is scale-handicapped -> H5 invalid)
 comm_topology: neighbor   # neighbor | skip | full | retailer_broadcast | no_neighbor
 
 # ===================== economics layer (rides on the reward) =====================
@@ -17,6 +19,15 @@ tau: 0.0                  # coordinating transfer on UPSTREAM backorders; tau* =
 # ===================== agent size =====================
 hidden: 64                # GRU hidden = belief width AND critic width
 max_order: 100            # must match env.max_order
+# Base-stock head: condition the order-up-to level S on the SMOOTHED, grounded demand estimate d_hat,
+# so the policy is REGIME-ADAPTIVE  (S ~= dhat_coef*d_hat + safety; textbook (lead+1)*demand + safety).
+# Uses d_hat (not raw last_demand) so no Poisson noise enters S -> no bullwhip. This couples demand->S
+# AND lets COMM affect ordering (message -> belief h -> d_hat -> S). use_dhat_head=false recovers the
+# minimal constant base-stock (the sweep showed optimization alone can't make that constant adapt).
+use_dhat_head: true
+dhat_coef: 5              # init weight on d_hat in the S-head (~ lead+1 = protection interval)
+dhat_init: 14            # init d_head bias so d_hat starts ~ mean training demand (softplus link)
+s_init: 5                 # head bias / safety floor (small; d_hat now supplies the demand-scaled level)
 
 # ===================== training env =====================
 train_env: dr_poisson     # dr_poisson | ar1 | family
@@ -47,9 +58,15 @@ vf_coef: 0.5
 aux_coef: 0.1             # d_hat grounding (keeps the demand message interpretable as a forecast)
 max_grad_norm: 0.5
 lr: 3.0e-4
+reward_scale: 1.0         # divide the shaped reward (critic-target scale). >1 (e.g. 100) shrinks the critic
+                          # gradient so the shared grad-clip stops starving the actor -> S can actually move
+log_std_init: -0.5        # initial exploration std on S = exp(log_std_init); raise (e.g. 1.0 => std ~2.7)
 
 # ===================== training loop =====================
 batch_episodes: 8
+log_every: 100            # heartbeat: print ep / train cost / losses every N episodes (0 = only gate prints)
+patience: 0               # early stop after this many episodes with NO held-out improvement (0 = off; sweep ~2000).
+                          # The best-gated checkpoint is always kept, so early stop never loses the best policy.
 warm_up_episodes: 0       # 0: SIGNAL's belief is trained by the policy gradient (no pre-train)
 use_gpu: false            # training is CPU-bound (sequential per-step encode); CPU torch wheels
 
