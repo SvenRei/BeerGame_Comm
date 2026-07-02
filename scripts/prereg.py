@@ -15,13 +15,14 @@ over the canonical JSON. Commit that hash (thesis appendix / README). Any later
 edit to the registered fields changes the hash; legitimate changes go through
 REGISTRATION['amendments'] with a date and reason, never by silent edit.
 
-BUDGET ARITHMETIC (training runs, 15 seeds/arm):
-  confirmatory : nocomm 15 (P1)  +  upstream_only x dhat 15 (P2)  +  retailer_broadcast x dhat 15 (S1) = 45
-  F_GEOMETRY   : 8 further topologies x dhat x 15                                                      = 120
-  F_CONTENT    : {ip, dhat_ip, learned} x upstream_only x 15                                           = 45
-  H2 (AR1)     : rho in {0,.3,.6,.9} x {comm, nocomm} x 15                                             = 120
-  TOTAL ~ 330. Only the 45 confirmatory runs are binding; secondary-family and H2
-  arms may be trimmed (fewer seeds) via an amendment BEFORE unblinding, not after.
+BUDGET ARITHMETIC (training runs, 15 seeds/arm; == sweep_all_hypotheses.sh after v1.1):
+  Phase A (H1/H2/H3 gradient, upstream_only): 10 configs x 15 = 150   (+ dp_rbroadcast S1: 15)
+  Phase B/Bnull (F_GEOMETRY @ rho0.9 + rho0 placebos): 7 configs x 15                        = 105
+  Phase C (F_CONTENT @ rbroadcast rho0.9): {raw, ip, dhat_ip, learned} x 15                  = 60
+  Phase D (H7 strategic, canonical): 3 x 15                                                  = 45
+  Phase E (F_INCENTIVE @ rho0.9): {b0, b0.5} x {comm, nocomm} x 15                           = 60
+  CORE ~ 435 (+ extended Bext/Dext 105). Only P1/P2/S1/S2 arms are binding; secondary
+  arms may be trimmed (fewer seeds) via a dated amendment BEFORE unblinding, not after.
 
 CONSUMERS: scripts/comm_stats.py produces value_of_sharing dicts; h1_decision()
 applies the registered decision rule to one. holm_family() wraps
@@ -46,13 +47,13 @@ from scripts.c1_stats import bootstrap_ci, compare_many                     # no
 # ============================================================================ #
 REGISTRATION = {
     "study": "SIGNAL: the value of demand-information sharing in decentralized MARL (4-echelon beer game)",
-    "version": "1.0",
-    "frozen": "2026-07-02",
+    "version": "1.1",
+    "frozen": "2026-07-02",     # v1.1 same-day PRE-LAUNCH amendment (see 'amendments'); no data observed
 
     # ---------------------------------------------------------------- design
     "design": {
         "seeds_per_arm": 15,
-        "seeds": list(range(101, 116)),          # identical across arms; CRN pairing is BY SEED
+        "seeds": list(range(10, 25)),            # == sweep_all_hypotheses.sh SEEDS; CRN pairing is BY SEED
         "test_lambdas": [6.0, 10.0, 14.0, 18.0, 22.0],     # scoring only; NEVER used for selection
         "validation_lambdas": [8.0, 12.0, 16.0, 20.0],     # checkpoint gate only (train_signal heldout)
         "eval_episodes_per_lambda": 200,                    # eval_signal --dump-episodes
@@ -60,8 +61,13 @@ REGISTRATION = {
         "cost_model": "team (holding+backorder charged at every stage) for H1-H4 headline; "
                       "the canonical (penalty_at_retailer_only) variant is the C1-gap chapter only, "
                       "with baselines regenerated on the SAME cost model",
-        "primary_inference": "95% bootstrap CI (10k resamples) over seed-paired differences; "
-                             "Wilcoxon signed-rank as the p-value companion (n=15, exact)",
+        "primary_inference": "95% STUDENTIZED bootstrap-t CI (10k resamples) over seed-paired "
+                             "means; Wilcoxon signed-rank as the p-value companion (n=15, exact). "
+                             "Method choice is calibration-driven: at n=15, percentile coverage "
+                             "measured .910 (normal) / .887 (skewed), BCa .912/.890 (no repair), "
+                             "bootstrap-t .953/.938 (near-nominal) -- appendix reports the sims",
+        "budget_milestones": [1000, 2000, 4000, 8000],   # deployable-at-budget snapshots (substitution curve)
+        "training_defaults": "EP=8000, patience=2000, gate every 200 eps on validation keys only",
         "tost_band_frac": 0.02,                             # practical-equivalence band: +-2% of no-comm cost
         "alpha": 0.05,
     },
@@ -95,11 +101,19 @@ REGISTRATION = {
     # --------------------------------------------------------- sensitivity
     "sensitivity": {
         "S1_max_favorable_geometry": {
-            "arms": {"comm": "topology=retailer_broadcast, content=dhat", "baseline": "nocomm"},
+            "arms": {"comm": "topology=retailer_broadcast, content=dhat (arm dp_rbroadcast)",
+                     "baseline": "nocomm"},
+            "regime": "dr_poisson, TEST lambdas (SAME regime as P2 -- the comparison it interprets)",
             "rule": "same decision rule as P2. Interprets P2: if even the maximally favorable "
                     "geometry (clean customer signal to every stage, one hop) is NULL, the serial "
                     "null is decisive; if S1 is POSITIVE while P2 is NULL, hop-by-hop relay is the "
                     "bottleneck (a mechanism finding, not a contradiction).",
+        },
+        "S2_stationarity_null_family_robustness": {
+            "arms": {"comm": "topology=upstream_only, content=dhat", "baseline": "nocomm"},
+            "regime": "AR(1) rho=0 (white noise), scored in-regime at rho=0",
+            "rule": "same decision rule as P2; checks the stationarity null is not a Poisson-family "
+                    "artifact (the rho=0 endpoint of the H2 gradient, reused).",
         },
     },
 
@@ -110,7 +124,9 @@ REGISTRATION = {
     # TOST pass, with the TOST p-values Holm-corrected within the predicted-null subfamily.
     "secondary_families": {
         "F_GEOMETRY": {
-            "content": "dhat", "baseline": "nocomm",
+            "content": "dhat", "baseline": "nocomm at the SAME regime",
+            "regime": "AR(1) rho=0.9, scored IN-REGIME (rho-keyed dumps) -- geometry is tested where "
+                      "value exists to route; at the stationarity null every geometry is trivially null",
             "members": {
                 "neighbor":              {"prediction": "positive", "why": "contains the Lee upstream link"},
                 "skip":                  {"prediction": "exploratory", "why": "2-hop shortcuts"},
@@ -123,11 +139,20 @@ REGISTRATION = {
             },
         },
         "F_CONTENT": {
-            "topology": "upstream_only", "baseline": "nocomm",
+            "topology": "retailer_broadcast", "baseline": "nocomm at the SAME regime",
+            "regime": "AR(1) rho=0.9, scored in-regime (max-favorable geometry isolates CONTENT with "
+                      "the strongest channel; matches sweep Phase C)",
             "members": {
+                "raw":      {"prediction": "exploratory", "why": "POS DATA-sharing rung; the classical "
+                             "CPFR contrast forecast-vs-data (Aviv 2001/2007; Cachon-Fisher 2000)"},
                 "ip":       {"prediction": "exploratory", "why": "VMI channel (Cachon-Fisher)"},
                 "dhat_ip":  {"prediction": "positive", "why": "superset of the primary content"},
                 "learned":  {"prediction": "exploratory", "why": "end-to-end optimized channel (DIAL)"},
+            },
+            "D1_forecast_vs_data": {
+                "contrast": "dhat vs raw (both retailer_broadcast, rho=0.9), seed-paired",
+                "prediction": "dhat weakly cheaper (a smoothed grounded forecast dominates one noisy "
+                              "observation -- Aviv); directional, exploratory",
             },
             "C3_interpretability_bound": {
                 "contrast": "learned vs dhat_ip (both upstream_only), seed-paired",
@@ -138,6 +163,47 @@ REGISTRATION = {
                                  "(exploratory follow-up: what does it encode? honesty probe)",
             },
         },
+    },
+
+    # ----------------------------------------------- incentives (Tier-2 axis)
+    "F_INCENTIVE": {
+        "question": "does the value of sharing survive incentive misalignment?",
+        "content_and_topology": "dhat x upstream_only (the P2 channel)",
+        "regime": "AR(1) rho=0.9, scored in-regime (V must exist for its incentive-modulation to be "
+                  "measurable; at a null V there is nothing to modulate)",
+        "betas": {"0.0": "self-interested", "0.5": "half-aligned", "1.0": "cooperative (REUSED from "
+                  "the H2 rho=0.9 pair; not retrained)"},
+        "baseline": "nocomm at the MATCHED beta -- V(beta) = cost(nocomm,beta) - cost(comm,beta) "
+                    "isolates communication within a fixed incentive regime",
+        "estimand_note": "V is always TEAM cost (system efficiency), even when training is "
+                         "self-interested; per-stage costs reported descriptively",
+        "why_dhat_only": "dhat is SELF-VERIFYING cheap talk: the sender's own S-head consumes its "
+                         "d_hat, so misreporting is self-punishing regardless of beta -- the "
+                         "strategic margin under misalignment is receiver-side TRUST/USE (listening), "
+                         "not sender-side lying. The 'learned' content is EXCLUDED from this axis: "
+                         "under DIAL its channel is trained by the RECEIVERS' gradients, so it is "
+                         "delegated communication, not strategic sending -- a beta-grid on it would "
+                         "not test cheap talk (Crawford-Sobel) and would mislabel the mechanism.",
+        "tests": "Holm over {beta0, beta05} member superiority tests vs matched-beta nocomm; "
+                 "exploratory per-seed slope of V(beta) over {0,.5,1}; mechanism gates "
+                 "(honesty corr, listening slope) reported PER beta",
+        "predictions": {"honesty(beta)": "flat (self-verifying signal)",
+                        "listening/V(beta)": "open -- degradation = incentive-sensitive trust; "
+                                             "flat = information is information"},
+    },
+
+    # ---------------------------------------- substitution curve (Tier-1 attachment)
+    "SUBSTITUTION_CURVE": {
+        "status": "exploratory-registered (named statistic, no confirmatory alpha spent)",
+        "claim_frame": "inference capacity and information sharing are SUBSTITUTES; the classical "
+                       "redundancy null (Raghunathan 2001) is the infinite-inference limit",
+        "producers": "signal_checkpoint_budget{1000,2000,4000,8000}.pt per seed on the P2 pair "
+                     "(dr_poisson) AND the rho=0.9 pair (AR1), dumped per budget",
+        "statistic": "per-seed OLS slope of V_s over log2(budget), seeds with all budgets; "
+                     "bootstrap-t CI; tie-naive Spearman companion (comm_stats.py curve)",
+        "readings": {"slope CI < 0": "substitutes (V vanishes as inference is learned)",
+                     "slope CI > 0": "complements (exploiting a channel must itself be learned)",
+                     "spans 0": "no budget trend at these milestones"},
     },
 
     # ------------------------------------------------------------------ H2
@@ -164,7 +230,12 @@ REGISTRATION = {
                 "high AND (listening slope dS/dTold materially > 0 at >=1 receiver OR message-weight "
                 "ratios materially > 0). Otherwise the verdict is 'instrument failure (deaf/pruned "
                 "channel)' and the cell is excluded from economic claims.",
-        "instruments": ["honesty_probe", "positive_listening (per component)", "message_weight_audit"],
+        "instruments": ["honesty_probe", "positive_listening (per component)", "message_weight_audit",
+                        "message_intervention (honest vs shuffled vs cross vs zeroed, CRN-paired)"],
+        "content_attribution_rule": "a POSITIVE V is attributed to message CONTENT (not channel "
+                                    "presence/scale) only if the intervention probe shows "
+                                    "delta(shuffled - honest) CI > 0 on that arm; otherwise the "
+                                    "claim is 'the channel helps' without a content mechanism",
     },
 
     "exploratory": "everything else: per-lambda breakdowns, bullwhip decompositions, forecast-error "
@@ -173,6 +244,16 @@ REGISTRATION = {
 
     "amendments": [
         # append dicts {"date": ..., "change": ..., "reason": ...} BEFORE unblinding; never edit above
+        {"date": "2026-07-02", "change": "v1.0 -> v1.1 (pre-launch, no data observed): (1) primary CI "
+         "percentile -> studentized bootstrap-t after calibration sims (coverage .91 -> .95); "
+         "(2) seeds aligned to the sweep (10..24); (3) S1 pinned to dr_poisson via new dp_rbroadcast "
+         "arm; S2 (rho=0 family-robustness) added; (4) F_GEOMETRY/F_CONTENT regimes pinned to the "
+         "executed design (rho=0.9 in-regime; F_CONTENT topology=retailer_broadcast per sweep Phase C); "
+         "(5) raw POS-data rung + D1 forecast-vs-data contrast added; (6) F_INCENTIVE (Tier-2 axis) "
+         "added; (7) SUBSTITUTION_CURVE exploratory-registered; (8) message-intervention instrument + "
+         "content-attribution rule added",
+         "reason": "reconcile registration with sweep_all_hypotheses.sh before launch; statistics "
+         "calibration; Tier-1/Tier-2 scope additions"},
     ],
 }
 
@@ -238,8 +319,11 @@ def h2_slope(comm, nocomm, n_boot=10000, seed=0):
         slopes.append(float(np.polyfit(np.array(rhos), v, 1)[0]))
     slopes = np.asarray(slopes, float)
     lo, hi = bootstrap_ci(slopes, n_boot=n_boot, seed=seed)
+    from scripts.c1_stats import paired
+    pr = paired(slopes, np.zeros_like(slopes))          # Wilcoxon companion on the per-seed slopes
     return {"seeds": seeds, "slopes": slopes.tolist(), "mean_slope": float(slopes.mean()),
-            "ci95": [float(lo), float(hi)], "h2_holds": bool(lo > 0)}
+            "ci95": [float(lo), float(hi)], "wilcoxon_p": pr["wilcoxon_p"],
+            "h2_holds": bool(lo > 0)}
 
 
 # ============================================================================ #

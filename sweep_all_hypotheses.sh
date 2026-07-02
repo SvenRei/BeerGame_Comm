@@ -15,25 +15,42 @@
 #    plus buffer for a couple of non-converging runs).
 #
 #   PHASE  QUESTION            FIXED                                   SWEPT                              runs(x15)
-#   A      H1,H2,H3            content=dhat, topology=neighbor,        regime in {dr_poisson, ar1_rho0,   150
+#   A      H1,H2,H3 (+S1)      content=dhat, topology=upstream_only,   regime in {dr_poisson, ar1_rho0,   165
 #                              behavioral cost                          .3,.6,.9} x {comm, nocomm}
+#                              [upstream_only = the REGISTERED primary  + dp_rbroadcast (S1 sensitivity:
+#                               P2 topology (prereg v1.1); neighbor       max-favorable geometry under the
+#                               moved to Phase B as a geometry point]     Poisson null)
 #   B      H4 geometry         content=dhat, rho=0.9, behavioral        topo in {no_neighbor,             75
-#                                                                        retailer_broadcast, upstream_only,
+#                                                                        retailer_broadcast, neighbor,
 #                                                                        downstream_only, manufacturer_broadcast}
 #   Bnull  H4 null-of-null     content=dhat, rho=0.0, behavioral        topo in {retailer_broadcast,      30
 #                                                                        no_neighbor}
-#   C      H5 content ladder   topology=retailer_broadcast, rho=0.9     content in {ip, dhat_ip, learned} 45
+#   C      H5 content ladder   topology=retailer_broadcast, rho=0.9     content in {ip, dhat_ip,          60
+#                              (+ D1 data-vs-forecast: raw vs dhat)      learned, raw}
 #   D      H7 strategic        content=dhat_ip, topology=neighbor,      (beta,tau) in {(1,0),(0,0),(0,t*)}45
 #                              CANONICAL cost, dr_poisson
-#   ---- core total = 345 ----
+#   E      F_INCENTIVE         content=dhat, topology=upstream_only,    beta in {0.0, 0.5} x               60
+#          V(beta) cheap-talk  rho=0.9, BEHAVIORAL cost, tau=0          {comm, nocomm-at-MATCHED-beta}
+#                              [beta=1.0 point REUSED from Phase A: ar1r9_upstream / ar1r9_nocomm]
+#   ---- core total = 435 ----
 #   Bext   H4 wider geometry   as B                                     topo in {skip, full,             60
 #                                                                        link_top_only, link_bottom_only}
 #   Dext   H7 x autocorrelation as D but rho=0.9 (canonical)            (beta,tau) as D                   45
-#   ---- extended total = +105 ----
+#   ---- extended total = +105 (540) ----
 #
-#   REUSE (do NOT retrain): H4's neighbor point = Phase A's ar1r9_neighbor; H4's nocomm baseline =
-#   A's ar1r9_nocomm; H5's dhat point = Phase B's ar1r9_rbroadcast. These are analysis-time reuses;
-#   the per-phase run counts above already exclude them (all trained configs are distinct).
+#   REUSE (do NOT retrain): H4's upstream point = Phase A's ar1r9_upstream; H4's nocomm baseline =
+#   A's ar1r9_nocomm; H5's dhat point = Phase B's ar1r9_rbroadcast; E's beta=1.0 pair = Phase A's
+#   ar1r9_upstream / ar1r9_nocomm. Analysis-time reuses; per-phase counts exclude them.
+#
+#   SUBSTITUTION CURVE (registered exploratory): every train run also snapshots the best-so-far
+#   checkpoint at agent.budget_milestones=$MILESTONES episodes (signal_checkpoint_budget{M}.pt =
+#   deployable-at-budget-M). STAGE=dump scores the dp and ar1r9 primary pairs at each milestone;
+#   STAGE=analyze fits the per-seed V-vs-log2(budget) slope (scripts/comm_stats.py curve).
+#
+#   INTERVENTION / CONTENT-ATTRIBUTION GATE (registered validity gate): STAGE=probe runs the do(m)
+#   message-intervention probe (honest/shuffled/cross/zeroed) per seed on the V-claiming arms and
+#   dumps seed{S}_iv.json; cross-seed gate: scripts/comm_stats.py interventions --dir DIR. A
+#   positive V is attributed to CONTENT only if the cross-seed delta(shuffled) CI excludes 0.
 #
 #   H6 (belief-capacity substitution) is EXCLUDED: it needs a GRU<->CRAFT encoder_type swap that does
 #   not exist in signal_agent.py. Sweeping a knob with no code is a mistake; build it as its own phase.
@@ -83,10 +100,16 @@
 #   # ... regenerate baselines_regime_v2.json for CANONICAL cost, then:
 #   PHASES="D Dext" NPROC=48 ./sweep_all_hypotheses.sh       # canonical phases
 #   PHASES=all ./sweep_all_hypotheses.sh                     # everything (warns about mixed cost models)
+#   STAGE=dump    ./sweep_all_hypotheses.sh                  # per-seed producers (needs checkpoints)
+#   STAGE=probe   ./sweep_all_hypotheses.sh                  # do(m) intervention dumps (V-claiming arms)
+#   STAGE=analyze ./sweep_all_hypotheses.sh                  # registered statistics
 #
 # OVERRIDABLE ENV (defaults in brackets):
 #   SEEDS[10..24 =15] EP[8000] PATIENCE[2000] HELDOUT_EPISODES[8] THREADS_PER_JOB[1]
-#   NPROC[cores/threads] TAU_STAR[1.0] PHASES[core] DRYRUN[0] PYTHON[python] OUTROOT[./sweep_out]
+#   NPROC[cores/threads] TAU_STAR[1.0] PHASES[core] STAGE[train] DRYRUN[0] PYTHON[python]
+#   OUTROOT[./sweep_out] MILESTONES[[1000,2000,4000,8000]] DUMP_EPISODES[200]
+#   PROBE_EPISODES[40] PROBE_ARMS[ar1r9_upstream ar1r9_rbroadcast ar1r9_rbroadcast_learned
+#                                 ar1r9_rbroadcast_raw ar1r9_beta0_upstream ar1r9_beta05_upstream]
 # ============================================================================
 set -euo pipefail
 
@@ -105,9 +128,12 @@ HELDOUT_EPISODES="${HELDOUT_EPISODES:-8}"
 THREADS_PER_JOB="${THREADS_PER_JOB:-1}"
 TAU_STAR="${TAU_STAR:-1.0}"                                        # CANONICAL-cost tau* = p - b_private = 1.0 (see header)
 PHASES="${PHASES:-core}"
-STAGE="${STAGE:-train}"                                            # train | dump | analyze | all
+STAGE="${STAGE:-train}"                                            # train | dump | probe | analyze | all
 DUMP_EPISODES="${DUMP_EPISODES:-200}"                             # episodes/key for the per-seed producers
 AR1_MU="${AR1_MU:-12.0}"; AR1_SIGMA="${AR1_SIGMA:-3.0}"          # AR(1) eval params (match training)
+MILESTONES="${MILESTONES:-[1000,2000,4000,8000]}"                # REGISTERED substitution-curve grid
+PROBE_EPISODES="${PROBE_EPISODES:-40}"                            # episodes/seed for the do(m) probe
+PROBE_ARMS="${PROBE_ARMS:-ar1r9_upstream ar1r9_rbroadcast ar1r9_rbroadcast_learned ar1r9_rbroadcast_raw ar1r9_beta0_upstream ar1r9_beta05_upstream}"
 DRYRUN="${DRYRUN:-0}"
 OUTROOT="${OUTROOT:-$ROOT/sweep_out}"
 LOGDIR="$OUTROOT/logs"
@@ -125,8 +151,8 @@ export WANDB_MODE=disabled PYTHONUNBUFFERED=1
 SEL=""
 for p in $PHASES; do
   case "$p" in
-    all)      SEL="$SEL A B Bnull C D Bext Dext" ;;
-    core)     SEL="$SEL A B Bnull C D" ;;
+    all)      SEL="$SEL A B Bnull C D E Bext Dext" ;;
+    core)     SEL="$SEL A B Bnull C D E" ;;
     extended) SEL="$SEL Bext Dext" ;;
     *)        SEL="$SEL $p" ;;
   esac
@@ -157,19 +183,26 @@ emit() {                                  # emit <algo_base> <hydra args...>  (d
   for s in $SEEDS; do printf '%s\t%s\t%s\n' "$algo" "$s" "$*" >> "$JOBS"; done
 }
 
-# ---- Phase A: core gradient (H1, H2, H3) -- dhat, neighbor, behavioral ----
+# ---- Phase A: core gradient (H1, H2, H3) -- dhat, upstream_only, behavioral ----
+# upstream_only is the REGISTERED P1_C1/P2_H1 primary topology (prereg v1.1): the Lee-correct
+# hop-by-hop VMI direction, the geometry the analytical mechanism speaks about. The dp_rbroadcast
+# arm is the REGISTERED S1 sensitivity: if the Poisson null (P1) holds even under the maximally
+# favorable clean-signal broadcast, the null is decisive, not a weak-instrument artifact.
 if want A; then
-  emit "dp_neighbor" "$BEHAV $DP $(COMM neighbor)"
-  emit "dp_nocomm"   "$BEHAV $DP $NOCOMM"
+  emit "dp_upstream"   "$BEHAV $DP $(COMM upstream_only)"
+  emit "dp_nocomm"     "$BEHAV $DP $NOCOMM"
+  emit "dp_rbroadcast" "$BEHAV $DP $(COMM retailer_broadcast)"
   for r in 0.0 0.3 0.6 0.9; do t="${RHOTAG[$r]}"
-    emit "${t}_neighbor" "$BEHAV $(AR "$r") $(COMM neighbor)"
+    emit "${t}_upstream" "$BEHAV $(AR "$r") $(COMM upstream_only)"
     emit "${t}_nocomm"   "$BEHAV $(AR "$r") $NOCOMM"
   done
 fi
 
 # ---- Phase B: geometry core (H4) -- rho0.9, dhat, behavioral ----
+# (neighbor sits here now that upstream_only carries the Phase-A primary; the ar1r9 upstream
+#  point and the nocomm baseline are REUSED from Phase A at analysis time.)
 if want B; then
-  for topo in no_neighbor retailer_broadcast upstream_only downstream_only manufacturer_broadcast; do
+  for topo in no_neighbor retailer_broadcast neighbor downstream_only manufacturer_broadcast; do
     emit "ar1r9_${SHORT[$topo]}" "$BEHAV $(AR 0.9) $(COMM "$topo")"
   done
 fi
@@ -188,11 +221,15 @@ if want Bext; then
   done
 fi
 
-# ---- Phase C: content ladder (H5) -- rho0.9, retailer_broadcast, behavioral ----
+# ---- Phase C: content ladder (H5 + D1) -- rho0.9, retailer_broadcast, behavioral ----
+# raw = UNPROCESSED last demand (classical POS-data sharing, Cachon-Fisher 2000); dhat (reused
+# from Phase B's ar1r9_rbroadcast) = the GRU FORECAST (Aviv 2001/2007). Their REGISTERED contrast
+# is D1 (data vs forecast); prediction: dhat weakly cheaper (the forecast pre-filters noise).
 if want C; then
   emit "ar1r9_rbroadcast_ip"      "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=ip"
   emit "ar1r9_rbroadcast_dhatip"  "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=dhat_ip"
   emit "ar1r9_rbroadcast_learned" "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=learned"
+  emit "ar1r9_rbroadcast_raw"     "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw"
 fi
 
 # ---- Phase D: strategic core (H7) -- CANONICAL cost, dr_poisson, dhat_ip, neighbor ----
@@ -209,6 +246,32 @@ if want Dext; then
   emit "cn_ar1r9_coop"     "$DXFIX agent.srdqn_beta=1.0 agent.tau=0.0"
   emit "cn_ar1r9_selfish"  "$DXFIX agent.srdqn_beta=0.0 agent.tau=0.0"
   emit "cn_ar1r9_contract" "$DXFIX agent.srdqn_beta=0.0 agent.tau=$TAU_STAR"
+fi
+
+# ---- Phase E: incentive x communication (F_INCENTIVE) -- BEHAVIORAL, rho0.9, dhat, upstream ----
+# The Crawford-Sobel question in RL form: does the VALUE of the dhat channel survive as sender
+# incentives misalign (beta 1.0 -> 0.5 -> 0.0)? Design registered in prereg v1.1 F_INCENTIVE:
+#   * V(beta) = cost(nocomm@beta) - cost(comm@beta), BOTH arms trained at the SAME beta -- the
+#     matched-beta baseline isolates communication WITHIN each incentive regime (an unmatched
+#     baseline would confound incentive effects with channel effects).
+#   * V is ALWAYS measured in TEAM cost units (eval sums all stages' realized costs regardless of
+#     the training beta), so V(beta) is comparable across the grid.
+#   * dhat ONLY: dhat is self-verifying cheap talk (the sender's own S-head consumes its d_hat, so
+#     misreporting is self-punishing; the strategic margin is receiver TRUST). The learned rung is
+#     EXCLUDED by design -- under DIAL it is trained by the receivers' gradients (delegated
+#     communication, not strategic sending), so a beta-grid on it would not test cheap talk.
+#   * beta=1.0 point REUSED from Phase A (ar1r9_upstream / ar1r9_nocomm); tau=0 throughout
+#     (the contract axis is Phase D's question, not this one).
+# DISCLOSED LIMITATION: checkpoint selection gates on held-out TEAM cost in ALL arms (the shared
+# instrument). Under beta<1 that criterion is not the agents' own objective, so absolute PoA
+# levels are selected-optimistic; V(beta) contrasts two arms under the IDENTICAL rule, so the
+# selection bias largely cancels in the registered quantity. State this in the paper.
+if want E; then
+  EFIX="$BEHAV $(AR 0.9) agent.msg_content=dhat agent.tau=0.0"
+  emit "ar1r9_beta0_upstream"  "$EFIX $(COMM upstream_only) agent.srdqn_beta=0.0"
+  emit "ar1r9_beta0_nocomm"    "$EFIX $NOCOMM agent.srdqn_beta=0.0"
+  emit "ar1r9_beta05_upstream" "$EFIX $(COMM upstream_only) agent.srdqn_beta=0.5"
+  emit "ar1r9_beta05_nocomm"   "$EFIX $NOCOMM agent.srdqn_beta=0.5"
 fi
 
 NJOBS=$(wc -l < "$JOBS"); NCFG=$(cut -f1 "$JOBS" | sort -u | wc -l)
@@ -250,6 +313,7 @@ run_one() {
   # shellcheck disable=SC2086  -- $args is intentionally word-split into hydra tokens
   if $PYTHON agents/train_signal.py agent=signal seed="$seed" total_episodes="$EP" \
         agent.heldout_every="$HE" agent.heldout_episodes="$HELDOUT_EPISODES" agent.patience="$PATIENCE" \
+        "agent.budget_milestones=$MILESTONES" \
         $args agent.algorithm="$full" > "$log" 2>&1; then
     echo "[done] $full"
   else
@@ -257,7 +321,7 @@ run_one() {
   fi
 }
 export -f run_one
-export PYTHON EP HE HELDOUT_EPISODES PATIENCE LOGDIR
+export PYTHON EP HE HELDOUT_EPISODES PATIENCE LOGDIR MILESTONES
 
 if [[ "$STAGE" == train || "$STAGE" == all ]]; then
   echo "== TRAIN: $NJOBS jobs, $NPROC parallel =="
@@ -276,12 +340,14 @@ fi
 # same dumps write give H3 (upstream forecast-error delta) at rho0.9 for free.
 # H7 (Phases D/Dext) is NOT dumped here: its analysis needs the best-response/measured-PoA probe,
 # which does not exist in eval_signal.py yet (train the arms now; analyze when the probe lands).
-H2ROOT="$OUTROOT/h2"; H1ROOT="$OUTROOT/h1pois"
+H2ROOT="$OUTROOT/h2"; H1ROOT="$OUTROOT/h1pois"; CURVROOT="$OUTROOT/curve"; EROOT="$OUTROOT/incentive"
+MLIST="$(echo "$MILESTONES" | tr -d '[] ' | tr ',' ' ')"
 if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
-  echo "== DUMP: H1 Poisson + H2/H1 AR1 (in-regime) + H3 forecast error =="
+  echo "== DUMP: H1 Poisson (+S1) + H2/H1 AR1 (in-regime) + H3 ferr + curve milestones + V(beta) =="
   DJOBS="$OUTROOT/dump_jobs.sh"; : > "$DJOBS"
+  # -- H2 in-regime pairs (REGISTERED primary topology: upstream_only) -------------------------
   for r in 0.0 0.3 0.6 0.9; do t="${RHOTAG[$r]}"
-    for pair in "neighbor comm" "nocomm nocomm"; do
+    for pair in "upstream comm" "nocomm nocomm"; do
       suf="${pair% *}"; grp="${pair#* }"
       for ck in weights_signal/run_signal_*_"${t}_${suf}"_s*/signal_checkpoint_best.pt; do
         [[ -e "$ck" ]] || continue
@@ -290,12 +356,42 @@ if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
       done
     done
   done
-  for pair in "neighbor comm" "nocomm nocomm"; do            # H1 Poisson (dr_poisson, default lambdas)
+  # -- H1 Poisson pair + the S1 sensitivity arm (max-favorable geometry under the null) --------
+  for pair in "upstream comm" "nocomm nocomm" "rbroadcast rbroadcast"; do
     suf="${pair% *}"; grp="${pair#* }"
     for ck in weights_signal/run_signal_*_"dp_${suf}"_s*/signal_checkpoint_best.pt; do
       [[ -e "$ck" ]] || continue
       echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$H1ROOT/${grp}' \
 --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+    done
+  done
+  # -- SUBSTITUTION CURVE: deployable-at-budget-M snapshots of the two PRIMARY pairs -----------
+  # (dp pair on the Poisson lambdas; ar1r9 pair in-regime at rho 0.9; per-seed V(budget) is fit
+  #  by scripts/comm_stats.py curve in STAGE=analyze.)
+  for M in $MLIST; do
+    for pair in "upstream comm" "nocomm nocomm"; do
+      suf="${pair% *}"; grp="${pair#* }"
+      for ck in weights_signal/run_signal_*_"dp_${suf}"_s*/"signal_checkpoint_budget${M}.pt"; do
+        [[ -e "$ck" ]] || continue
+        echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$CURVROOT/dp_${grp}_b${M}' \
+--dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+      done
+      for ck in weights_signal/run_signal_*_"ar1r9_${suf}"_s*/"signal_checkpoint_budget${M}.pt"; do
+        [[ -e "$ck" ]] || continue
+        echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$CURVROOT/ar1r9_${grp}_b${M}' \
+--dump-ar1 0.9 --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+      done
+    done
+  done
+  # -- F_INCENTIVE (Phase E): matched-beta pairs, in-regime at rho 0.9, TEAM-cost units --------
+  for b in beta0 beta05; do
+    for pair in "upstream comm" "nocomm nocomm"; do
+      suf="${pair% *}"; grp="${pair#* }"
+      for ck in weights_signal/run_signal_*_"ar1r9_${b}_${suf}"_s*/signal_checkpoint_best.pt; do
+        [[ -e "$ck" ]] || continue
+        echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$EROOT/${b}_${grp}' \
+--dump-ar1 0.9 --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+      done
     done
   done
   echo "  $(wc -l < "$DJOBS") dump jobs, $NPROC parallel"
@@ -310,7 +406,7 @@ for grp in ("comm", "nocomm"):
     for r, t in tags.items():
         for p in glob.glob(os.path.join(root, f"{grp}_{t}", "seed*.json")):
             b = os.path.basename(p)
-            if b.endswith("_ferr.json") or b.endswith("_bw.json"):
+            if b.endswith(("_ferr.json", "_bw.json", "_censor.json", "_iv.json")):
                 continue
             s = b[4:-5]                                        # seed<N>.json -> N
             with open(p) as f:
@@ -323,20 +419,50 @@ for grp in ("comm", "nocomm"):
 PY
 fi
 
+# ------------------------------------------------------------ 5b. PROBE: do(m) intervention dumps
+# The REGISTERED content-attribution gate's producer: per seed on every V-claiming arm, replay the
+# CRN eval episodes under do(m) in {honest, shuffled, cross, zeroed} and dump seed{S}_iv.json
+# (episode-mean costs; the per-seed table also lands in the log, incl. the identity-replay check).
+# Cross-seed inference (SEED = unit) happens in STAGE=analyze via `comm_stats.py interventions`.
+# Arms default to every arm a positive V will be claimed for: the P2 primary (ar1r9_upstream), the
+# H4 geometry star (ar1r9_rbroadcast), the C3/D1 content rungs (learned, raw), and the Phase-E
+# comm arms (does the channel stay informative as beta falls?). Override with PROBE_ARMS.
+PROBEROOT="$OUTROOT/probes"
+if [[ "$STAGE" == probe || "$STAGE" == all ]]; then
+  echo "== PROBE: message interventions (do(m)) on: $PROBE_ARMS =="
+  mkdir -p "$PROBEROOT/logs"
+  PJOBS="$OUTROOT/probe_jobs.sh"; : > "$PJOBS"
+  for arm in $PROBE_ARMS; do
+    for ck in weights_signal/run_signal_*_"${arm}"_s*/signal_checkpoint_best.pt; do
+      [[ -e "$ck" ]] || continue
+      rid="$(basename "$(dirname "$ck")")"
+      echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --ar1 --ar1-rho 0.9 --ar1-mu $AR1_MU \
+--ar1-sigma $AR1_SIGMA --episodes $PROBE_EPISODES --dump-iv '$PROBEROOT/iv_${arm}' \
+> '$PROBEROOT/logs/${rid}.log' 2>&1" >> "$PJOBS"
+    done
+  done
+  echo "  $(wc -l < "$PJOBS") probe jobs, $NPROC parallel"
+  xargs -P "$NPROC" -I LINE bash -c 'eval "$1"' _ LINE < "$PJOBS" > "$OUTROOT/probe.log" 2>&1 || true
+  for arm in $PROBE_ARMS; do
+    d="$PROBEROOT/iv_${arm}"
+    [[ -d "$d" ]] && echo "  $arm: $(ls "$d"/seed*_iv.json 2>/dev/null | wc -l) seed dumps -> $d"
+  done
+fi
+
 # ------------------------------------------------------------ 6. ANALYZE: registered H1/H2/H3 statistics
 if [[ "$STAGE" == analyze || "$STAGE" == all ]]; then
-  echo "== ANALYZE: H1 (TOST) + H2 (registered slope) + H3 (forecast delta) =="
-  "$PYTHON" - "$H2ROOT" "$H1ROOT" <<'PY'
+  echo "== ANALYZE: H1 (TOST) + S1 + H2 (registered slope) + H3 + V(beta) =="
+  "$PYTHON" - "$H2ROOT" "$H1ROOT" "$EROOT" <<'PY'
 import sys, json
 sys.path.insert(0, ".")
 from scripts.comm_stats import load_cost_dir, value_of_sharing, load_ferr_dir, forecast_delta
 from scripts.prereg import h2_slope, h1_decision
-h2root, h1root = sys.argv[1], sys.argv[2]
+h2root, h1root, eroot = sys.argv[1], sys.argv[2], sys.argv[3]
 comm, nocomm = load_cost_dir(h2root + "/comm"), load_cost_dir(h2root + "/nocomm")
 if comm and nocomm:
     h2 = h2_slope(comm, nocomm)
-    print("  H2 slope (registered): mean=%.2f CI95=%s -> H2 holds: %s"
-          % (h2["mean_slope"], h2["ci95"], h2["h2_holds"]))
+    print("  H2 slope (registered): mean=%.2f CI95=%s Wilcoxon p=%.3g -> H2 holds: %s"
+          % (h2["mean_slope"], h2["ci95"], h2["wilcoxon_p"], h2["h2_holds"]))
     v0 = value_of_sharing(comm, nocomm, lambdas=[0.0])
     print("  H1 AR1 rho=0 : V=%.1f CI=%s equiv=%s -> %s"
           % (v0["v_cost_mean"], v0["v_cost_ci"], v0["equivalent"], h1_decision(v0)))
@@ -350,6 +476,7 @@ if comm and nocomm:
         print("  H3: skipped (%s)" % e)
 else:
     print("  (no merged H2 dumps found -- run STAGE=dump first)")
+ncp = {}
 try:
     cp, ncp = load_cost_dir(h1root + "/comm"), load_cost_dir(h1root + "/nocomm")
     if cp and ncp:
@@ -358,9 +485,59 @@ try:
               % (vp["v_cost_mean"], vp["v_cost_ci"], vp["equivalent"], h1_decision(vp)))
 except Exception as e:
     print("  H1 Poisson: skipped (%s)" % e)
+try:                                                   # S1: max-favorable geometry under the null
+    rb = load_cost_dir(h1root + "/rbroadcast")
+    if rb and ncp:
+        vs1 = value_of_sharing(rb, ncp)
+        print("  S1 Poisson retailer_broadcast (sensitivity): V=%.1f CI=%s equiv=%s -> %s"
+              % (vs1["v_cost_mean"], vs1["v_cost_ci"], vs1["equivalent"], h1_decision(vs1)))
+        print("      (P1 is DECISIVE only if the null also survives this max-favorable geometry.)")
+except Exception as e:
+    print("  S1: skipped (%s)" % e)
+# ---- F_INCENTIVE: V(beta) at matched beta, TEAM-cost units, in-regime rho0.9 ----
+try:
+    rows = []
+    for tag, blab in (("beta0", "0.0"), ("beta05", "0.5")):
+        c = load_cost_dir(f"{eroot}/{tag}_comm"); n = load_cost_dir(f"{eroot}/{tag}_nocomm")
+        if c and n:
+            rows.append((blab, value_of_sharing(c, n)))
+    if comm and nocomm:                                # beta=1.0 point REUSED from Phase A, rho0.9
+        rows.append(("1.0", value_of_sharing(comm, nocomm, lambdas=[0.9])))
+    if rows:
+        print("  F_INCENTIVE V(beta) (matched-beta baselines; + => channel still buys team cost):")
+        for blab, v in sorted(rows, key=lambda kv: float(kv[0])):
+            print("      beta=%-4s V=%+8.1f (%+5.1f%%) CI=%s n=%d %s"
+                  % (blab, v["v_cost_mean"], v["v_cost_pct"], v["v_cost_ci"], v["n_seeds"],
+                     "sig" if v["v_cost_ci_excludes_0"] else "ns"))
+        print("      (informative-communication survives misalignment if V stays positive as beta falls;")
+        print("       babbling-equilibrium collapse shows as V -> 0/ns at low beta. Crawford-Sobel 1982.)")
+except Exception as e:
+    print("  F_INCENTIVE: skipped (%s)" % e)
 print("  (H4 geometry / H5 content: same producers on the rho0.9 topology/content arms + "
       "comm_stats.value_of_sharing per arm with Holm across the family; H7 needs the PoA probe.)")
 PY
+  # ---- substitution curve (registered exploratory): per-seed V vs log2(budget) slope ----
+  for reg in dp ar1r9; do
+    cargs=(); ok=1
+    for M in $MLIST; do
+      c="$CURVROOT/${reg}_comm_b${M}"; n="$CURVROOT/${reg}_nocomm_b${M}"
+      if [[ -d "$c" && -d "$n" ]]; then cargs+=(--budget "$M" "$c" "$n"); else ok=0; fi
+    done
+    if [[ "$ok" == 1 && "${#cargs[@]}" -gt 0 ]]; then
+      echo "-- SUBSTITUTION CURVE ($reg pair): V(training budget) --"
+      "$PYTHON" scripts/comm_stats.py curve "${cargs[@]}" || true
+    else
+      echo "  (curve $reg: milestone dumps incomplete -- STAGE=dump fills $CURVROOT/${reg}_*_b{$MILESTONES})"
+    fi
+  done
+  # ---- registered content-attribution gate: cross-seed do(m) summaries ----
+  for arm in $PROBE_ARMS; do
+    d="$PROBEROOT/iv_${arm}"
+    if compgen -G "$d/seed*_iv.json" > /dev/null 2>&1; then
+      echo "-- INTERVENTIONS (cross-seed gate): $arm --"
+      "$PYTHON" scripts/comm_stats.py interventions --dir "$d" || true
+    fi
+  done
 fi
 
 echo "ALL SELECTED STAGES COMPLETE ($(date))"

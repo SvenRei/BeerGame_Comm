@@ -35,6 +35,10 @@ WHAT IT COMPUTES (each part names the question it answers):
   * HONESTY PROBE: each message COMPONENT vs the sender's true demand / inventory position.
   * POSITIVE LISTENING: causal dS/d(told) PER MESSAGE COMPONENT (components swept one at
     a time, the others held at their actually-received values).
+  * MESSAGE INTERVENTION (--interventions): do(m) on the channel -- honest vs time-shuffled vs
+    cross-episode vs zeroed message streams, CRN-paired. The causal CONTENT test: if shuffled/
+    cross degrade toward zeroed, the value is state-correlated information, not channel presence.
+    Includes an identity-replay self-check (replaying the honest stream reproduces its cost).
   * PRODUCERS: --dump-c1 (per-seed {lambda: cost} for scripts/c1_stats.py) and --dump-comm
     (per-seed {lambda: cost} + per-echelon forecast error for scripts/comm_stats.py).
     --dump-comm + --dump-ar1 "0,0.3,0.6,0.9" keys the SAME dump format by AR(1) rho
@@ -52,6 +56,9 @@ Usage:
   python agents/eval_signal.py --ckpt ... --dump-comm results/comm_on
   python agents/eval_signal.py --ckpt ... --dump-comm results/comm_on_ar1 --dump-ar1 "0,0.3,0.6,0.9"
   python agents/eval_signal.py --ckpt ... --env-json conf/env_canonical.json   # override the saved env
+  python agents/eval_signal.py --ckpt ... --ar1 --interventions                # causal content test, AR(1)
+  python agents/eval_signal.py --ckpt ... --ar1 --episodes 40 --dump-iv results/iv_arm   # per-seed gate dump
+      # then cross-seed: python scripts/comm_stats.py interventions --dir results/iv_arm
 """
 import os
 import sys
@@ -127,6 +134,8 @@ def _safe_ratio(num, den):
 def _component_layout(content):
     """Return {component_name: column_index} for a message content type. 'learned' has no
     named ground truth, so its channels are reported against both demand and IP."""
+    if content == "raw":
+        return {"raw": 0}
     if content == "dhat":
         return {"dhat": 0}
     if content == "ip":
@@ -148,6 +157,7 @@ class SIGNALPolicy:
         self.N = len(AGENTS)
         cfg = ckpt.get("config", {})                # train_signal saves the AGENT dict directly
         self.cfg = cfg
+        self.msg_override = None                    # optional [T,N,msg] array: do(m_{t-1}) intervention
 
         self.hidden = int(cfg.get("hidden", 64))
         self.content = ckpt.get("msg_content", cfg.get("msg_content", "dhat"))
@@ -178,6 +188,10 @@ class SIGNALPolicy:
     def reset(self):
         self.h = [torch.zeros(1, 1, self.hidden, device=DEVICE) for _ in range(self.N)]
         self.m_buf = torch.zeros(self.N, self.msg_dim, device=DEVICE)
+        self._t = 0                                 # step counter for msg_override indexing
+        # NOTE: self.msg_override is deliberately NOT cleared here -- run_episode() calls reset()
+        # internally, so the intervention runner sets the override BEFORE run_episode and clears it
+        # after. override[t] replaces the PREVIOUS-step messages m_{t-1} the router would deliver.
         self.last_S = np.zeros(self.N)
         self.last_dhat = np.full(self.N, np.nan)
         self.last_msg = np.zeros((self.N, self.msg_dim))
@@ -186,7 +200,12 @@ class SIGNALPolicy:
     @torch.no_grad()
     def act(self, obs):
         o_t = torch.tensor(np.stack([obs[a] for a in AGENTS]), dtype=torch.float32, device=DEVICE)  # [N,obs]
-        incoming = self.adj @ self.m_buf            # [N,msg]
+        if self.msg_override is not None and self._t < len(self.msg_override):
+            m_prev = torch.as_tensor(self.msg_override[self._t], dtype=torch.float32,
+                                     device=DEVICE).view(self.N, self.msg_dim)
+        else:
+            m_prev = self.m_buf
+        incoming = self.adj @ m_prev                # [N,msg]
         if self.ablate:
             incoming = torch.zeros_like(incoming)
 
@@ -211,6 +230,7 @@ class SIGNALPolicy:
         self.last_msg = m_out.detach().cpu().numpy()
         self.last_ctx = (o_t.detach(), hi_list, incoming.detach())
         self.m_buf = m_out.detach()                 # ONE-STEP message delay (matches collect)
+        self._t += 1
         return {a: float(frac[i, 0].item()) for i, a in enumerate(AGENTS)}
 
     @torch.no_grad()
@@ -285,8 +305,15 @@ def run_episode(policy, env, seed, trace=False):
     bw_stage, ovar, dvar, bw_cum, nsamp = {}, {}, {}, {}, {}
     mean_inv, mean_back, mean_netstock = {}, {}, {}
     serv_alpha, fill_beta_s, stockout_freq, hold_c, back_c, total_c = {}, {}, {}, {}, {}, {}
+    zero_of, max_of = {}, {}
     for a in AGENTS:
         o = np.asarray(orders[a], float); d = np.asarray(demand[a], float)
+        # CENSORING FINGERPRINT (Proposition 1 mechanism): with a base-stock head the order is
+        # clip(S - IP, 0, max_order), so o==0 IS the lower-censoring event (S <= IP) and o==max
+        # the upper one. Censoring makes the order stream a NON-INVERTIBLE statistic of demand --
+        # exactly where the Raghunathan/GGS redundancy null breaks. P(censor) should rise with
+        # rho (bullwhip widens the order distribution) and predict V across seeds.
+        zero_of[a] = float(np.mean(o == 0)); max_of[a] = float(np.mean(o >= float(env.max_order)))
         iv = np.asarray(inv[a], float); bk = np.asarray(back[a], float)
         ns = iv - bk
         ovar[a] = float(np.var(o)); dvar[a] = float(np.var(d))
@@ -318,6 +345,7 @@ def run_episode(policy, env, seed, trace=False):
         "mean_inv": mean_inv, "mean_back": mean_back, "mean_netstock": mean_netstock,
         "serv_alpha": serv_alpha, "fill_beta_s": fill_beta_s, "stockout_freq": stockout_freq,
         "hold_c": hold_c, "back_c": back_c, "total_c": total_c,
+        "zero_order_frac": zero_of, "max_order_frac": max_of,
     }
     if trace:
         out["trace"] = {"dhat": np.array(tr_dhat), "msg": np.array(tr_msg),
@@ -483,7 +511,7 @@ def honesty_probe(ckpt, episodes=40, scenario="poisson", env=None, label=None, e
     print(f"    {'sender':<13}{'component':>10}{'mean(msg*100)':>14}{'mean(truth)':>12}"
           f"{'bias':>9}{'corr':>8}")
     for name, col in layout.items():
-        truth_src = dem if name == "dhat" else ipv
+        truth_src = dem if name in ("dhat", "raw") else ipv
         for i, a in enumerate(AGENTS):
             reported = msg[:, i, col] * _MSG_SCALE
             truth = truth_src[:, i]
@@ -494,8 +522,10 @@ def honesty_probe(ckpt, episodes=40, scenario="poisson", env=None, label=None, e
                                   "mean_truth": float(np.nanmean(truth))}
             print(f"    {a:<13}{name:>10}{np.nanmean(reported):>14.2f}{np.nanmean(truth):>12.2f}"
                   f"{bias:>+9.2f}{corr:>8.3f}")
-    print("    (corr~1, bias~0 => the component faithfully reports the named signal. 'ip' is a deterministic")
-    print("     readout of the obs, so it is honest by construction; 'dhat' is the learned, falsifiable case.)")
+    print("    (corr~1, bias~0 => the component faithfully reports the named signal. 'ip' and 'raw' are")
+    print("     deterministic obs readouts, honest by construction; 'dhat' is the learned, falsifiable case.")
+    print("     For 'raw' the truth is the sender's demand at the SAME step; corr<1 only reflects the")
+    print("     one-step reporting alignment, not dishonesty.)")
     return out
 
 
@@ -563,6 +593,8 @@ def positive_listening(ckpt, episodes=20, env=None, label=None, demand_grid=None
             out[a][nm] = {"dS_dTold": ms, "S_swing": sw}
             print(f"    {a:<13}{nm:>10}{ms:>10.3f}{sw:>15.2f}")
     print("    (dhat component: dS/dTold ~ (lead+1) => the receiver fully acts on the demand message;")
+    print("     raw component: told value is ONE noisy observation, so the rational slope is SHRUNK below")
+    print("     (lead+1) by the signal-to-noise ratio -- expect raw slope < dhat slope (forecast > data);")
     print("     ~0 => deaf to content. ip component: sign/size only (negative = VMI-consistent).")
     print("     Honest messages (high corr in the probe above) + dS/dTold~0 = the agent is IGNORING a")
     print("     usable signal -- an optimization/architecture finding, NOT 'communication has no value'.)")
@@ -596,6 +628,83 @@ def message_weight_audit(ckpt, env=None, env_base=None):
         print(f"    {a:<13}{gr:>9.3f}{hr:>9.3f}")
     print("    (ratio compares per-input weight mass; obs has 4 inputs, message 1-2, so ~0.2-0.5 is")
     print("     'wired in'. Values ~0 at every receiver = the message inputs were driven to zero.)")
+    return out
+
+def message_intervention_probe(ckpt, episodes=20, env=None, label=None, env_base=None):
+    """CAUSAL content test by INTERVENTION on the channel, do(m) (Jaques et al. 2019; the design
+    Lowe et al. 2019 license): re-run the SAME CRN episodes with the message stream replaced by
+      honest   : live messages (reference)
+      shuffled : the episode's own honest messages, time-permuted  (same marginals, timing destroyed)
+      cross    : another episode's honest messages                 (same process, wrong realization)
+      zeroed   : channel off (the existing ablation)
+    If the channel's value is CONTENT (state-correlated information), cost(shuffled)/cost(cross)
+    degrade toward cost(zeroed); if only PRESENCE/scale matters, shuffled ~ honest. This upgrades
+    the H3 mechanism claim from correlational to interventional and is the registered gate for
+    attributing a positive V to content. SELF-CHECK: replaying episode 0's own honest stream
+    (identity intervention) must reproduce its cost bit-for-bit -- printed and asserted.
+    Unit of analysis here is the EPISODE within one checkpoint (an instrument, not the cross-seed
+    confirmatory statistic); deltas are episode-paired with bootstrap-t CIs."""
+    from scripts.c1_stats import bootstrap_ci, paired
+    if env is None:
+        env = BeerGameParallelEnv({**(ENV_BASE if env_base is None else env_base),
+                                   "demand_type": "poisson"})
+    label = label or "poisson"
+    pol = SIGNALPolicy(ckpt, env, ablate=False)
+    if not pol.use_comm:
+        print(f"\n  message-intervention ({label}): use_comm=false checkpoint. skipped.")
+        return None
+    N, md = pol.N, pol.msg_dim
+
+    def _prev_of(msgs):                              # emitted m_t -> the m_{t-1} stream act() consumes
+        z = np.zeros((1, N, md), dtype=np.float64)
+        return np.concatenate([z, msgs[:-1]], axis=0)
+
+    # pass 1: honest runs (trace records the emitted messages)
+    honest = [run_episode(pol, env, SEED_BASE + e, trace=True) for e in range(episodes)]
+    c_hon = np.array([r["cost"] for r in honest])
+    msgs = [r["trace"]["msg"] for r in honest]       # [T,N,md] each
+
+    # identity replay self-check on episode 0 (must reproduce the honest cost exactly)
+    pol.msg_override = _prev_of(msgs[0])
+    c_replay = run_episode(pol, env, SEED_BASE + 0)["cost"]
+    pol.msg_override = None
+    replay_ok = abs(c_replay - c_hon[0]) <= 1e-4 * max(1.0, abs(c_hon[0]))
+    assert replay_ok, f"identity replay mismatch: {c_replay} vs {c_hon[0]} (override wiring broken)"
+
+    # pass 2: interventions, CRN-paired to the honest episodes
+    c_shuf, c_cross = np.zeros(episodes), np.zeros(episodes)
+    for e in range(episodes):
+        rng = np.random.default_rng(777_000 + e)
+        pol.msg_override = _prev_of(msgs[e][rng.permutation(len(msgs[e]))])
+        c_shuf[e] = run_episode(pol, env, SEED_BASE + e)["cost"]
+        partner = msgs[(e + 1) % episodes]
+        T = min(len(partner), len(msgs[e]))
+        pol.msg_override = _prev_of(partner[:T])
+        c_cross[e] = run_episode(pol, env, SEED_BASE + e)["cost"]
+    pol.msg_override = None
+    pol_off = SIGNALPolicy(ckpt, env, ablate=True)
+    c_zero = np.array([run_episode(pol_off, env, SEED_BASE + e)["cost"] for e in range(episodes)])
+
+    print(f"\n  message-intervention probe ({label}, {episodes} CRN eps; identity-replay check PASS)")
+    print(f"    {'condition':<12}{'mean cost':>11}{'delta vs honest':>17}{'95% CI':>20}{'p(Wilcoxon)':>13}")
+    out = {"honest": float(c_hon.mean())}
+    for nm, c in [("shuffled", c_shuf), ("cross", c_cross), ("zeroed", c_zero)]:
+        d = c - c_hon                                # + => intervention HURTS => content mattered
+        pr = paired(d, np.zeros_like(d))
+        lo, hi = bootstrap_ci(d)
+        out[nm] = {"mean": float(c.mean()), "delta": float(d.mean()),
+                   "ci": (lo, hi), "p": pr["wilcoxon_p"]}
+        print(f"    {nm:<12}{c.mean():>11.1f}{d.mean():>+17.1f}"
+              f"   [{lo:>7.1f},{hi:>8.1f}]{pr['wilcoxon_p']:>13.3g}")
+    dz = out["zeroed"]["delta"]
+    if abs(dz) > 1e-6:
+        share = out["shuffled"]["delta"] / dz
+        print(f"    content share = delta(shuffled)/delta(zeroed) = {share:+.2f}  "
+              f"(~1: value IS the state-correlated content; ~0: only presence/scale)")
+        out["content_share"] = float(share)
+    else:
+        print("    content share: n/a (zeroing the channel does not change cost -> channel worthless here)")
+    print("    (registered gate: a positive V is attributed to CONTENT only if delta(shuffled) CI > 0.)")
     return out
 
 
@@ -670,19 +779,27 @@ def dump_comm(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS, env_b
                                                            p_shift=0.0)
                       for lam in lambdas}
         mode = f"Poisson lambdas {[f'{l:g}' for l in lambdas]}"
-    per, per_ferr = {}, {}
+    per, per_ferr, per_censor = {}, {}, {}
     for key, env in keyed_envs.items():
         pol = SIGNALPolicy(ckpt, env, ablate=False)
         rs = [run_episode(pol, env, HELDOUT_SEED_BASE + e, trace=True) for e in range(episodes)]
         per[key] = float(np.mean([r["cost"] for r in rs]))
         per_ferr[key] = _upstream_forecast_error([r["trace"] for r in rs])
+        # censoring fingerprint on the SAME CRN episodes as the cost (Proposition 1 signature):
+        # per-stage fraction of lower-censored (order==0) and upper-censored (order==max) steps.
+        per_censor[key] = {a: {"zero": float(np.mean([r["zero_order_frac"][a] for r in rs])),
+                               "max": float(np.mean([r["max_order_frac"][a] for r in rs]))}
+                           for a in AGENTS}
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"seed{int(seed)}.json")
     with open(path, "w") as f:
         json.dump(per, f, indent=2)
     with open(os.path.join(out_dir, f"seed{int(seed)}_ferr.json"), "w") as f:
         json.dump(per_ferr, f, indent=2)
-    print(f"\n  [dump-comm] wrote {path} (+ seed{int(seed)}_ferr.json)  use_comm={pol.use_comm}  [{mode}]")
+    with open(os.path.join(out_dir, f"seed{int(seed)}_censor.json"), "w") as f:
+        json.dump(per_censor, f, indent=2)
+    print(f"\n  [dump-comm] wrote {path} (+ seed{int(seed)}_ferr.json, seed{int(seed)}_censor.json)"
+          f"  use_comm={pol.use_comm}  [{mode}]")
     return path
 
 
@@ -721,6 +838,9 @@ def main():
                          "default is the env AS TRAINED, persisted in the checkpoint)")
     ap.add_argument("--regime-episodes", type=int, default=20, help="episodes per held-out lambda")
     ap.add_argument("--messages", action="store_true", help="run the comm decomposition + honesty probe")
+    ap.add_argument("--interventions", action="store_true",
+                    help="run the message-intervention probe (honest vs shuffled/cross/zeroed messages; "
+                         "the causal content test gating content-attribution of a positive V)")
     ap.add_argument("--full", action="store_true", help="standard benchmark + dashboard + C1 + messages")
     ap.add_argument("--ar1", action="store_true",
                     help="AR(1) mode: run the comm-value-vs-rho table + decomposition/honesty ON AR(1) demand "
@@ -736,6 +856,10 @@ def main():
     ap.add_argument("--dump-ar1", default=None, metavar="RHOS",
                     help="with --dump-comm: key the dump by AR(1) rho instead of Poisson lambda, e.g. "
                          "\"0,0.3,0.6,0.9\" (the H2 producer; uses --ar1-mu/--ar1-sigma)")
+    ap.add_argument("--dump-iv", default=None, metavar="DIR",
+                    help="run the message-intervention probe and write seed{S}_iv.json to DIR "
+                         "(cross-seed aggregation: scripts/comm_stats.py interventions --dir DIR). "
+                         "With --ar1 the probe runs on the AR(1) env at --ar1-rho (the sweep mode).")
     ap.add_argument("--dump-episodes", type=int, default=200, help="episodes/lambda for the producers")
     ap.add_argument("--seed", type=int, default=None, help="seed label for the producers (default: ckpt's seed)")
     args = ap.parse_args()
@@ -752,6 +876,28 @@ def main():
                 if args.dump_ar1 else None)
         dump_comm(ckpt, args.dump_episodes, args.dump_comm, seed=args.seed, env_base=env_base,
                   ar1_rhos=rhos, ar1_mu=args.ar1_mu, ar1_sigma=args.ar1_sigma)
+        return
+    if args.dump_iv:
+        # PRODUCER for the registered content-attribution gate: one seed{S}_iv.json per checkpoint
+        # (episode-mean cost under do(m): honest/shuffled/cross/zeroed). Cross-seed inference lives
+        # in scripts/comm_stats.py `interventions` (the SEED is the unit; this file is the instrument).
+        if args.ar1:
+            iv_env = make_ar1_env(args.ar1_rho, args.ar1_mu, args.ar1_sigma, env_base)
+            lbl = f"ar1 rho={args.ar1_rho:g}"
+        else:
+            iv_env, lbl = None, "poisson"
+        res = message_intervention_probe(ckpt, episodes=args.episodes, env=iv_env, label=lbl,
+                                         env_base=env_base)
+        if res is None:
+            print("  [dump-iv] use_comm=false checkpoint -> no intervention dump (by design).")
+            return
+        seed = args.seed if args.seed is not None else ckpt.get("seed", cfg.get("seed", 0))
+        os.makedirs(args.dump_iv, exist_ok=True)
+        payload = {"label": lbl, "episodes": int(args.episodes), **res}
+        path = os.path.join(args.dump_iv, f"seed{int(seed)}_iv.json")
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"  [dump-iv] wrote {path}")
         return
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -803,11 +949,17 @@ def main():
         honesty_probe(ckpt, episodes=min(40, args.episodes), env=ar1_env, label=lbl)
         positive_listening(ckpt, episodes=min(20, args.episodes), env=ar1_env, label=lbl)
         message_weight_audit(ckpt, env=ar1_env)
+        if args.interventions:
+            message_intervention_probe(ckpt, episodes=min(20, args.episodes), env=ar1_env, label=lbl)
     elif args.messages or args.full:
         comm_value_decomposition(ckpt, episodes=min(40, args.episodes), env_base=env_base)
         honesty_probe(ckpt, episodes=min(40, args.episodes), env_base=env_base)
         positive_listening(ckpt, episodes=min(20, args.episodes), env_base=env_base)
         message_weight_audit(ckpt, env_base=env_base)
+        if args.interventions:
+            message_intervention_probe(ckpt, episodes=min(20, args.episodes), env_base=env_base)
+    elif args.interventions:
+        message_intervention_probe(ckpt, episodes=min(20, args.episodes), env_base=env_base)
     print()
 
 

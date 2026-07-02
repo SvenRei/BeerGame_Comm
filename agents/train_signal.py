@@ -197,11 +197,32 @@ def main(cfg: DictConfig):
     log_every = int(A.get("log_every", 100))                        # heartbeat cadence in episodes (0 = silent between gates)
     patience = int(A.get("patience", 0))                            # early stop: episodes w/o held-out improvement (0 = off)
     best = float("inf"); best_ep = -1                               # we KEEP the best-gated checkpoint, never the last one
+    best_payload = None                                             # the best checkpoint dict, kept for budget milestones
+    # BUDGET MILESTONES (substitution curve): at each milestone M, snapshot the DEPLOYABLE-AT-BUDGET-M
+    # model = the best-gated checkpoint so far, to signal_checkpoint_budget{M}.pt. V(budget) from these
+    # feeds the sharing-vs-inference SUBSTITUTION analysis (comm_stats.py curve). Milestones never
+    # change training; they only copy the current best payload.
+    milestones = sorted(int(m) for m in (A.get("budget_milestones") or []))
+    mi = 0
+
+    def _save_budget(m, ep_now, truncated=False):
+        if best_payload is None:
+            print(f"[signal] budget milestone {m}: no gated checkpoint yet (gate cadence "
+                  f"{eval_every} > milestone?) -- skipped", flush=True)
+            return
+        torch.save({**best_payload, "budget_episodes": int(m), "trained_episodes": int(ep_now),
+                    "budget_truncated": bool(truncated)},
+                   os.path.join(run_dir, f"signal_checkpoint_budget{int(m)}.pt"))
+        print(f"[signal] budget milestone {m}: snapshot of best@ep{best_ep} saved"
+              f"{' (training ended earlier; deployable-at-budget = final best)' if truncated else ''}",
+              flush=True)
+
     train_rng = np.random.default_rng(cfg.seed + 12345)            # training seeds, DISJOINT from SEED_BASE
 
     batch = []
     recent_cost = deque(maxlen=50)                                  # running TRAIN-episode team cost (liveness + learning signal)
     last_a = last_c = float("nan")
+    ep = -1                                                         # defined even if total_episodes == 0 (tail milestones)
     for ep in range(int(cfg.total_episodes)):
         buf = trainer.collect(train_env, seed=int(train_rng.integers(0, 2**31 - 1)))
         recent_cost.append(float(buf["cost"].sum().item()))
@@ -223,21 +244,21 @@ def main(cfg: DictConfig):
             log.update(elog)
             if mean_cost < best:                                   # save the BEST held-out point (not the last)
                 best = mean_cost; best_ep = ep
-                torch.save({"actors": [ac.state_dict() for ac in trainer.actors],
-                            "critic": trainer.critic.state_dict(),
-                            "config": A, "adj": adj.tolist(),
-                            "env": base,                # cfg.env AS TRAINED (cost model, lead times, ...).
-                            #                             eval_signal rebuilds its envs from THIS -- without
-                            #                             it, a canonical-cost (penalty_at_retailer_only) or
-                            #                             lead-time run is silently scored on the DEFAULT env
-                            #                             against the wrong references.
-                            "obs_dim": obs_dim, "state_dim": state_dim,
-                            "msg_content": A.get("msg_content"), "episode": ep,
-                            "seed": int(cfg.seed),      # TOP-LEVEL Hydra seed (NOT in agent cfg); the per-seed
-                            #                             dumps key filenames off this -- without it every
-                            #                             checkpoint mislabels as seed0 and CRN pairing breaks.
-                            "best_heldout_cost": best},
-                           os.path.join(run_dir, "signal_checkpoint_best.pt"))
+                best_payload = {"actors": [ac.state_dict() for ac in trainer.actors],
+                                "critic": trainer.critic.state_dict(),
+                                "config": A, "adj": adj.tolist(),
+                                "env": base,                # cfg.env AS TRAINED (cost model, lead times, ...).
+                                #                             eval_signal rebuilds its envs from THIS -- without
+                                #                             it, a canonical-cost (penalty_at_retailer_only) or
+                                #                             lead-time run is silently scored on the DEFAULT env
+                                #                             against the wrong references.
+                                "obs_dim": obs_dim, "state_dim": state_dim,
+                                "msg_content": A.get("msg_content"), "episode": ep,
+                                "seed": int(cfg.seed),      # TOP-LEVEL Hydra seed (NOT in agent cfg); the per-seed
+                                #                             dumps key filenames off this -- without it every
+                                #                             checkpoint mislabels as seed0 and CRN pairing breaks.
+                                "best_heldout_cost": best}
+                torch.save(best_payload, os.path.join(run_dir, "signal_checkpoint_best.pt"))
                 log["Eval/best_heldout_cost"] = best
                 print(f"[signal] ep {ep}: held-out mean cost {mean_cost:.1f}  "
                       f"Gap_Recovered {elog['Eval/Gap_Recovered']:+.3f}  (checkpoint saved)")
@@ -246,9 +267,19 @@ def main(cfg: DictConfig):
                       f"(best {best:.1f} @ ep {best_ep}; checkpoint kept)", flush=True)
                 break
 
+        while mi < len(milestones) and (ep + 1) >= milestones[mi]:  # budget milestone crossed
+            _save_budget(milestones[mi], ep + 1)
+            mi += 1
+
         if log:
             log["episode"] = ep
             wandb.log(log)
+
+    # milestones beyond the last trained episode (early stop / short run): the deployable-at-budget-M
+    # model IS the final best (training would not have improved further), stamped budget_truncated.
+    while mi < len(milestones):
+        _save_budget(milestones[mi], ep + 1, truncated=True)
+        mi += 1
 
     wandb.finish()
     print(f"[signal] done. best held-out mean cost = {best:.1f} @ ep {best_ep}   ->  {run_dir}", flush=True)

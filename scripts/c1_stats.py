@@ -72,8 +72,15 @@ def mean_refs(rungs, lambdas=None):
 # ==============================================================================
 # Statistical primitives
 # ==============================================================================
-def bootstrap_ci(values, stat=np.mean, n_boot=10000, ci=0.95, seed=0):
-    """Percentile bootstrap CI of `stat` over the sample (resampling the seeds)."""
+def bootstrap_ci(values, stat=np.mean, n_boot=10000, ci=0.95, seed=0, method="auto"):
+    """Bootstrap CI of `stat` over the sample (resampling the SEEDS -- the experimental unit).
+    method='auto' (default, REGISTERED): STUDENTIZED bootstrap-t when stat is the mean, else BCa.
+    Why: at the study's n=15 a plain percentile 95% CI of a mean UNDERCOVERS (~91% normal, ~89%
+    skewed in calibration sims), and BCa does NOT fix it (it repositions the interval; the problem
+    is width). The bootstrap-t interval  [theta - se*t*_(1-a), theta - se*t*_(a)]  is the
+    second-order-accurate repair for a mean and restores near-nominal coverage. Every registered
+    statistic in this study is a seed-mean, so 'auto' == bootstrap-t in practice. BCa/percentile
+    remain available; any failure falls back to percentile (strictly the old behavior)."""
     v = np.asarray(values, float)
     n = v.size
     if n == 0:
@@ -83,9 +90,43 @@ def bootstrap_ci(values, stat=np.mean, n_boot=10000, ci=0.95, seed=0):
         return (s, s)
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, n, size=(n_boot, n))
+    alpha = (1.0 - ci) / 2.0
+    is_mean = stat is np.mean
+    if method == "auto":
+        method = "student" if is_mean else "bca"
+    if method == "student" and is_mean:
+        theta = float(v.mean())
+        se = float(v.std(ddof=1) / np.sqrt(n))
+        if se > 1e-12:
+            bm = v[idx].mean(axis=1)                                  # resample means
+            bs = v[idx].std(axis=1, ddof=1) / np.sqrt(n)              # resample SEs
+            t = (bm - theta) / np.maximum(bs, 1e-12)                  # studentized pivots
+            t_lo, t_hi = np.percentile(t, [100.0 * alpha, 100.0 * (1.0 - alpha)])
+            return (theta - se * float(t_hi), theta - se * float(t_lo))
+        return (theta, theta)                                         # zero-variance sample
     boots = np.array([float(stat(v[i])) for i in idx])
-    lo = float(np.percentile(boots, 100.0 * (1.0 - ci) / 2.0))
-    hi = float(np.percentile(boots, 100.0 * (1.0 + ci) / 2.0))
+    if method == "bca":
+        try:
+            from scipy.stats import norm
+            theta = float(stat(v))
+            if float(boots.max()) - float(boots.min()) > 1e-12:       # non-degenerate resamples
+                p0 = float(np.mean(boots < theta) + 0.5 * np.mean(boots == theta))
+                if 0.0 < p0 < 1.0:
+                    z0 = float(norm.ppf(p0))
+                    jack = np.array([float(stat(np.delete(v, i))) for i in range(n)])
+                    jm = jack.mean()
+                    denom = np.sum((jm - jack) ** 2) ** 1.5
+                    a = float(np.sum((jm - jack) ** 3) / (6.0 * denom)) if denom > 1e-12 else 0.0
+                    za, zb = norm.ppf(alpha), norm.ppf(1.0 - alpha)
+                    a1 = float(norm.cdf(z0 + (z0 + za) / max(1e-12, 1.0 - a * (z0 + za))))
+                    a2 = float(norm.cdf(z0 + (z0 + zb) / max(1e-12, 1.0 - a * (z0 + zb))))
+                    if 0.0 < a1 < a2 < 1.0:
+                        return (float(np.percentile(boots, 100.0 * a1)),
+                                float(np.percentile(boots, 100.0 * a2)))
+        except Exception:                                             # noqa: BLE001 -> percentile fallback
+            pass
+    lo = float(np.percentile(boots, 100.0 * alpha))
+    hi = float(np.percentile(boots, 100.0 * (1.0 - alpha)))
     return (lo, hi)
 
 
