@@ -1,21 +1,21 @@
 """
 c1_stats.py -- statistical inference for the C1 (regime-inference) result.
 
-Turns the headline SIGNAL number from a point estimate ("Gap_Recovered crossed 0") into a
+Elevates the headline SIGNAL result from a point estimate ("Gap_Recovered crossed 0") to a
 defended claim ("Gap CI excludes 0; SIGNAL is significantly below the analytic Bayes-adaptive
-policy"). The unit of analysis is the INDEPENDENT TRAINING SEED: each seed = one trained
-policy, scored deterministically per-lambda on the EVAL seeds (so SIGNAL and the reference
-rungs are CRN-comparable).
+policy"). The unit of analysis is the independent training seed: each seed is one trained
+policy, scored deterministically per-lambda on the eval seeds, so SIGNAL and the reference
+rungs are CRN-comparable.
 
-It provides:
+Provides:
   * load_rungs / mean_refs   -- read results/baselines_regime_v2.json (the 4-rung ladder from
-                                `python scripts/baselines.py regime`). Used by the trainer and
-                                eval as the single source of truth for BAR / Oracle / Bayes.
-  * summarize / print_report -- aggregate Gap_Recovered mean [95% CI], the "CI excludes 0" flag,
-                                the Gap<=1 oracle-validity flag (T3.3), per-lambda Gap curves,
-                                rliable IQM + performance profile (Agarwal et al. 2021), and the
-                                paired SIGNAL-vs-Bayes Wilcoxon / sign test.
-  * paired / performance_profile / iqm / bootstrap_ci -- the building blocks (reusable for the
+                                `python scripts/baselines.py regime`), the single source of
+                                truth for BAR / Oracle / Bayes shared by trainer and eval.
+  * summarize / print_report -- aggregate Gap_Recovered mean and 95% CI, the "CI excludes 0"
+                                flag, the Gap<=1 oracle-validity flag (T3.3), per-lambda Gap
+                                curves, rliable IQM and performance profile (Agarwal et al.
+                                2021), and the paired SIGNAL-vs-Bayes Wilcoxon / sign test.
+  * paired / performance_profile / iqm / bootstrap_ci -- reusable primitives (also used by the
                                 Phase-3 comm TOST in phase3_sweep.sh).
 
 DATA MODEL
@@ -23,10 +23,11 @@ DATA MODEL
           e.g. results/signal_c1/seed{S}.json  (see eval_signal.py --dump-c1)
   rungs : {name: {lambda(float): cost(float)}}             # from load_rungs(...)
 
-Gap_Recovered (aggregate, matches heldout_eval.py): with BAR/Oracle the means over lambda,
+Gap_Recovered (aggregate; matches the train/eval held-out gate), with BAR/Oracle the means over
+lambda:
     gap(seed) = (BAR - mean_lambda SIGNAL[seed]) / (BAR - Oracle)
   0 = matches the deployable static base-stock, 1 = matches the per-lambda oracle, >1 = beats
-  the static oracle (finite-horizon effect; flags the oracle as not a valid static bound).
+  the static oracle (a finite-horizon effect; flags the oracle as not a valid static bound).
 
 Run:
   python scripts/c1_stats.py                                   # self-test (numpy only)
@@ -73,14 +74,14 @@ def mean_refs(rungs, lambdas=None):
 # Statistical primitives
 # ==============================================================================
 def bootstrap_ci(values, stat=np.mean, n_boot=10000, ci=0.95, seed=0, method="auto"):
-    """Bootstrap CI of `stat` over the sample (resampling the SEEDS -- the experimental unit).
-    method='auto' (default, REGISTERED): STUDENTIZED bootstrap-t when stat is the mean, else BCa.
-    Why: at the study's n=15 a plain percentile 95% CI of a mean UNDERCOVERS (~91% normal, ~89%
-    skewed in calibration sims), and BCa does NOT fix it (it repositions the interval; the problem
-    is width). The bootstrap-t interval  [theta - se*t*_(1-a), theta - se*t*_(a)]  is the
-    second-order-accurate repair for a mean and restores near-nominal coverage. Every registered
-    statistic in this study is a seed-mean, so 'auto' == bootstrap-t in practice. BCa/percentile
-    remain available; any failure falls back to percentile (strictly the old behavior)."""
+    """Bootstrap CI of `stat` over the sample, resampling the seeds (the experimental unit).
+    method='auto' (default, registered): studentized bootstrap-t when stat is the mean, else BCa.
+    At n=15 a percentile 95% CI of a mean undercovers (~91% normal, ~89% skewed in calibration
+    sims), and BCa does not repair it (it shifts the interval; the deficit is width). The
+    bootstrap-t interval [theta - se*t*_(1-a), theta - se*t*_(a)] is second-order accurate for a
+    mean and restores near-nominal coverage. Every registered statistic here is a seed-mean, so
+    'auto' == bootstrap-t in practice. BCa/percentile remain available; any failure falls back to
+    percentile."""
     v = np.asarray(values, float)
     n = v.size
     if n == 0:
@@ -159,9 +160,9 @@ def paired(a, b, alternative="two-sided"):
     """Paired nonparametric comparison of two equal-length samples (a vs b). Reports the mean
     difference (a-b), the Wilcoxon signed-rank p, and the sign-test (binomial) p.
 
-    NOTE on small n: with 5 seeds, a perfectly consistent effect still gives Wilcoxon/sign
-    p ~= 0.06 (you cannot cross 0.05 nonparametrically at n=5). Read the bootstrap CI as the
-    primary inferential tool at small n, and scale seeds for the final claim."""
+    At small n the nonparametric p is floored: with 5 seeds a perfectly consistent effect still
+    gives Wilcoxon/sign p ~= 0.06, since 0.05 is unreachable nonparametrically at n=5. Treat the
+    bootstrap CI as the primary inferential tool at small n and scale seeds for the final claim."""
     a = np.asarray(a, float)
     b = np.asarray(b, float)
     d = a - b
@@ -192,12 +193,12 @@ def paired(a, b, alternative="two-sided"):
 
 
 def adjust_pvalues(pvals, method="holm"):
-    """Multiple-comparison correction over a FAMILY of tests (review #12). Returns
+    """Multiple-comparison correction over a family of tests. Returns
     (adjusted_pvals, reject_at_0.05), order-preserving. method:
       'holm' -- Holm-Bonferroni, controls the family-wise error rate (FWER); conservative.
       'bh'   -- Benjamini-Hochberg, controls the false-discovery rate (FDR); more powerful.
-    Run this across the p-values of all the paired comparisons you report in one study (e.g. one per
-    comm topology, per demand family, or per ablation), NOT per-comparison in isolation."""
+    Apply across the p-values of all paired comparisons reported in one study (e.g. one per comm
+    topology, demand family, or ablation), not per comparison in isolation."""
     p = np.asarray(pvals, float)
     n = p.size
     if n == 0:
@@ -225,7 +226,7 @@ def adjust_pvalues(pvals, method="holm"):
 def compare_many(named_pvals, method="holm"):
     """Apply `adjust_pvalues` to a {name: raw_p} dict of paired comparisons. Returns
     {name: {raw, adjusted, reject}} corrected across the whole family. Use after running one
-    paired() per topology / family / ablation, to avoid the multiple-comparisons inflation (#12)."""
+    paired() per topology / family / ablation to avoid multiple-comparisons inflation."""
     names = list(named_pvals)
     adj, rej = adjust_pvalues([named_pvals[n] for n in names], method=method)
     return {n: {"raw": float(named_pvals[n]), "adjusted": float(adj[i]), "reject": bool(rej[i])}
@@ -233,9 +234,9 @@ def compare_many(named_pvals, method="holm"):
 
 
 def tost(diffs, low, high, alpha=0.05):
-    """Two One-Sided Tests for EQUIVALENCE (review #9, the communication NULL): is the mean of the
-    paired differences `diffs` (e.g. no_comm_cost - topology_cost, per seed) within the band
-    [low, high] (= +/- delta)? Returns dict(mean, p_tost, equivalent, ...). Equivalent iff BOTH
+    """Two One-Sided Tests for equivalence (the communication null): is the mean of the paired
+    differences `diffs` (e.g. no_comm_cost - topology_cost, per seed) within the band
+    [low, high] (= +/- delta)? Returns dict(mean, p_tost, equivalent, ...). Equivalent iff both
     one-sided tests reject, i.e. p_tost = max(p_low, p_high) < alpha. Requires scipy for the t-tests."""
     d = np.asarray(diffs, float)
     n = int(d.size)

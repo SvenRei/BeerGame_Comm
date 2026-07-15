@@ -1,63 +1,63 @@
 """
-baselines.py  --  Self-contained base-stock + behavioral baselines for the SIGNAL
-beer-game thesis. No dependency on the analysis scripts.
+baselines.py -- Self-contained base-stock and behavioral baselines for the SIGNAL
+beer-game study. No dependency on the analysis scripts.
 
-POLICIES you run ON the env (editable like the agents):
+Policies evaluated on the environment (configured via their constructors):
 
   OptimizedBaseStockPolicy : per-echelon installation base-stock,
                           order_i = clip(S_i - IP_i, 0, max_order).
-                      Get the LEVELS from optimize_basestock_on_env(...) (env-matched) or
+                      Levels come from optimize_basestock_on_env(...) (env-matched) or
                       coord_descent_serial(...) (idealized anchor). For a serial system an
                       echelon base-stock attains the optimal cost (Clark & Scarf 1960;
                       installation/echelon cost-equivalence, Axsater & Rosling 1993), but
-                      these LEVELS are numerically optimized, NOT the analytic echelon DP --
-                      so do not call them "Clark-Scarf optimal" unless you run the canonical
-                      DP (see `canonical`). Back-compat alias: ClarkScarfPolicy.
+                      these levels are numerically optimized, not the analytic echelon DP --
+                      label them "Clark-Scarf optimal" only when produced by the canonical
+                      DP (see `canonical`). Back-compatible alias: ClarkScarfPolicy.
 
   AdaptiveForecastPolicy   : exponentially-smoothed demand mean+variance -> order-up-to at a
-                      normal-approx critical fractile. The "naive practitioner forecast" rung;
-                      its EMPIRICAL variance captures bullwhip inflation upstream, so it is a
-                      strong (not strawman) non-RL adaptive baseline.
+                      normal-approx critical fractile. The empirical variance captures bullwhip
+                      inflation upstream, making this a strong (not strawman) non-RL adaptive
+                      baseline.
 
   BayesPoissonPolicy       : per-stage Gamma-Poisson conjugate belief on the demand rate ->
                       base-stock at the critical fractile of the negative-binomial predictive
-                      over the protection interval. Bayes-OPTIMAL at the retailer (Poisson
-                      demand; Scarf 1959, Azoury 1985); a HEURISTIC upstream (whose incoming
-                      ORDER stream is not Poisson).
-                      FRAMING (important -- read before reporting): this is the single-stage-
-                      optimal adaptive policy, but in the multi-echelon penalty-at-EVERY-stage
-                      cost it BULLWHIPS (changing its order-up-to level injects order variance)
-                      and is typically WORSE than the static BAR. So report it as a NAIVE-
-                      ADAPTATION FLOOR, NOT "the bar to beat." The headline comparators are the
+                      over the protection interval. Bayes-optimal at the retailer (Poisson
+                      demand; Scarf 1959, Azoury 1985); a heuristic upstream (whose incoming
+                      order stream is not Poisson).
+                      Framing: this is the single-stage-
+                      optimal adaptive policy, but under the multi-echelon penalty-at-every-stage
+                      cost it bullwhips (varying its order-up-to level injects order variance)
+                      and is typically worse than the static BAR. Report it as a naive-
+                      adaptation floor, not the target. The headline comparators are the
                       static BAR (bullwhip-free, the hard target) and the per-lambda Oracle;
-                      SIGNAL-vs-Bayes is the SECONDARY "beats naive adaptation" check. (Under the
-                      CANONICAL retailer-only cost the textbook ordering Bayes < BAR is more
+                      SIGNAL-vs-Bayes is the secondary "beats naive adaptation" check. (Under the
+                      canonical retailer-only cost the textbook ordering Bayes < BAR is more
                       likely to hold.) Use make_bayes_rung() (retailer-Bayes + adaptive upstream)
                       for the reported rung.
-                      SPEC (what the policy knows): Gamma prior centred at the TRAINING-support
+                      Spec: Gamma prior centered at the training-support
                       mean (prior_mean); updates the rate from each period's observed demand;
                       critical-fractile order-up-to over protection interval tau; finite-horizon
-                      with no terminal correction; retailer sees true customer demand, upstream
+                      with no terminal correction; the retailer sees true customer demand, upstream
                       stages see only their own (amplified) incoming order stream.
 
   StermanPolicy            : Sterman (1989) anchoring-and-adjustment heuristic. The behavioral
-                      bullwhip baseline / floor.
+                      bullwhip baseline.
 
-THEORY ANCHORS (no env, pure numpy):
-  the idealized serial model + base-stock optimizer (selftest validates convexity), and the
-  CANONICAL serial model (penalty at the retailer only) whose cost is provably convex
-  (Clark-Scarf 1960) so the optimizer is provably global -- the verified CEILING anchor.
+Theory anchors (no env, pure numpy):
+  the idealized serial model plus base-stock optimizer (selftest validates convexity), and the
+  canonical serial model (penalty at the retailer only) whose cost is provably convex
+  (Clark-Scarf 1960) so the optimizer is provably global -- the verified ceiling anchor.
 
-C1 REFERENCES (the headline regime-uncertainty ladder) -- use `regime`:
-  regime_benchmark() computes a FOUR-rung ladder
+Regime-uncertainty ladder (the headline references) -- use `regime`:
+  regime_benchmark() computes a four-rung ladder
       static BAR  <  Adaptive  <=  Bayes  <=  per-lambda Oracle
-  with DISJOINT select/eval seeds (no winner's-curse): levels are SELECTED on SELECT_SEED_BASE
-  and every rung is REPORTED on EVAL_SEED_BASE (== the SIGNAL held-out seeds, so CRN-comparable).
+  with disjoint select/eval seeds (no winner's curse): levels are selected on SELECT_SEED_BASE
+  and every rung is reported on EVAL_SEED_BASE (== the SIGNAL held-out seeds, so CRN-comparable).
   Writes results/baselines_regime_v2.json (read by c1_stats.py and the trainer/eval ref loader).
 
-PROTECTION INTERVAL tau (per stage, for the Bayes/Adaptive rungs) = effective_lead + 1 review,
+Protection interval tau (per stage, for the Bayes/Adaptive rungs) = effective_lead + 1 review,
 read from the env's lead structure: order(2)+ship(2)=4 downstream, order_mfr(1)+production(2)=3
-mfr -> DEFAULT_TAU=[5,5,5,4]. UPDATE this if you change lead times, or the rungs miscalibrate.
+mfr -> DEFAULT_TAU=[5,5,5,4]. Update this if lead times change, or the rungs miscalibrate.
 
 Run:
   python scripts/baselines.py selftest
@@ -77,17 +77,17 @@ from scipy import stats
 
 AGENTS = ["retailer", "wholesaler", "distributor", "manufacturer"]
 
-# Default env settings (mirror conf/config.yaml `env:`). EDIT here or via the env config.
+# Default env settings (mirror conf/config.yaml env:). Override here or via the env config.
 ENV_BASE = {"horizon": 50, "max_order": 100, "holding_cost": 0.5, "backorder_cost": 1.0}
 SEED_BASE = 100000          # held-out eval seed space (== the SIGNAL held-out eval seeds)
 
-# Disjoint seed blocks (fixes in-sample optimism): SELECT tunes baseline levels; EVAL reports
+# Disjoint seed blocks (remove in-sample optimism): SELECT tunes baseline levels; EVAL reports
 # every rung. EVAL == SEED_BASE so baselines and the SIGNAL held-out eval (also SEED_BASE+e) are
 # scored on the SAME episodes (CRN), while baseline SELECTION uses a block SIGNAL never touches.
 SELECT_SEED_BASE = SEED_BASE + 500000
 EVAL_SEED_BASE = SEED_BASE
 
-# Held-out demand regimes for the C1 study. Each lambda is a STATIONARY poisson rate the policy
+# Held-out demand regimes. Each lambda is a stationary Poisson rate the policy
 # does not know in advance. Keep in sync with HELDOUT_LAMBDAS in the trainer's held-out eval.
 HELDOUT_LAMBDAS = [6.0, 10.0, 14.0, 18.0, 22.0]
 
@@ -96,7 +96,7 @@ DEFAULT_TAU = [5.0, 5.0, 5.0, 4.0]
 
 
 # ==============================================================================
-# Env access + rollout harness (the ONE place policies meet the environment)
+# Env access + rollout harness (the single point where policies meet the environment)
 # ==============================================================================
 def get_env_class():
     """Import the project env. Run from the repo root (script lives in scripts/)."""
@@ -134,7 +134,7 @@ def rollout(env, policy, seed):
 
 
 # ==============================================================================
-# POLICIES  (editable like the agents: configure via the constructor)
+# Policies (configure via their constructors)
 # ==============================================================================
 class Policy:
     """Base policy. act(obs_dict, env) -> {agent: [fraction in 0..1]}.
@@ -164,7 +164,7 @@ class BaseStockPolicy(Policy):
     """Per-echelon installation base-stock: order_i = clip(S_i - IP_i, 0, max_order).
     IP_i = inventory - backlog + on_order  (recoverable from the 4-scalar obs).
 
-    EDIT: S = scalar (same level everywhere) or [S_ret, S_whole, S_dist, S_mfr]."""
+    S is a scalar (same level everywhere) or [S_ret, S_whole, S_dist, S_mfr]."""
     def __init__(self, S):
         self.S = _per_echelon(S, "S")
 
@@ -174,13 +174,13 @@ class BaseStockPolicy(Policy):
 
 
 class OptimizedBaseStockPolicy(BaseStockPolicy):
-    """Numerically-optimized per-echelon installation base-stock. Identical *mechanism* to
-    BaseStockPolicy; the point is the LEVELS.
+    """Numerically-optimized per-echelon installation base-stock. Identical mechanism to
+    BaseStockPolicy; only the levels differ.
 
     For a serial system an echelon base-stock attains the optimal cost (Clark & Scarf 1960),
     and installation vs echelon are cost-equivalent at the optimum (Axsater & Rosling 1993) --
-    BUT these levels are found by coordinate descent on the env / idealized sim, NOT by the
-    analytic echelon DP. Do NOT label them "Clark-Scarf optimal" unless you run the canonical
+    but these levels are found by coordinate descent on the env / idealized sim, not by the
+    analytic echelon DP. Label them "Clark-Scarf optimal" only when produced by the canonical
     DP (`canonical`), which is provably global for the canonical cost structure.
 
     Get the levels by either:
@@ -198,7 +198,7 @@ class AdaptiveForecastPolicy(Policy):
     """Exponentially-weighted demand mean & variance per stage; order-up-to at a normal-approx
     critical fractile. The empirical variance lets the level inflate where the order stream is
     noisier (bullwhip), so this is a strong non-RL adaptive rung.
-    EDIT: tau (protection interval per echelon), eta (smoothing)."""
+    Parameters: tau (protection interval per echelon), eta (smoothing)."""
     def __init__(self, tau=None, h=0.5, b=1.0, eta=0.2):
         self.tau = _per_echelon(DEFAULT_TAU if tau is None else tau, "tau")
         self.z = float(stats.norm.ppf(_critical_fractile(h, b)))
@@ -228,10 +228,10 @@ class BayesPoissonPolicy(Policy):
     Gamma(alpha0 + sum d, beta0 + t). Demand over the protection interval tau marginalizes to
     NegBin(r=alpha, p=beta/(beta+tau)); base-stock = its critical-fractile quantile.
 
-    Bayes-OPTIMAL at the retailer (Poisson customer demand; Scarf 1959, Azoury 1985); a strong
-    HEURISTIC at upstream stages (whose incoming order stream is not Poisson). Prior defaults to
-    the TRAINING regime support so SIGNAL and this rung share the same prior over lambda.
-    EDIT: tau, prior_mean, prior_strength (pseudo-periods)."""
+    Bayes-optimal at the retailer (Poisson customer demand; Scarf 1959, Azoury 1985); a strong
+    heuristic at upstream stages (whose incoming order stream is not Poisson). Prior defaults to
+    the training regime support so SIGNAL and this rung share the same prior over lambda.
+    Parameters: tau, prior_mean, prior_strength (pseudo-periods)."""
     def __init__(self, tau=None, h=0.5, b=1.0, prior_mean=14.0, prior_strength=0.3):
         self.tau = _per_echelon(DEFAULT_TAU if tau is None else tau, "tau")
         self.frac = _critical_fractile(h, b)
@@ -276,16 +276,16 @@ def ar1_cumulative_forecast(d_t, mu, rho, sigma, tau):
 
 
 class AR1BaseStockPolicy(Policy):
-    """MMFE / Kalman-optimal base-stock for AR(1) demand -- the PROPER comparator for the AR(1)
-    family. The Gamma-Poisson BayesPoissonPolicy is NOT optimal under autocorrelation, so on AR(1)
-    you must compare SIGNAL to THIS, not to Bayes. Sets the order-up-to level at the critical-fractile
+    """MMFE / Kalman-optimal base-stock for AR(1) demand -- the proper comparator for the AR(1)
+    family. The Gamma-Poisson BayesPoissonPolicy is not optimal under autocorrelation, so on AR(1)
+    SIGNAL must be compared to this, not to Bayes. Sets the order-up-to level at the critical-fractile
     quantile of the closed-form cumulative-demand forecast over the protection interval:
         S = forecast_mean_over_tau + z * forecast_sd_over_tau,   z = Phi^-1(b/(b+h)).
 
-    Optimal at the RETAILER (sees the true AR(1) customer demand); a strong heuristic upstream (whose
-    incoming ORDER stream is a transformed process) -- exactly the same retailer-optimal / upstream-
+    Optimal at the retailer (sees the true AR(1) customer demand); a strong heuristic upstream (whose
+    incoming order stream is a transformed process) -- the same retailer-optimal / upstream-
     heuristic status as the Bayes rung. Pass the env's AR(1) params (mu, rho, sigma): this is the
-    *informed* optimum, parallel to Bayes being informed about the Poisson family.
+    informed optimum, parallel to Bayes being informed about the Poisson family.
     Heath & Jackson (1994, MMFE); Graves (1999); Lee, So & Tang (2000)."""
     def __init__(self, mu=12.0, rho=0.6, sigma=3.0, tau=None, h=0.5, b=1.0):
         self.mu = float(mu)
@@ -309,17 +309,17 @@ class AR1BaseStockPolicy(Policy):
 
 
 class RetailerOptimalPolicy(Policy):
-    """The DEFENSIBLE multi-echelon adaptive comparator: the family-OPTIMAL model at the retailer
+    """The defensible multi-echelon adaptive comparator: the family-optimal model at the retailer
     (where it is valid -- the retailer faces the true customer demand), and a robust, variance-aware
-    ADAPTIVE forecast base-stock at the upstream echelons (where the incoming ORDER stream is
-    bullwhipped and NOT the assumed family).
+    adaptive forecast base-stock at the upstream echelons (where the incoming order stream is
+    bullwhipped and not the assumed family).
 
-    WHY this exists: applying a Gamma-Poisson (or AR(1)) conjugate at EVERY stage assumes the order
+    Rationale: applying a Gamma-Poisson (or AR(1)) conjugate at every stage assumes the order
     stream upstream is Poisson/AR(1). It is not -- it is the amplified order process -- so the naive
-    rung inflates ABOVE a static base-stock (Bayes > BAR), which is nonsensical for a 'near-optimal
-    adaptive' policy and makes 'SIGNAL beats Bayes' meaningless. Composing retailer-optimal with an
-    EWMA critical-fractile upstream (which estimates the order stream's mean AND variance, so it does
-    not misfire on the bullwhipped stream) restores the sane ordering Oracle <= rung <= BAR.
+    rung inflates above a static base-stock (Bayes > BAR), which is implausible for a near-optimal
+    adaptive policy and makes "SIGNAL beats Bayes" uninformative. Composing retailer-optimal with an
+    EWMA critical-fractile upstream (which estimates the order stream's mean and variance, so it does
+    not misfire on the bullwhipped stream) restores the expected ordering Oracle <= rung <= BAR.
 
     Retailer optimality: Scarf (1959) / Azoury (1985) for Poisson (and NegBin = its Gamma-Poisson
     predictive); Heath & Jackson (1994) for AR(1). Upstream: AdaptiveForecastPolicy."""
@@ -361,7 +361,7 @@ class StermanPolicy(Policy):
       S_eff      : effective inventory = on_hand - backlog  (obs[0] - obs[1])
       SL         : supply line = on-order                  (obs[2])
       beta = 1 -> rational (non-bullwhip); beta < 1 -> supply-line under-weighting -> bullwhip.
-    EDIT any parameter as scalar (shared) or length-4 (per echelon)."""
+    Each parameter is a scalar (shared) or length-4 (per echelon)."""
     def __init__(self, theta=0.25, alpha_S=0.36, beta=0.34, S_prime=17.0, L_init=8.0):
         self.theta = _per_echelon(theta, "theta")
         self.alpha_S = _per_echelon(alpha_S, "alpha_S")
@@ -387,7 +387,7 @@ class StermanPolicy(Policy):
 
 
 # ==============================================================================
-# Evaluate any set of policies ON THE ENV, across regimes x seeds (common seeds = CRN)
+# Evaluate a set of policies on the env, across regimes x seeds (common seeds = CRN)
 # ==============================================================================
 def evaluate(named_policies, regimes, n_seeds=20, seed_base=SEED_BASE,
              env_cfg=None, env_class=None, verbose=True):
@@ -428,8 +428,8 @@ def _print_eval_table(out, regimes, n_seeds):
 
 
 # ==============================================================================
-# Optimize per-echelon base-stock DIRECTLY ON THE ENV -> OptimizedBaseStock levels.
-# (Used by the `optimize`/`eval` CLI for the OOD regimes. The C1 references use the
+# Optimize per-echelon base-stock directly on the env -> OptimizedBaseStock levels.
+# (Used by the `optimize`/`eval` CLI for the OOD regimes. The regime ladder uses the
 #  seed-split `regime_benchmark` below, which is authoritative.)
 # ==============================================================================
 def optimize_basestock_on_env(regime, env_cfg=None, env_class=None, episodes=40,
@@ -447,8 +447,8 @@ def optimize_basestock_on_env(regime, env_cfg=None, env_class=None, episodes=40,
             tot += c
         return tot / episodes
 
-    # Grid-seeded start (replaces the old fixed [44,44,44,44], which biased toward the
-    # in-distribution basin -- M3 optimizer fragility).
+    # Grid-seeded start avoids biasing the optimizer toward the in-distribution basin,
+    # which a fixed uniform start would do.
     if S0 is None:
         gi, gbest = None, np.inf
         for s in range(lo, hi + 1, step):
@@ -475,11 +475,11 @@ def optimize_basestock_on_env(regime, env_cfg=None, env_class=None, episodes=40,
 
 
 # ==============================================================================
-# THEORY ANCHOR: idealized serial model + base-stock optimizer (pure numpy, no env)
+# Theory anchor: idealized serial model + base-stock optimizer (pure numpy, no env)
 # ------------------------------------------------------------------------------
 # Standard serial beer-game, installation base-stock. stages 0..N-1, 0=retailer. Single
 # shipping lead L (pass L=4 to mimic the env's order(2)+ship(2)). penalty_at_retailer_only
-# selects the CANONICAL Clark-Scarf cost (holding everywhere, backorder penalty ONLY at the
+# selects the canonical Clark-Scarf cost (holding everywhere, backorder penalty only at the
 # retailer) -- for which the cost is provably convex (Clark-Scarf 1960). The default
 # (penalty everywhere) matches the project env's service-at-every-stage cost.
 # ==============================================================================
@@ -564,9 +564,9 @@ def coord_descent_serial(lam, L, h, b, T=50, n_eps=120, seed=0,
 
 
 def optimize_canonical_serial(lam, L=4, h=0.5, b=1.0, n_eps=300, seed=0, n_starts=3, verbose=True):
-    """Provable global optimum of the CANONICAL serial model (penalty at retailer only): its
+    """Provable global optimum of the canonical serial model (penalty at retailer only): its
     cost is convex (Clark-Scarf 1960), so multi-start coordinate descent finds the global
-    optimum. The verified CEILING anchor for the canonical-cost env variant (M3 gold standard).
+    optimum. The verified ceiling anchor for the canonical-cost env variant.
     Returns (levels, cost)."""
     guess = float(np.clip(lam * (L + 1), 0, 200))
     starts = [[guess] * 4, [0.0] * 4, [200.0] * 4][:max(1, n_starts)]
@@ -584,16 +584,16 @@ def optimize_canonical_serial(lam, L=4, h=0.5, b=1.0, n_eps=300, seed=0, n_start
 
 def validate_canonical(lambdas=None, L=4, select_episodes=60, eval_episodes=120, env_cfg=None,
                        env_class=None, lo=0, hi=160, step=8, per_echelon=True, verbose=True):
-    """M3.4/M3.5 validation -- turn the env oracle into a VALIDATED COMPUTATIONAL CEILING (not a
+    """Turn the env oracle into a validated computational ceiling (not a
     mathematical proof for the implemented env).
 
-    Runs the ENV under the canonical cost (penalty_at_retailer_only=True) and shows:
-      (1) the env canonical cost is UNIMODAL in a uniform base-stock (single global basin) -> the
-          numerically-optimized env oracle is the global optimum of the base-stock class WITHIN this
-          search. Clark-Scarf (1960) establishes that base-stock is the optimal policy CLASS for the
-          canonical serial model; the EXACT optimum is verified only for the single stage by
+    Runs the env under the canonical cost (penalty_at_retailer_only=True) and shows:
+      (1) the env canonical cost is unimodal in a uniform base-stock (single global basin) -> the
+          numerically-optimized env oracle is the global optimum of the base-stock class within this
+          search. Clark-Scarf (1960) establishes that base-stock is the optimal policy class for the
+          canonical serial model; the exact optimum is verified only for the single stage by
           scripts/dp_optimum.py (the multi-echelon finite-horizon env here is validated, not proven).
-      (2) the env oracle's cost MATCHES the idealized convex single-installation model
+      (2) the env oracle's cost matches the idealized convex single-installation model
           (optimize_canonical_serial) in magnitude -> an independent cross-check (differences = the
           env's extra manufacturer production lead + the equilibrium-init transient).
 
@@ -626,7 +626,7 @@ def validate_canonical(lambdas=None, L=4, select_episodes=60, eval_episodes=120,
                                               per_echelon=per_echelon, verbose=False)
         c_env = _mean_cost_at_lambda(BaseStockPolicy(S_env), lam, eval_episodes, LamEnv,
                                      cfg_canon, EVAL_SEED_BASE)
-        # UNIMODALITY of the env canonical cost in a uniform base-stock (noise-tolerant proxy for
+        # Unimodality of the env canonical cost in a uniform base-stock (noise-tolerant proxy for
         # the Clark-Scarf convexity): decreasing to the min, increasing after -> one global basin.
         grid = list(range(lo, hi + 1, step))
         curve = [_mean_cost_at_lambda(BaseStockPolicy([float(s)] * 4), lam, conv_eps, LamEnv,
@@ -683,7 +683,7 @@ def selftest():
 
 
 # ==============================================================================
-# REGIME-UNCERTAINTY env helpers (CRN-comparable to the SIGNAL held-out eval). A thin subclass
+# Regime-uncertainty env helpers (CRN-comparable to the SIGNAL held-out eval). A thin subclass
 # reads the poisson rate from config 'poisson_lam' -- equivalent to the agent's
 # DemandRandomizedBeerGame(lo=hi=lam, p_shift=0): both draw np_random.poisson(lam) off an env
 # RNG seeded by `seed`, so these numbers match the SIGNAL held-out eval at the SAME seeds.
@@ -719,7 +719,7 @@ def cost_across_lambdas(policy, lambdas, episodes=200, env_cfg=None, env_class=N
 def best_single_fixed_S(lambdas, episodes=80, env_cfg=None, env_class=None,
                         seed_base=SELECT_SEED_BASE, lo=20, hi=160, step=4,
                         per_echelon=False, rounds=3, verbose=True):
-    """The DEPLOYABLE BAR's LEVELS: ONE base-stock across the whole lambda set, chosen with NO
+    """The deployable BAR levels: one base-stock across the whole lambda set, chosen with no
     regime knowledge (min mean cost). Selected on `seed_base` (= SELECT). Uniform by default;
     per_echelon=True coordinate-descends a 4-vector. Returns (S_vec, {lam: select_cost}, mean)."""
     env_cfg = dict(ENV_BASE if env_cfg is None else env_cfg)
@@ -756,8 +756,8 @@ def best_single_fixed_S(lambdas, episodes=80, env_cfg=None, env_class=None,
 def per_lambda_oracle_levels(lambdas, episodes=80, env_cfg=None, env_class=None,
                              seed_base=SELECT_SEED_BASE, lo=20, hi=160, step=4,
                              per_echelon=True, rounds=3, verbose=True):
-    """The privileged ORACLE's per-lambda LEVELS (knows the regime), per_echelon to match
-    SIGNAL's per-echelon head so the ceiling is a TRUE upper bound. Selected on `seed_base`
+    """The privileged Oracle's per-lambda levels (knows the regime), per_echelon to match
+    SIGNAL's per-echelon head so the ceiling is a true upper bound. Selected on `seed_base`
     (= SELECT). Returns {lam: S_vec}."""
     out = {}
     for lam in lambdas:
@@ -773,14 +773,14 @@ def per_lambda_oracle_levels(lambdas, episodes=80, env_cfg=None, env_class=None,
 def regime_benchmark(lambdas=None, select_episodes=80, eval_episodes=200, env_cfg=None,
                      env_class=None, tau=None, prior_mean=14.0, bar_per_echelon=False,
                      out_path="results/baselines_regime_v2.json", sterman=None, verbose=True):
-    """The FOUR-rung, leakage-free C1 ladder. The TEXTBOOK ordering by cost is
+    """The four-rung, leakage-free regime-uncertainty ladder. The textbook ordering by cost is
         Oracle <= Bayes <~ Adaptive <= static BAR
-    and holds under the CANONICAL retailer-only cost (penalty_at_retailer_only=True). Under the
-    DEFAULT penalty-at-EVERY-stage cost, the adaptive rungs (Adaptive, Bayes) BULLWHIP and can
-    EXCEED the static BAR -- this is expected (see S2), not a bug. So the HEADLINE comparators are
-    the static BAR (bullwhip-free, the hard target) + the per-lambda Oracle: SIGNAL must BEAT the
-    static BAR and APPROACH the Oracle; SIGNAL-vs-Bayes is a SECONDARY 'beats naive adaptation'
-    check. Levels (BAR, Oracle) are SELECTED on SELECT_SEED_BASE; ALL rungs are REPORTED on
+    and holds under the canonical retailer-only cost (penalty_at_retailer_only=True). Under the
+    default penalty-at-every-stage cost, the adaptive rungs (Adaptive, Bayes) bullwhip and can
+    exceed the static BAR -- this is expected, not a bug. The headline comparators are
+    the static BAR (bullwhip-free, the hard target) plus the per-lambda Oracle: SIGNAL must beat the
+    static BAR and approach the Oracle; SIGNAL-vs-Bayes is a secondary "beats naive adaptation"
+    check. Levels (BAR, Oracle) are selected on SELECT_SEED_BASE; all rungs are reported on
     EVAL_SEED_BASE (== the SIGNAL held-out seeds). Writes per-lambda curves to JSON for c1_stats.py
     and the trainer/eval ref loader."""
     lambdas = [float(l) for l in (HELDOUT_LAMBDAS if lambdas is None else lambdas)]

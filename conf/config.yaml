@@ -27,11 +27,11 @@ env:
   holding_cost: 0.5
   # Penalty per unit of starving backlog per week.
   backorder_cost: 1.0
-  # COST MODEL. False (default) = beer-game team cost: every echelon pays for its own backlog
-  # (service at every stage). True = canonical Clark-Scarf (1960) serial cost: backorder penalty
-  # ONLY at the retailer -> echelon base-stock is PROVABLY optimal (the verified-ceiling variant
-  # for the C1 "gap to the provable optimum" claim). Holding cost is charged at every stage either
-  # way. Changing this changes the cost scale -> regenerate baselines refs (baselines.py regime).
+  # Cost model. False (default): beer-game team cost, where every echelon pays for its own backlog.
+  # True: canonical Clark-Scarf (1960) serial cost with the backorder penalty only at the retailer,
+  # under which echelon base-stock is provably optimal (the verified-ceiling variant for the C1
+  # gap-to-optimum claim). Holding cost is charged at every stage either way. Changing this changes
+  # the cost scale, so regenerate the baselines refs (baselines.py regime).
   penalty_at_retailer_only: False
   # How many in-transit shipment slots the OBSERVATION exposes. Should be >= the
   # largest shipping lead time below, or agents go briefly blind to inbound goods

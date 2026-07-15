@@ -1,15 +1,14 @@
-"""
-run_confirmatory_report.py -- the LOCKED, preregistered analyzer (review #2/#9/#10). Torch-free.
+"""Locked, preregistered confirmatory analyzer. Torch-free.
 
-It executes PREREGISTRATION.md end-to-end so the headline numbers come from one immutable script,
-not ad-hoc notebooks:
-  * loads the per-seed SIGNAL dumps produced by `eval_signal.py --dump-c1`
+Executes PREREGISTRATION.md end-to-end so the headline numbers come from one immutable script
+rather than ad-hoc notebooks:
+  * loads the per-seed SIGNAL dumps produced by `eval_signal.py --dump-c1`:
         seed{S}.json     -> {lambda: mean_cost}
         seed{S}_bw.json  -> {lambda: {echelon: BW_cum}}
-  * checks the run matches the prereg (>=10 seeds, lambda set == the refs);
-  * C1 headline via c1_stats.summarize (Gap [95% CI], IQM, perf profile, Gap<=1, vs-Bayes floor);
-  * a BULLWHIP TABLE (SIGNAL from the dumps; static-BAR + Bayes computed offline on the env);
-  * optional COMMUNICATION analysis: CRN-paired Wilcoxon + TOST(+/-band) + Holm across topologies;
+  * checks the run matches the preregistration (>=10 seeds, lambda set == the references);
+  * C1 headline via c1_stats.summarize (Gap [95% CI], IQM, performance profile, Gap<=1, vs-Bayes floor);
+  * a bullwhip table (SIGNAL from the dumps; static-BAR and Bayes computed offline on the env);
+  * optional communication analysis: CRN-paired Wilcoxon + TOST(+/-band) + Holm across topologies;
   * writes results/confirmatory_report.json.
 
 Run:
@@ -113,9 +112,9 @@ def prereg_check(signal, lambdas, min_seeds=MIN_SEEDS):
 
 # ----------------------------------------------------------------------- communication
 def comm_analysis(comm_dirs, band_frac=TOST_BAND_FRAC, alpha=0.05):
-    """comm_dirs[0] = no-comm reference dir; the rest = topology arms. Each dir has per-seed
+    """comm_dirs[0] is the no-comm reference dir; the rest are topology arms. Each dir holds per-seed
     seed{S}.json ({lambda: cost}). Per topology: CRN-paired diff (no_comm - topology) over seeds,
-    Wilcoxon (effect) + TOST (equivalence vs +/- band) ; Holm across topologies."""
+    Wilcoxon (effect) and TOST (equivalence vs +/- band); Holm correction across topologies."""
     base = load_signal_dir(comm_dirs[0])
     base_seed_cost = {s: float(np.mean(list(d.values()))) for s, d in base.items()}
     band = band_frac * float(np.mean(list(base_seed_cost.values())))

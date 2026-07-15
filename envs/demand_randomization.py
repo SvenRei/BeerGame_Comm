@@ -1,11 +1,10 @@
-"""
-demand_randomization.py -- DemandRandomizedBeerGame, a self-contained subclass of the env
-(no agent dependency).
+"""DemandRandomizedBeerGame: a self-contained BeerGameParallelEnv subclass (no agent dependency).
 
-Per episode: lambda ~ U[lo,hi] and, with prob p_shift, one mid-episode level shift. Perturbs ONLY
-demand_type 'poisson' (training); black_swan/extreme_chaos pass straight through so any OOD
-benchmark is never altered. This is the rate-randomized regime-inference training env; the held-out
-gate reuses it with lo=hi=lambda, p_shift=0 for stationary per-lambda evaluation.
+Per episode, draws lambda ~ U[lo, hi] and, with probability p_shift, applies one
+mid-episode level shift. Perturbs only demand_type 'poisson' (training); black_swan
+and extreme_chaos pass through unchanged so OOD benchmarks are never altered. This is
+the rate-randomized regime-inference training env; the held-out gate reuses it with
+lo=hi=lambda and p_shift=0 for stationary per-lambda evaluation.
 """
 import numpy as np
 from envs.beer_game_env import BeerGameParallelEnv

@@ -1,32 +1,31 @@
-"""
-distill_symbolic.py -- C3: SYMBOLIC DISTILLATION of the SIGNAL policy (PySR + DAgger).
+"""Symbolic distillation of the SIGNAL policy via PySR and DAgger (contribution C3).
 
-The headline contribution: take the SIGNAL actor (a GRU belief + a single linear base-stock head),
-distill its memoryless state -> order-up-to S map into a closed-form equation, and show the equation
-recovers the textbook base-stock structure  S ~= lead*demand + safety  with a safety factor near the
-critical fractile  z* = Phi^-1(b/(b+h)). Because SIGNAL's head is already a base-stock, the fidelity
-gap (one-step R^2 on the student's OWN states) measures how much the GRU BELIEF adds beyond the four
-memoryless features -- i.e. how history-dependent the learned policy really is.
+Takes the SIGNAL actor (a GRU belief plus a single linear base-stock head), distills its
+memoryless state -> order-up-to S map into a closed-form equation, and tests whether the equation
+recovers the textbook base-stock structure S ~= lead*demand + safety with a safety factor near the
+critical fractile z* = Phi^-1(b/(b+h)). Because SIGNAL's head is already a base-stock, the fidelity
+gap (one-step R^2 on the student's own states) measures how much the GRU belief adds beyond the four
+memoryless features -- i.e. how history-dependent the learned policy is.
 
-WHY DAGGER (non-negotiable): naive symbolic regression on the expert's OWN trajectories looks fine
-in one-step fidelity but drifts off-distribution when the symbolic policy actually drives the system
-(the documented policy-distillation failure mode; SPID 2025). DAgger fixes it: roll out the SYMBOLIC
-student, collect the states IT visits, re-query the MLP expert there, append, refit. Repeat.
+DAgger is required because naive symbolic regression on the expert's own trajectories scores well on
+one-step fidelity but drifts off-distribution once the symbolic policy drives the system (the known
+policy-distillation failure mode; SPID 2025). DAgger rolls out the symbolic student, collects the
+states it visits, re-queries the MLP expert there, appends, and refits.
 
-PIPELINE
-  round 0 (behavior cloning): roll the EXPERT, log per echelon (state -> expert order-up-to S).
-  rounds 1..R (DAgger):       roll the SYMBOLIC student, re-query the expert at its states, append, refit.
-  report:  (1) cost retention  symbolic vs MLP vs Bayes-adaptive rung,
-           (2) one-step fidelity R^2 on EXPERT states AND on the student's OWN states (the SPID gap),
-           (3) the equation per echelon + the base-stock structural test (slope~=lead, implied z vs z*).
+Pipeline:
+  round 0 (behavior cloning): roll the expert, log per echelon (state -> expert order-up-to S).
+  rounds 1..R (DAgger):       roll the symbolic student, re-query the expert at its states, append, refit.
+  report:  (1) cost retention: symbolic vs MLP vs Bayes-adaptive rung;
+           (2) one-step fidelity R^2 on expert states and on the student's own states (the SPID gap);
+           (3) the equation per echelon plus the base-stock structural test (slope~=lead, implied z vs z*).
 
-The symbolic regressor is pluggable: PySR (the real symbolic search) when installed, else a transparent
-LINEAR base-stock least-squares fit (the H0 "S is affine in the demand signal"). The DAgger loop,
-rollouts, fidelity and structural analysis are identical for both, so the whole method is testable
-without Julia/torch (see the self-test, which distills a known base-stock 'expert' on the real env).
+The symbolic regressor is pluggable: PySR when installed, else a transparent linear base-stock
+least-squares fit (the affine "S is affine in the demand signal" hypothesis). The DAgger loop,
+rollouts, fidelity, and structural analysis are identical for both, so the method is testable
+without Julia or torch (see the self-test, which distills a known base-stock expert on the real env).
 
-FEATURES are the four memoryless local scalars [inv, backlog, on_order, last_demand] (roadmap step B):
-a memoryless base-stock rule. The expert (MLP) is history-dependent via its belief z; the fidelity gap
+Features are the four memoryless local scalars [inv, backlog, on_order, last_demand], forming a
+memoryless base-stock rule. The expert (MLP) is history-dependent via its belief; the fidelity gap
 quantifies how much that memory matters. (An EWMA-of-demand feature is the natural next ablation.)
 
 Run:
@@ -83,7 +82,7 @@ def rollout_cost(policy, env, seed):
 
 
 # ==============================================================================
-# Symbolic regressor: PySR (real search) | linear base-stock LS (transparent H0)
+# Symbolic regressor: PySR search, or linear base-stock least squares (transparent baseline)
 # ==============================================================================
 class SymbolicRegressor:
     def __init__(self, backend="auto", feature_names=FEATURE_NAMES, pysr_kwargs=None):
@@ -117,7 +116,7 @@ class SymbolicRegressor:
                 if self.backend == "pysr":
                     raise
                 print(f"  [SR] PySR unavailable ({type(e).__name__}: {e}); using linear base-stock fit.")
-        # linear least squares: y ~ X @ coef + intercept  (the affine base-stock H0)
+        # linear least squares: y ~ X @ coef + intercept (the affine base-stock hypothesis)
         A = np.hstack([X, np.ones((len(X), 1))])
         sol, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
         self._coef = sol[:-1]
@@ -178,9 +177,9 @@ class SymbolicPolicy:
 # DAgger data collection + fit + diagnostics
 # ==============================================================================
 def collect_round(envs, expert, driver, episodes, seed_base, target="S"):
-    """One data pass. DRIVER acts in the env (expert for BC round 0, symbolic for DAgger rounds);
-    the EXPERT is queried at every visited state for the target (advancing its belief over the
-    driver's trajectory -> correct DAgger). Returns per-echelon (X, y)."""
+    """One data pass. `driver` acts in the env (expert for BC round 0, symbolic for DAgger rounds);
+    the expert is queried at every visited state for the target, advancing its belief over the
+    driver's trajectory as DAgger requires. Returns per-echelon (X, y)."""
     X = [[] for _ in AGENTS]
     Y = [[] for _ in AGENTS]
     same = driver is expert
@@ -283,8 +282,8 @@ def load_expert(ckpt_path):
     from agents.eval_signal import SIGNALPolicy
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     # SIGNAL's actor is a single linear base-stock head over [obs, belief, message], so the
-    # base-stock form is built in: distillation here mainly quantifies how much the GRU BELIEF
-    # (memory) adds beyond the four memoryless features the symbolic student is given.
+    # base-stock form is built in; distillation here mainly quantifies how much the GRU belief
+    # (memory) adds beyond the four memoryless features given to the symbolic student.
     env0 = make_lambda_envs([HELDOUT_LAMBDAS[0]])[HELDOUT_LAMBDAS[0]]
     return SIGNALPolicy(ck, env0, ablate=False, deterministic=True)
 
@@ -378,12 +377,12 @@ def main():
 
 
 # ==============================================================================
-# Self-test: distill a KNOWN base-stock 'expert' on the REAL env (no torch/pysr).
-# Verifies the full DAgger pipeline + linear SR + structural analysis end-to-end.
+# Self-test: distill a known base-stock expert on the real env (no torch/pysr),
+# verifying the full DAgger pipeline, linear SR, and structural analysis end-to-end.
 # ==============================================================================
 class _MockBaseStockExpert:
-    """Stands in for the trained MLP. Memoryless per-echelon base-stock S_i = a_i + b_i*last_demand,
-    so the linear SR should recover it EXACTLY -> retention ~1, fidelity ~1, slope~b_i, intercept~a_i."""
+    """Stand-in for the trained MLP: a memoryless per-echelon base-stock S_i = a_i + b_i*last_demand,
+    which the linear SR should recover exactly (retention ~1, fidelity ~1, slope~b_i, intercept~a_i)."""
     def __init__(self, a, b, max_order=100):
         self.a = list(a)
         self.b = list(b)
@@ -408,7 +407,7 @@ def _selftest():
     print("=" * 72)
     print("SELF-TEST: distill a known base-stock expert on the REAL env (linear backend)")
     print("=" * 72)
-    a, b_coef = [20.0, 24.0, 28.0, 30.0], [4.0, 4.0, 4.0, 3.0]   # mfr lead smaller (matches env)
+    a, b_coef = [20.0, 24.0, 28.0, 30.0], [4.0, 4.0, 4.0, 3.0]   # manufacturer lead smaller (matches env)
     expert = _MockBaseStockExpert(a, b_coef)
     envs = make_lambda_envs([8.0, 16.0])
     regs, history = dagger_distill(expert, envs, backend="linear", bc_episodes=12, dagger_episodes=8,

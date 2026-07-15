@@ -1,9 +1,9 @@
 """
 coordination_theory.py -- numerical check of the regime-invariance theorem for the SIGNAL
-coordinating transfer, on a serial chain. NO torch/env needed (scipy newsvendor algebra).
+coordinating transfer, on a serial chain. No torch/env needed (scipy newsvendor algebra).
 
-Claim: the transfer tau*_k = p - b_k that coordinates each upstream link is REGIME-INVARIANT --
-the SAME constant coordinates the decentralized base-stocks to the centralized base-stocks for
+Claim: the transfer tau*_k = p - b_k that coordinates each upstream link is regime-invariant --
+the same constant coordinates the decentralized base-stocks to the centralized base-stocks for
 every demand rate lambda. Levels move with lambda; the coordinating transfer does not.
 """
 import numpy as np
@@ -28,11 +28,11 @@ def newsvendor_cost(y, Lam, h, b, dmax=None):
 
 def check_link(p, h, b_private, lambdas, L=1):
     """One upstream link: central target fractile p/(p+h); decentral b_private/(b_private+h);
-    contract tau* = p - b_private. Verify the contract level == central level for EVERY lambda,
+    contract tau* = p - b_private. Verify the contract level == central level for every lambda,
     and report the price of anarchy (system cost under decentral vs central stock)."""
     phi_star = p / (p + h)                                   # system-optimal fractile
     phi_nash = b_private / (b_private + h)                   # self-interested fractile
-    tau_star = p - b_private                                 # the coordinating transfer (regime-FREE)
+    tau_star = p - b_private                                 # the coordinating transfer (regime-free)
     phi_ctr = (b_private + tau_star) / (b_private + tau_star + h)
     rows, poas, coordinated = [], [], True
     for lam in lambdas:
@@ -40,7 +40,7 @@ def check_link(p, h, b_private, lambdas, L=1):
         y_star = newsvendor_level(phi_star, Lam)
         y_nash = newsvendor_level(phi_nash, Lam)
         y_ctr = newsvendor_level(phi_ctr, Lam)
-        # PoA: SYSTEM cost (shortfall charged at p) under decentral vs central stock
+        # PoA: system cost (shortfall charged at p) under decentral vs central stock
         c_star = newsvendor_cost(y_star, Lam, h, p)
         c_nash = newsvendor_cost(y_nash, Lam, h, p)
         poa = c_nash / max(c_star, 1e-9)
@@ -70,7 +70,7 @@ if __name__ == "__main__":
     # ---- assertions ----
     assert r["coordinated"], "tau* must coordinate at every lambda (regime-invariance)"
     assert r["poa_mean"] > 1.05, "self-interest should create a real price of anarchy"
-    # tau* must NOT depend on lambda: recompute over a different lambda grid, same tau*
+    # tau* must not depend on lambda: recompute over a different lambda grid, same tau*
     r2 = check_link(p, h, b_priv, [8, 12, 30], L=1)
     assert abs(r2["tau_star"] - r["tau_star"]) < 1e-12, "tau* changed with the regime grid (should not)"
     assert r2["coordinated"], "tau* must also coordinate the second regime grid"

@@ -40,12 +40,17 @@ agents/
                             checkpointing). Folds the held-out-lambda gate in directly.
   eval_signal.py            Checkpoint loader (SIGNALPolicy) + measurement layer: standard benchmark,
                             per-stage dashboard, C1 regime-uncertainty, comm-value decomposition
-                            (forecast-error delta = the Lee mechanism), honesty probe, and the
-                            --dump-c1 / --dump-comm producers for the stats scripts.
+                            (forecast-error delta = the Lee mechanism), honesty probe, positive-
+                            listening + message-intervention (do(m)) probes, and the --dump-c1 /
+                            --dump-comm / --dump-iv producers for the stats scripts.
+  signal_csvlog.py          Scientific scalar logger (opt-in via SIGNAL_CSVLOG=1). PURE OBSERVATION:
+                            reads tensors the update/eval paths already compute and writes one
+                            metrics_heldout.csv (the true per-gate learning curve), one
+                            metrics_update.csv (PPO/convergence diagnostics), and a run_meta.json
+                            provenance manifest per run_dir. Stdlib csv only; default-off is
+                            byte-identical to the frozen trainer. Replaces W&B for the sweep.
   topologies.py             Communication topologies (ADJ matrices): neighbor / skip / full /
-                            retailer_broadcast / no_neighbor (placebo).
-  heldout_eval.py           [LEGACY] standalone Gap_Recovered helper + self-test. Not imported by the
-                            pipeline (train_signal.py folds an equivalent gate in directly).
+                            retailer_broadcast / no_neighbor (placebo) + the geometry variants.
 conf/
   config.yaml               Master Hydra config (env block + globals). defaults: agent: signal.
   agent/signal.yaml         Agent hyperparameters + the study knobs (msg_content, topology, beta, tau).
@@ -64,18 +69,32 @@ scripts/
                             the optimum (the "gap to optimal" anchor).
   run_confirmatory_report.py  Locked analyzer: runs the C1 + bullwhip + communication tables end-to-end
                             from the per-seed dumps. Torch-free.
+  prereg.py                 Pre-registration of the confirmatory analysis (the single source of truth
+                            for the primary/secondary contrasts + multiplicity). `python scripts/prereg.py`
+                            prints the registration and its SHA256 (logged into run_meta.json). Torch-free.
   distill_symbolic.py       C3 symbolic distillation (PySR + DAgger) of the SIGNAL policy into a
                             closed-form base-stock equation. Falls back to a linear fit without PySR.
-  play_yourself.py          Tkinter GUI to play the env by hand and sanity-check the physics.
 test/
   test_signal.py            [TODO] agent component/integration tests (needs torch).
   test_beer_game_env.py     [TODO] env unit tests (numpy + pettingzoo; no torch).
 requirements.txt            CPU torch + numpy/scipy/pettingzoo/gymnasium/hydra/omegaconf/wandb/pytest.
-                            (matplotlib/seaborn/pysr are optional; see the file.)
+                            (matplotlib is needed for plot_curves.py; seaborn/pysr optional; see file.)
+setup_pod.sh                One-shot environment bootstrap for a fresh (RunPod/Linux) box: detects
+                            CPU vs GPU, builds the venv, installs everything, VERIFIES the install,
+                            runs the component + end-to-end smoke tests, and prints the data-gen
+                            tutorial. Idempotent; see `OVERRIDABLE ENV` in its header.
+sweep_all_hypotheses.sh     The full registered multi-seed sweep orchestrator (train | dump | probe |
+                            analyze) for a parallel CPU pod. xargs -P job pool, BLAS pinned to 1
+                            thread/job, sentinel-based resume. Enables SIGNAL_CSVLOG by default.
+plot_curves.py              Standalone learning-curve plotter: ingests the per-seed metrics_heldout.csv
+                            for one/many arms, aligns on episode, plots the seed-aggregated mean of any
+                            column with a bootstrap-95%-CI (default) or IQR band, to a vector PDF. No
+                            tracker; matplotlib + numpy only.
 ```
 
-Generated at runtime (git-ignored): `weights_signal/` (checkpoints), `results/` (refs + dumps),
-`outputs/` (Hydra run dirs), `wandb/`.
+Generated at runtime (git-ignored): `weights_signal/` (checkpoints + per-run metrics_*.csv /
+run_meta.json), `results/` (refs + dumps), `sweep_out/` (sweep job lists + logs), `outputs/`
+(Hydra run dirs), `wandb/`.
 
 ---
 
@@ -92,10 +111,14 @@ Generated at runtime (git-ignored): `weights_signal/` (checkpoints), `results/` 
 - **Head** — ONE linear layer maps `[obs, belief, message] → S` (order-up-to level); softplus is only
   a positivity link. The env order is `clip(S − inventory_position)`.
 - **Message ladder** (the object of study) — the message is one of:
+  `raw` (the sender's last realized incoming demand — classical POS-data sharing, Cachon–Fisher) ·
   `dhat` (the demand belief, the Lee signal) · `ip` (inventory position, the VMI signal) ·
   `dhat_ip` (both named signals) · `learned` (a learned vector — the interpretability control).
-  Routed along the topology with a one-step delay. Messages are stored detached, i.e. as fixed
-  extended observations (plain MAPPO; no DIAL gradient).
+  Routed along the topology with a one-step delay. The **named** rungs (`raw`/`dhat`/`ip`/`dhat_ip`)
+  are stored detached, i.e. as fixed extended observations (plain MAPPO), which keeps `dhat`
+  grounded by the aux loss and the honesty probe well-posed. The **`learned`** rung is instead
+  recomputed in-graph in the update (**DIAL**, Foerster et al.), so the channel actually trains —
+  a self-test asserts its params move (`dial_dW`/`dial_dgain`).
 - **Economics layer** (rides on the reward, independent of the agent) —
   `rᵢ = −(own_costᵢ + β·others_cost) − τ·backlogᵢ (+ credit to customer)`.
   `β = 1` cooperative (team cost) ↔ `β = 0` self-interested (price of anarchy);
@@ -105,10 +128,17 @@ Generated at runtime (git-ignored): `weights_signal/` (checkpoints), `results/` 
 
 ## Install
 
-**Train / eval (CPU torch — training is CPU-bound; the per-step encode is sequential):**
+**One-shot (recommended, esp. on a fresh RunPod/Linux pod)** — detects CPU vs GPU, builds the
+venv, installs + **verifies** everything, and runs the smoke tests:
+```bash
+chmod +x setup_pod.sh && ./setup_pod.sh          # GPU=0 to force CPU wheels; see the header for env knobs
+```
+
+**Manual (CPU torch — training is CPU-bound; the per-step encode is sequential):**
 ```bash
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements.txt
+python -m pip install matplotlib                 # for plot_curves.py (the learning-curve figures)
 # On a GPU box, install the CUDA torch build for your toolkit instead of the CPU wheel.
 ```
 
@@ -143,7 +173,11 @@ base-stock at the held-out λ (competence is the floor, not the contribution —
 ## The research pipeline
 
 The benchmark is generated **once** and read by every training run (do not regenerate per run).
-Set `WANDB_MODE=disabled` to skip W&B.
+Set `WANDB_MODE=disabled` to skip W&B, and `SIGNAL_CSVLOG=1` to write the per-run learning-curve
+CSVs (`metrics_heldout.csv` = the true per-gate curve, `metrics_update.csv` = PPO diagnostics,
+`run_meta.json` = provenance) into each `run_dir`. The CSV logger is pure observation — with the
+flag unset, training is byte-identical to the frozen instrument. For the parallel sweep it is on by
+default (see `sweep_all_hypotheses.sh`); W&B is the interactive-single-run convenience.
 
 ```bash
 # 1) BENCHMARK (once): static-base-stock BAR / per-lambda Oracle -> results/baselines_regime_v2.json
@@ -174,6 +208,25 @@ python scripts/comm_stats.py report --comm-dir results/comm_on --nocomm-dir resu
 # 5) CONFIRMATORY report (C1 + bullwhip + communication tables in one locked script):
 python scripts/run_confirmatory_report.py --signal-dir results/signal_c1 \
        --refs results/baselines_regime_v2.json --comm results/comm_off results/comm_on
+
+# 6) LEARNING-CURVE figures from the per-run CSVs (needs SIGNAL_CSVLOG=1 at train time).
+#    Aggregates all matching seeds; default band = studentized bootstrap-95% CI.
+python plot_curves.py \
+       --arm comm   "weights_signal/run_signal_*_<comm_arm>_s*/metrics_heldout.csv" \
+       --arm nocomm "weights_signal/run_signal_*_<nocomm_arm>_s*/metrics_heldout.csv" \
+       --out fig.pdf                     # --metric {gap_recovered,forecast_error,positive_listening,...}
+```
+
+**Full registered sweep.** The steps above are the manual path; `sweep_all_hypotheses.sh` runs all
+~435 arms across 15 seeds on a parallel CPU pod and drives the same producers/stats through its
+`STAGE={train,dump,probe,analyze}` phases. See `setup_pod.sh` (which ends with a commented
+data-gen tutorial) and the header of `sweep_all_hypotheses.sh`. Quick path on a pod:
+```bash
+./setup_pod.sh                                             # install + verify + smoke
+python scripts/baselines.py regime                        # refs (behavioral cost model)
+DRYRUN=1 ./sweep_all_hypotheses.sh                        # preview the plan
+NPROC=48 PHASES="A B Bnull C E" ./sweep_all_hypotheses.sh # train the behavioral core
+STAGE=dump ./sweep_all_hypotheses.sh && STAGE=analyze ./sweep_all_hypotheses.sh
 ```
 
 Train **≥10 seeds** per arm for the statistical headline (5 is a pilot — the nonparametric p is
@@ -200,8 +253,8 @@ Hydra composes `conf/config.yaml` + `conf/agent/signal.yaml`; override anything 
 | Override | Values | Meaning |
 |---|---|---|
 | `agent.use_comm` | `true` \| `false` | enable messages (false zeroes the ADJ — no-comm control) |
-| `agent.msg_content` | `dhat` \| `ip` \| `dhat_ip` \| `learned` | the semantic message ladder |
-| `agent.comm_topology` | `neighbor` \| `skip` \| `full` \| `retailer_broadcast` \| `no_neighbor` | message routing |
+| `agent.msg_content` | `raw` \| `dhat` \| `ip` \| `dhat_ip` \| `learned` | the semantic message ladder (`raw` = last incoming demand) |
+| `agent.comm_topology` | `neighbor` \| `skip` \| `full` \| `retailer_broadcast` \| `no_neighbor` \| … | message routing (+ geometry variants) |
 | `agent.srdqn_beta` | `0.0`..`1.0` | reward sharing: 1 cooperative, 0 self-interested |
 | `agent.tau` | float | coordinating transfer on upstream backorders (τ\* = p − b) |
 | `agent.train_env` | `dr_poisson` \| `ar1` \| `family` | training demand process |
@@ -215,6 +268,7 @@ Hydra composes `conf/config.yaml` + `conf/agent/signal.yaml`; override anything 
 ## Testing
 
 ```bash
+./setup_pod.sh                        # full board: verify install + all self-tests + end-to-end smoke
 python agents/signal_agent.py         # agent shape self-test (needs torch)
 # python test/test_beer_game_env.py   # env unit tests [TODO — test/ not yet written]
 # python test/test_signal.py          # agent integration tests [TODO]
@@ -224,10 +278,13 @@ python agents/signal_agent.py         # agent shape self-test (needs torch)
 
 ## Status
 
-- **Done & self-tested:** env, agent (`signal_agent.py`, shape self-test), trainer (`train_signal.py`,
-  py-compiled), `eval_signal.py` (py-compiled), `demand_randomization.py`, `baselines.py`,
-  `demand_families.py`, `c1_stats.py`, `comm_stats.py`, `coordination_theory.py`, `dp_optimum.py`,
-  `run_confirmatory_report.py`, `distill_symbolic.py`.
+- **Done & self-tested:** env, agent (`signal_agent.py`, shape + DIAL + policy-gradient self-test),
+  trainer (`train_signal.py`, py-compiled + end-to-end smoke in `setup_pod.sh`), `eval_signal.py`
+  (py-compiled), `signal_csvlog.py` (byte-identical-when-off verified; smoke-tested), `plot_curves.py`
+  (ingest/aggregate tested), `demand_randomization.py`, `baselines.py`, `demand_families.py`,
+  `c1_stats.py`, `comm_stats.py`, `coordination_theory.py`, `dp_optimum.py`, `prereg.py`,
+  `run_confirmatory_report.py`, `distill_symbolic.py`. Orchestration: `setup_pod.sh`,
+  `sweep_all_hypotheses.sh` (bash-linted).
 - **TODO:** `test/` package — `test_beer_game_env.py` (env unit tests) and `test_signal.py` (agent
   integration tests). The directory does not exist yet.
 

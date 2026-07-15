@@ -1,8 +1,8 @@
 """
-dp_optimum.py -- EXACT finite-horizon dynamic-programming optimum for a single-stage canonical
-inventory problem. Anchors the "gap to optimal" claim (review #2/#17): it shows the critical-fractile
-base-stock MATCHES the exact DP optimum, i.e. the base-stock benchmark is a *true* optimum, not a
-hand-built reference. For the canonical SERIAL system the multi-echelon optimum decomposes into
+dp_optimum.py -- Exact finite-horizon dynamic-programming optimum for a single-stage canonical
+inventory problem. Anchors the "gap to optimal" claim: it shows the critical-fractile
+base-stock matches the exact DP optimum, i.e. the base-stock benchmark is a true optimum, not a
+hand-built reference. For the canonical serial system the multi-echelon optimum decomposes into
 per-echelon single-stage problems of exactly this form (Clark & Scarf 1960; Zipkin 2000, Ch. 8-9);
 this script is that building block at one stage / one lambda. (The full serial echelon-DP is the
 heavier alternative; the env-side check that the numerically-optimized canonical base-stock is global
@@ -14,7 +14,7 @@ of ordering up to S is the newsvendor loss over the protection interval (L+1 per
     G(S) = E[ h*(S - D_{L+1})^+ + b*(D_{L+1} - S)^+ ],   D_{L+1} ~ Poisson(lambda*(L+1)).
 The exact scalar DP over inventory position x is
     V_t(x) = min_{S >= x} [ G(S) + E_{D~Poisson(lambda)} V_{t+1}(S - D) ],   V_{T+1} = 0,
-whose minimizer is independent of x (a base-stock level) -- the discovery we verify numerically.
+whose minimizer is independent of x (a base-stock level), which is verified numerically.
 
 Run:
   python scripts/dp_optimum.py                 # self-test
@@ -107,7 +107,7 @@ def _selftest():
         r = validate(lam, L, 0.5, 1.0, T=40, verbose=False)
         # (1) critical fractile == argmin G (the textbook level is the newsvendor optimum)
         assert abs(r["S_cf"] - r["S_argmin"]) <= 1, (lam, L, r)
-        # (2) DP recovers a CONSTANT interior base-stock == the newsvendor level (base-stock optimality)
+        # (2) DP recovers a constant interior base-stock == the newsvendor level (base-stock optimality)
         assert r["interior_const"] and abs(r["interior_basestock"] - r["S_argmin"]) <= 1, r
         # (3) stationary base-stock is within MC/finite-horizon noise of the exact DP optimum
         assert -1e-6 <= r["gap"] < 0.03, r

@@ -1,30 +1,28 @@
-"""
-demand_families.py -- demand processes beyond Poisson-rate randomization (for M2; enables the
-AR(1) communication sweep of roadmap 5.6).
+"""Demand processes beyond Poisson-rate randomization: AR(1), negative-binomial, and a
+per-episode family-randomization curriculum.
 
-WHY: training currently randomizes only the Poisson RATE (see DemandRandomizedBeerGame). That is
-rate-robustness within ONE family, not distributional robustness. This module adds AR(1),
-negative-binomial, and a per-episode FAMILY-randomization curriculum.
+Existing training randomizes only the Poisson rate (see DemandRandomizedBeerGame), giving
+rate-robustness within a single family rather than distributional robustness. This module adds
+AR(1) and negative-binomial families plus a curriculum that randomizes the family each episode.
 
-!! CONSTRUCTION NOTE (the bug this version fixes) !!
-The base env validates `demand_type` against {step, zero, black_swan, extreme_chaos, poisson}
-and RAISES on anything else (beer_game_env.py ~line 169). So these envs are built with
-demand_type="poisson" (which passes validation) plus a separate key `family` in {ar1, negbin}
-that the overridden _roll_stochastic_demand checks FIRST -- exactly the pattern
-DemandRandomizedBeerGame uses (it keeps demand_type="poisson" and routes internally). Do NOT
-pass demand_type="ar1"/"negbin"; pass demand_type="poisson", family="ar1"/"negbin".
+Construction note: the base env validates `demand_type` against
+{step, zero, black_swan, extreme_chaos, poisson} and raises otherwise (see beer_game_env.py).
+These envs are therefore built with demand_type="poisson" plus a separate key `family` in
+{ar1, negbin} that the overridden _roll_stochastic_demand checks first -- the same routing
+pattern as DemandRandomizedBeerGame. Pass demand_type="poisson", family="ar1"/"negbin"; never
+demand_type="ar1"/"negbin".
 
-Per-episode state is initialized in reset() BEFORE super().reset() so the env's demand-cache
-pre-roll routes through the override (mirrors DemandRandomizedBeerGame). AR(1) assumes
-_roll_stochastic_demand is called once per period in increasing order (true here, including the
-lookahead cache); the i.i.d. families are order-independent.
+Per-episode state is initialized in reset() before super().reset() so the env's demand-cache
+pre-roll routes through the override. AR(1) assumes _roll_stochastic_demand is called once per
+period in increasing order (true here, including the lookahead cache); the i.i.d. families are
+order-independent.
 
-INTEGRATION
-  * Held-out-FAMILY eval (M2): make_heldout_family_envs(...) builds AR(1)-rho + NegBin-dispersion
-    test envs; score SIGNAL on them like heldout_eval does for lambda.
-  * AR(1) comm sweep (5.6): make_ar1_rho_envs(...) -> run the topology study per rho.
-  * DR training (M2): swap DemandRandomizedBeerGame -> FamilyRandomizedBeerGame in the trainer
-    (it mirrors DemandRandomizedBeerGame's config-only constructor form).
+Integration:
+  * Held-out-family eval: make_heldout_family_envs(...) builds AR(1)-rho and NegBin-dispersion
+    test envs; score SIGNAL on them as the held-out gate does for lambda.
+  * AR(1) communication sweep: make_ar1_rho_envs(...) yields one env per rho for the topology study.
+  * Distributional-robustness training: swap DemandRandomizedBeerGame for FamilyRandomizedBeerGame
+    in the trainer; it mirrors the config-only constructor form.
 """
 import numpy as np
 
@@ -35,8 +33,8 @@ def poisson_sample(rng, mu):
 
 
 def negbin_sample(rng, mu, dispersion):
-    """NegBin with mean mu and variance mu + mu^2/dispersion (dispersion->inf gives Poisson).
-    numpy: negative_binomial(n=r, p) has mean r(1-p)/p; set r=dispersion, p=r/(r+mu)."""
+    """Negative-binomial with mean mu and variance mu + mu^2/dispersion (dispersion->inf gives
+    Poisson). numpy's negative_binomial(n=r, p) has mean r(1-p)/p; set r=dispersion, p=r/(r+mu)."""
     mu = max(1e-6, float(mu)); r = max(1e-6, float(dispersion))
     return float(rng.negative_binomial(r, r / (r + mu)))
 
@@ -56,7 +54,7 @@ def make_demand_family_envs(base_cls):
     class AR1BeerGame(base_cls):
         """Build with demand_type='poisson', family='ar1'. Config: ar1_mu(12), ar1_rho(.6), ar1_sigma(3)."""
         def reset(self, seed=None, options=None):
-            self._ar1_latent = float(self._config.get("ar1_mu", 12.0))   # before super (cache pre-roll)
+            self._ar1_latent = float(self._config.get("ar1_mu", 12.0))   # set before super() so the cache pre-roll uses it
             return super().reset(seed=seed, options=options)
 
         def _roll_stochastic_demand(self, step):
@@ -80,13 +78,13 @@ def make_demand_family_envs(base_cls):
             return super()._roll_stochastic_demand(step)
 
     class FamilyRandomizedBeerGame(base_cls):
-        """Per-EPISODE distributional randomization (the DR curriculum). Build with
-        demand_type='poisson'. At reset, samples a family from `dr_families` and its params.
-        Mirrors DemandRandomizedBeerGame but over FAMILIES, not just the Poisson rate.
+        """Per-episode distributional-robustness curriculum. Build with demand_type='poisson'.
+        At reset, samples a family from `dr_families` and its parameters. Mirrors
+        DemandRandomizedBeerGame but randomizes over families, not just the Poisson rate.
 
         Config (all optional): dr_families (subset of ['poisson','negbin','ar1']),
           dr_lambda_lo/hi, nb_mu_lo/hi, nb_dispersion_lo/hi, ar1_mu_lo/hi, ar1_rho_lo/hi, ar1_sigma.
-        TRAIN/TEST HYGIENE: leave at least one family OUT of dr_families for the held-out test."""
+        Train/test hygiene: leave at least one family out of dr_families for the held-out test."""
         def reset(self, seed=None, options=None):
             cfg = self._config
             # dedicated RNG so family choice is reproducible from `seed` and independent of the
@@ -123,7 +121,7 @@ def make_demand_family_envs(base_cls):
 
 # ----------------------------------------------------------------------- held-out eval builders
 def make_ar1_rho_envs(ar1_cls, env_cfg, rhos=(0.0, 0.3, 0.6, 0.9), mu=12.0, sigma=3.0):
-    """One AR(1) env per rho (comm-value-vs-autocorrelation sweep, roadmap 5.6). ar1_cls is the
+    """One AR(1) env per rho for the communication-value-vs-autocorrelation sweep. ar1_cls is the
     AR1BeerGame from make_demand_family_envs. Built with demand_type='poisson', family='ar1'."""
     return {float(r): ar1_cls({**env_cfg, "demand_type": "poisson", "family": "ar1",
                                "ar1_mu": mu, "ar1_rho": float(r), "ar1_sigma": sigma})
@@ -132,8 +130,8 @@ def make_ar1_rho_envs(ar1_cls, env_cfg, rhos=(0.0, 0.3, 0.6, 0.9), mu=12.0, sigm
 
 def make_heldout_family_envs(ar1_cls, negbin_cls, env_cfg,
                              ar1_rhos=(0.3, 0.6, 0.9), nb_disps=(2.0, 4.0, 8.0), mu=12.0):
-    """Held-out distributional-shift test set (M2): AR(1) at several rho + NegBin at several
-    dispersion, fixed mean. Score SIGNAL here as heldout_eval scores lambda."""
+    """Held-out distributional-shift test set: AR(1) at several rho and NegBin at several
+    dispersion values, fixed mean. Score SIGNAL here as the held-out gate scores lambda."""
     envs = {}
     for r in ar1_rhos:
         envs[f"ar1_rho{r:g}"] = ar1_cls({**env_cfg, "demand_type": "poisson", "family": "ar1",

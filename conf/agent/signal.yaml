@@ -6,7 +6,8 @@ algorithm: signal
 
 # ===================== communication (the object of study) =====================
 use_comm: true            # false -> ADJ is zeroed (no-comm control, IDENTICAL architecture)
-msg_content: dhat         # dhat | ip | dhat_ip | learned   (the semantic ladder)
+msg_content: dhat         # raw | dhat | ip | dhat_ip | learned   (the semantic ladder; raw = last realized
+                          # incoming demand, the classical POS-data rung -- Cachon-Fisher 2000 / prereg D1)
 learned_msg_dim: 3        # message width when msg_content=learned (interpretability control)
 learned_msg_gain: 10.0    # gain on the tanh learned message so it rides at the same O(10) scale as dhat/ip
                           # (bounded but AUDIBLE; without it the learned rung is scale-handicapped -> H5 invalid)
@@ -19,11 +20,10 @@ tau: 0.0                  # coordinating transfer on UPSTREAM backorders; tau* =
 # ===================== agent size =====================
 hidden: 64                # GRU hidden = belief width AND critic width
 max_order: 100            # must match env.max_order
-# Base-stock head: condition the order-up-to level S on the SMOOTHED, grounded demand estimate d_hat,
-# so the policy is REGIME-ADAPTIVE  (S ~= dhat_coef*d_hat + safety; textbook (lead+1)*demand + safety).
-# Uses d_hat (not raw last_demand) so no Poisson noise enters S -> no bullwhip. This couples demand->S
-# AND lets COMM affect ordering (message -> belief h -> d_hat -> S). use_dhat_head=false recovers the
-# minimal constant base-stock (the sweep showed optimization alone can't make that constant adapt).
+# Base-stock head: condition the order-up-to level S on the smoothed demand estimate d_hat, making the
+# policy regime-adaptive (S ~= dhat_coef*d_hat + safety; textbook (lead+1)*mean-demand + safety). Using
+# d_hat rather than the raw last demand keeps sampling noise out of S (no bullwhip); it also lets
+# communication affect ordering (message -> belief h -> d_hat -> S). false recovers a constant base-stock.
 use_dhat_head: true
 dhat_coef: 5              # init weight on d_hat in the S-head (~ lead+1 = protection interval)
 dhat_init: 14            # init d_head bias so d_hat starts ~ mean training demand (softplus link)
@@ -48,7 +48,7 @@ ar1_mu_hi: 24.0
 ar1_rho_lo: 0.0
 ar1_rho_hi: 0.8
 
-# ===================== PPO / optimisation =====================
+# ===================== PPO / optimization =====================
 gamma: 0.99
 gae_lambda: 0.95
 eps_clip: 0.2
@@ -58,8 +58,8 @@ vf_coef: 0.5
 aux_coef: 0.1             # d_hat grounding (keeps the demand message interpretable as a forecast)
 max_grad_norm: 0.5
 lr: 3.0e-4
-reward_scale: 1.0         # divide the shaped reward (critic-target scale). >1 (e.g. 100) shrinks the critic
-                          # gradient so the shared grad-clip stops starving the actor -> S can actually move
+reward_scale: 1.0         # divides the shaped reward; >1 (e.g. 100) shrinks the critic gradient so the
+                          # shared gradient clip stops starving the actor and S can move
 log_std_init: -0.5        # initial exploration std on S = exp(log_std_init); raise (e.g. 1.0 => std ~2.7)
 
 # ===================== training loop =====================
@@ -67,6 +67,10 @@ batch_episodes: 8
 log_every: 100            # heartbeat: print ep / train cost / losses every N episodes (0 = only gate prints)
 patience: 0               # early stop after this many episodes with NO held-out improvement (0 = off; sweep ~2000).
                           # The best-gated checkpoint is always kept, so early stop never loses the best policy.
+budget_milestones: [1000, 2000, 4000, 8000]   # substitution-curve snapshots (== prereg design.budget_milestones):
+                          # at each milestone M the trainer copies the best-gated-so-far payload to
+                          # signal_checkpoint_budget{M}.pt. The key must be declared here because Hydra
+                          # struct mode rejects a CLI override for an unknown key (ConfigCompositionException).
 warm_up_episodes: 0       # 0: SIGNAL's belief is trained by the policy gradient (no pre-train)
 use_gpu: false            # training is CPU-bound (sequential per-step encode); CPU torch wheels
 

@@ -1,53 +1,52 @@
 """
-eval_signal.py -- evaluation / measurement layer for the SIGNAL agent.
+Evaluation and measurement layer for the SIGNAL agent.
 ================================================================================
 SIGNAL (Strategic Information-sharing for Game-theoretic, Networked, Adaptive
 Logistics). Loads a `signal_checkpoint_best.pt` produced by train_signal.py into a
-SIGNALPolicy and runs the paper's measurements. It REPLACES the legacy DRACO eval:
-the SIGNAL agent has no encoder/z/structured-vs-mlp head/plug-in belief, so this is
-a from-scratch port keyed to the SIGNAL actor (GRU belief + linear base-stock head +
-demand readout + message ladder).
+SIGNALPolicy and runs the paper's measurements. The eval is keyed to the SIGNAL actor
+architecture (GRU belief + linear base-stock head + demand readout + message ladder),
+which has no encoder, latent z, structured-vs-mlp head, or plug-in belief.
 
-THE POLICY IS THE TRAINED POLICY. SIGNALPolicy.act() reproduces SIGNALTrainer.collect()'s
-per-step forward byte-for-byte: incoming = ADJ @ m_prev (one-step delay), per-agent GRU
-belief update, base-stock head -> S, order = clip(S - IP), message = ladder(d_hat, IP).
-The saved ADJ (already zeroed for a use_comm=false checkpoint) is used directly, so
-messages route exactly as trained; ablate=True is the comm-OFF counterfactual on the
-SAME weights.
+The policy is the trained policy: SIGNALPolicy.act() reproduces SIGNALTrainer.collect()'s
+per-step forward exactly -- incoming = ADJ @ m_prev (one-step delay), per-agent GRU belief
+update, base-stock head -> S, order = clip(S - IP), message = ladder(d_hat, IP). The saved
+ADJ (already zeroed for a use_comm=false checkpoint) is used directly, so messages route
+exactly as trained; ablate=True is the comm-off counterfactual on the same weights.
 
-THE ENV IS THE TRAINED ENV. Every probe below rebuilds its env from the env config
-PERSISTED IN THE CHECKPOINT (train_signal saves cfg.env), resolved by resolve_env_base:
-CLI --env-json > ckpt['env'] > module ENV_BASE fallback (pre-fix checkpoints, with a
-warning). Without this, a canonical-cost (penalty_at_retailer_only) or lead-time run
-was silently scored on the default env against the wrong references.
+The env is the trained env: every probe rebuilds its env from the env config persisted in
+the checkpoint (train_signal saves cfg.env), resolved by resolve_env_base with precedence
+CLI --env-json > ckpt['env'] > module ENV_BASE fallback (pre-fix checkpoints only, with a
+warning). Without this, a canonical-cost (penalty_at_retailer_only) or lead-time run would
+be silently scored on the default env against the wrong references.
 
-WHAT IT COMPUTES (each part names the question it answers):
-  * STANDARD BENCHMARK (per regime poisson/black_swan/extreme_chaos): mean/CVaR cost,
+What it computes (each part names the question it answers):
+  * Standard benchmark (per regime poisson/black_swan/extreme_chaos): mean/CVaR cost,
     bullwhip, Type-1 (alpha) service, Type-2 (beta) fill, jitter, and the zero-message
     comm value (paired Wilcoxon).
-  * PER-STAGE DASHBOARD: local + cumulative bullwhip, net-stock amplification, on-hand/
+  * Per-stage dashboard: local + cumulative bullwhip, net-stock amplification, on-hand/
     backlog, service/fill, per-echelon cost (Chen 2000; Lee 1997; Disney-Towill 2003).
-  * REGIME-UNCERTAINTY (C1): per-lambda cost + Gap_Recovered vs the BAR/Oracle references
+  * Regime-uncertainty (C1): per-lambda cost + Gap_Recovered vs the BAR/Oracle references
     from `python scripts/baselines.py regime`.
-  * COMM-VALUE DECOMPOSITION (the Lee mechanism): comm ON vs OFF, CRN-paired -- per-stage
-    bullwhip/inventory/backlog split and the per-echelon UPSTREAM forecast-error delta
-    vs CUSTOMER demand. delta>0 => the shared signal cuts upstream forecast error.
-  * HONESTY PROBE: each message COMPONENT vs the sender's true demand / inventory position.
-  * POSITIVE LISTENING: causal dS/d(told) PER MESSAGE COMPONENT (components swept one at
-    a time, the others held at their actually-received values).
-  * MESSAGE INTERVENTION (--interventions): do(m) on the channel -- honest vs time-shuffled vs
-    cross-episode vs zeroed message streams, CRN-paired. The causal CONTENT test: if shuffled/
-    cross degrade toward zeroed, the value is state-correlated information, not channel presence.
-    Includes an identity-replay self-check (replaying the honest stream reproduces its cost).
-  * PRODUCERS: --dump-c1 (per-seed {lambda: cost} for scripts/c1_stats.py) and --dump-comm
+  * Comm-value decomposition (the Lee mechanism): comm ON vs OFF, CRN-paired -- per-stage
+    bullwhip/inventory/backlog split and the per-echelon upstream forecast-error delta
+    vs customer demand. delta>0 => the shared signal cuts upstream forecast error.
+  * Honesty probe: each message component vs the sender's true demand / inventory position.
+  * Positive listening: causal dS/d(told) per message component (components swept one at a
+    time, the others held at their actually-received values).
+  * Message intervention (--interventions): do(m) on the channel -- honest vs time-shuffled
+    vs cross-episode vs zeroed message streams, CRN-paired. The causal content test: if
+    shuffled/cross degrade toward zeroed, the value is state-correlated information, not
+    channel presence. Includes an identity-replay self-check (replaying the honest stream
+    reproduces its cost).
+  * Producers: --dump-c1 (per-seed {lambda: cost} for scripts/c1_stats.py) and --dump-comm
     (per-seed {lambda: cost} + per-echelon forecast error for scripts/comm_stats.py).
-    --dump-comm + --dump-ar1 "0,0.3,0.6,0.9" keys the SAME dump format by AR(1) rho
-    instead of Poisson lambda (the H2 producer; comm_stats' loaders are key-agnostic).
+    --dump-comm + --dump-ar1 "0,0.3,0.6,0.9" keys the same dump format by AR(1) rho instead
+    of Poisson lambda (the H2 producer; comm_stats' loaders are key-agnostic).
 
-TWO SEED SPACES (do not conflate):
+Two seed spaces (do not conflate):
   SEED_BASE=2000          -> standard-benchmark / message rollouts.
   HELDOUT_SEED_BASE=1e5   -> C1 / dump rollouts; == baselines.py SEED_BASE, so SIGNAL and the
-                             reference rungs are scored on the SAME demand draws (CRN).
+                             reference rungs are scored on the same demand draws (CRN).
 
 Usage:
   python agents/eval_signal.py --ckpt weights_signal/run_signal_<id>_<algo>/signal_checkpoint_best.pt
@@ -79,24 +78,24 @@ SCENARIOS = ["poisson", "black_swan", "extreme_chaos"]
 SEED_BASE = 2000
 HELDOUT_SEED_BASE = 100000          # matches baselines.py SEED_BASE (CRN with the BAR/CEILING)
 HELDOUT_LAMBDAS = [6.0, 10.0, 14.0, 18.0, 22.0]
-ENV_BASE = {"horizon": 50, "max_order": 100}   # FALLBACK ONLY: probes use resolve_env_base(ckpt)
-H_COST = 0.5     # FALLBACK ONLY: run_episode reads h from the LIVE env (env.h); this constant is
-#                  used only if an exotic env object lacks the attribute.
-B_COST = 1.0     # FALLBACK ONLY: as above (env.b), incl. the canonical-cost flag.
+ENV_BASE = {"horizon": 50, "max_order": 100}   # fallback only: probes use resolve_env_base(ckpt)
+H_COST = 0.5     # fallback only: run_episode reads h from the live env (env.h); used only when an
+#                  env object lacks that attribute.
+B_COST = 1.0     # fallback only: as above (env.b), including the canonical-cost flag.
 
-# message-component layout per content type (which slot carries which named signal).
-# 'dhat' and 'ip' messages now ride at NATURAL units (see SIGNALActor.message), so the honesty probe
-# compares the component DIRECTLY to demand / IP (_MSG_SCALE = 1.0). [Was 100.0 when messages were
-# /100-scaled; that scaling made the message causally inert -- see positive_listening.]
+# Message-component layout per content type (which slot carries which named signal).
+# 'dhat' and 'ip' messages ride at natural units (see SIGNALActor.message), so the honesty probe
+# compares the component directly to demand / IP with _MSG_SCALE = 1.0 (a prior /100 scaling made
+# the message causally inert; see positive_listening).
 _MSG_SCALE = 1.0
 
 
 def resolve_env_base(ckpt, env_json=None):
-    """The env config the checkpoint was TRAINED on, resolved with explicit provenance:
+    """Resolve the env config the checkpoint was trained on, with explicit precedence:
          CLI --env-json  >  ckpt['env'] (train_signal persists cfg.env)  >  module ENV_BASE.
-    The fallback exists only for pre-fix checkpoints and WARNS, because a canonical-cost
+    The fallback exists only for pre-fix checkpoints and warns, because a canonical-cost
     (penalty_at_retailer_only) or lead-time run would otherwise be silently scored on the
-    default env against the wrong references. demand_type is stripped: each probe sets its
+    default env against the wrong references. demand_type is stripped so each probe sets its
     own demand regime on top of this base."""
     if env_json:
         with open(env_json) as f:
@@ -117,10 +116,10 @@ def resolve_env_base(ckpt, env_json=None):
 
 
 def make_ar1_env(rho, mu=12.0, sigma=3.0, env_base=None):
-    """AR(1) eval env at a fixed rho (built exactly as train_signal builds the ar1 train env:
-    demand_type='poisson' + family='ar1'). Use this so an AR(1)-trained checkpoint is measured
-    IN its training regime -- evaluating it on Poisson (the default probes) tests white noise,
-    where comm value is null by construction (Axsater-Rosling)."""
+    """AR(1) eval env at a fixed rho, built exactly as train_signal builds the ar1 train env
+    (demand_type='poisson' + family='ar1'). Measures an AR(1)-trained checkpoint in its training
+    regime; evaluating it on Poisson (the default probes) tests white noise, where comm value is
+    null by construction (Axsater-Rosling)."""
     base = dict(ENV_BASE if env_base is None else env_base)
     AR1, _NegBin, _Family = make_demand_family_envs(BeerGameParallelEnv)
     return AR1({**base, "demand_type": "poisson", "family": "ar1",
@@ -155,7 +154,7 @@ class SIGNALPolicy:
         self.deterministic = deterministic
         self.max_order = float(env.max_order)
         self.N = len(AGENTS)
-        cfg = ckpt.get("config", {})                # train_signal saves the AGENT dict directly
+        cfg = ckpt.get("config", {})                # train_signal saves the agent config dict directly
         self.cfg = cfg
         self.msg_override = None                    # optional [T,N,msg] array: do(m_{t-1}) intervention
 
@@ -189,9 +188,9 @@ class SIGNALPolicy:
         self.h = [torch.zeros(1, 1, self.hidden, device=DEVICE) for _ in range(self.N)]
         self.m_buf = torch.zeros(self.N, self.msg_dim, device=DEVICE)
         self._t = 0                                 # step counter for msg_override indexing
-        # NOTE: self.msg_override is deliberately NOT cleared here -- run_episode() calls reset()
-        # internally, so the intervention runner sets the override BEFORE run_episode and clears it
-        # after. override[t] replaces the PREVIOUS-step messages m_{t-1} the router would deliver.
+        # self.msg_override is deliberately not cleared here: run_episode() calls reset()
+        # internally, so the intervention runner sets the override before run_episode and clears it
+        # after. override[t] replaces the previous-step messages m_{t-1} the router would deliver.
         self.last_S = np.zeros(self.N)
         self.last_dhat = np.full(self.N, np.nan)
         self.last_msg = np.zeros((self.N, self.msg_dim))
@@ -235,12 +234,11 @@ class SIGNALPolicy:
 
     @torch.no_grad()
     def probe_S(self, agent_idx, msg_value, component=0):
-        """Order-up-to S that actor `agent_idx` WOULD output at the LAST step's (obs, belief) if
+        """Order-up-to S that actor `agent_idx` would output at the last step's (obs, belief) if
         component `component` of its incoming message were `msg_value` (message natural units),
-        ALL OTHER components held at their actually-received values. dS/d(message component)
-        measures causal positive listening PER NAMED SIGNAL.
-        [FIX: the old probe filled EVERY column with the scalar, so for dhat_ip the told-demand
-        sweep also swept the IP channel 0..30 and the slope conflated dS/d(dhat) + dS/d(ip).]"""
+        all other components held at their actually-received values. dS/d(message component)
+        measures causal positive listening per named signal. Only the swept column is changed:
+        setting every column to the scalar would, for dhat_ip, conflate dS/d(dhat) with dS/d(ip)."""
         o_t, hi_list, inc = self.last_ctx
         m = inc[agent_idx:agent_idx + 1].clone()    # observed incoming as the baseline
         m[0, int(component)] = float(msg_value)
@@ -296,9 +294,9 @@ def run_episode(policy, env, seed, trace=False):
     all_back = np.concatenate([back[a] for a in AGENTS])
     cust_arr = np.asarray(cust_series, float)
     cust_var = float(np.var(cust_arr))
-    # cost-split parameters from the LIVE env (single source of truth; canonical-cost aware).
-    # The per-stage $ split must reproduce what the env actually CHARGED: under
-    # penalty_at_retailer_only, upstream stages pay holding but NOT backorder penalties.
+    # Cost-split parameters from the live env (single source of truth; canonical-cost aware).
+    # The per-stage cost split must reproduce what the env actually charged: under
+    # penalty_at_retailer_only, upstream stages pay holding but not backorder penalties.
     h_cost = float(getattr(env, "h", H_COST))
     b_cost = float(getattr(env, "b", B_COST))
     pen_ret_only = bool(getattr(env, "_penalty_at_retailer_only", False))
@@ -308,9 +306,9 @@ def run_episode(policy, env, seed, trace=False):
     zero_of, max_of = {}, {}
     for a in AGENTS:
         o = np.asarray(orders[a], float); d = np.asarray(demand[a], float)
-        # CENSORING FINGERPRINT (Proposition 1 mechanism): with a base-stock head the order is
-        # clip(S - IP, 0, max_order), so o==0 IS the lower-censoring event (S <= IP) and o==max
-        # the upper one. Censoring makes the order stream a NON-INVERTIBLE statistic of demand --
+        # Censoring fingerprint (Proposition 1 mechanism): with a base-stock head the order is
+        # clip(S - IP, 0, max_order), so o==0 is the lower-censoring event (S <= IP) and o==max
+        # the upper one. Censoring makes the order stream a non-invertible statistic of demand --
         # exactly where the Raghunathan/GGS redundancy null breaks. P(censor) should rise with
         # rho (bullwhip widens the order distribution) and predict V across seeds.
         zero_of[a] = float(np.mean(o == 0)); max_of[a] = float(np.mean(o >= float(env.max_order)))
@@ -400,10 +398,10 @@ def _upstream_forecast_error(traces):
 
 
 def ar1_comm_vs_rho(ckpt, episodes, rhos, mu=12.0, sigma=3.0, env_base=None):
-    """The headline autocorrelation view: comm value as a function of AR(1) rho. Deterministic team
-    cost with messages ON vs OFF (same weights, CRN-paired seeds) at each rho. Lee-So-Tang (2000)
-    predicts comm value (OFF-ON) ~ 0 at rho=0 and RISING with rho. For a use_comm=false checkpoint
-    ON==OFF (ADJ already zero), so the table just reports that model's cost per rho (cross-model ref)."""
+    """Comm value as a function of AR(1) rho. Deterministic team cost with messages ON vs OFF
+    (same weights, CRN-paired seeds) at each rho. Lee-So-Tang (2000) predicts comm value (OFF-ON)
+    ~ 0 at rho=0 and rising with rho. For a use_comm=false checkpoint ON==OFF (ADJ already zero),
+    so the table just reports that model's cost per rho (cross-model reference)."""
     print(f"\n  AR(1) message-RELIANCE vs autocorrelation   [{episodes} eps/rho, CRN seeds {SEED_BASE}+, "
           f"mu={mu:g} sigma={sigma:g}]")
     print(f"    {'rho':>6}{'cost_ON':>10}{'cost_OFF':>10}{'reliance%':>13}")
@@ -476,9 +474,10 @@ def _corr(x, y):
 
 
 def honesty_probe(ckpt, episodes=40, scenario="poisson", env=None, label=None, env_base=None):
-    """Does each message component report the sender's truth? For 'dhat' compare component*100 to
-    the sender's OWN realized demand; for 'ip' to the sender's true inventory position (recoverable
-    from its obs, so this is honest by construction); 'learned' channels are scored against both."""
+    """Does each message component report the sender's truth? For 'dhat' compare the component
+    (scaled by _MSG_SCALE) to the sender's own realized demand; for 'ip' to the sender's true
+    inventory position (recoverable from its obs, hence honest by construction); 'learned' channels
+    are scored against both demand and IP."""
     if env is None:
         env = BeerGameParallelEnv({**(ENV_BASE if env_base is None else env_base),
                                    "demand_type": scenario})
@@ -530,22 +529,21 @@ def honesty_probe(ckpt, episodes=40, scenario="poisson", env=None, label=None, e
 
 
 # ==============================================================================
-# DOES THE AGENT LISTEN? two reports that separate "comm redundant" from "comm ignored"
+# Does the agent listen? Two reports that separate "comm redundant" from "comm ignored"
 # (cost-based comm value cannot tell these apart; these can).
 # ==============================================================================
 def positive_listening(ckpt, episodes=20, env=None, label=None, demand_grid=None, env_base=None):
-    """CAUSAL listening probe, PER MESSAGE COMPONENT. At every state actually visited, hold the
-    receiver's (obs, belief) FIXED and sweep ONE component of its incoming message across a value
-    grid (0..30, the component's natural units), ALL OTHER components held at their actually-
-    received values, recording the order-up-to S it would emit (probe_S).
-    [FIX: the old probe filled EVERY column with the swept scalar, so for dhat_ip the 'told-demand'
-    slope conflated dS/d(dhat) + dS/d(ip); components are now swept one at a time.]
-    dS/d(told) on the DHAT component ~ (lead+1) means the receiver fully acts on the demand message;
+    """Causal listening probe, per message component. At every state actually visited, hold the
+    receiver's (obs, belief) fixed and sweep one component of its incoming message across a value
+    grid (0..30, the component's natural units), all other components held at their actually-
+    received values, recording the order-up-to S it would emit (probe_S). Components are swept one
+    at a time: sweeping every column together would conflate dS/d(dhat) with dS/d(ip) for dhat_ip.
+    dS/d(told) on the dhat component ~ (lead+1) means the receiver fully acts on the demand message;
     ~0 means deaf to it. The IP component has no such textbook target -- its slope is reported for
-    sign and size (the VMI channel; a NEGATIVE slope, order less when the sender holds more, is the
-    theory-consistent direction). This is the test cost cannot do -- a 0 here + honest messages =
-    the agent is deaf, not the channel empty. (Probes the DIRECT head path; the recurrent belief
-    path is covered by the comm-on/off cost ablation.)"""
+    sign and size (the VMI channel; a negative slope, ordering less when the sender holds more, is
+    the theory-consistent direction). This is the test cost cannot do: a 0 here with honest messages
+    means the agent is deaf, not the channel empty. (Probes the direct head path; the recurrent
+    belief path is covered by the comm-on/off cost ablation.)"""
     if env is None:
         env = BeerGameParallelEnv({**(ENV_BASE if env_base is None else env_base),
                                    "demand_type": "poisson"})
@@ -557,20 +555,20 @@ def positive_listening(ckpt, episodes=20, env=None, label=None, demand_grid=None
     if not pol.use_comm:
         print(f"\n  positive-listening ({label}): use_comm=false checkpoint. skipped.")
         return None
-    if pol.content == "learned":                                     # no demand semantics -> the told-demand sweep is meaningless
+    if pol.content == "learned":                                     # no demand semantics, so the told-demand sweep does not apply
         print(f"\n  positive-listening ({label}): content=learned has no demand semantics, so the injected")
         print("    told-demand sweep does not apply. Use message_weight_audit (scale-agnostic) as the")
         print("    listening check for this rung, and the comm-on/off cost ablation for the net effect.")
         return None
     layout = _component_layout(pol.content)                          # {name: column}
-    receivers = [i for i in range(pol.N) if float(pol.adj[i].abs().sum()) > 0]   # only stages that HEAR someone
+    receivers = [i for i in range(pol.N) if float(pol.adj[i].abs().sum()) > 0]   # only stages that hear someone
     slopes = {i: {nm: [] for nm in layout} for i in receivers}
     swings = {i: {nm: [] for nm in layout} for i in receivers}
     for e in range(episodes):
         obs, _ = env.reset(seed=SEED_BASE + e)
         pol.reset()
         while True:
-            acts = pol.act(obs)                              # sets pol.last_ctx for THIS step
+            acts = pol.act(obs)                              # sets pol.last_ctx for this step
             for i in receivers:
                 for nm, col in layout.items():
                     S_vals = np.array([pol.probe_S(i, m, component=col) for m in msg_grid])
@@ -602,10 +600,10 @@ def positive_listening(ckpt, episodes=20, env=None, label=None, demand_grid=None
 
 
 def message_weight_audit(ckpt, env=None, env_base=None):
-    """Structural companion: the L2 norm the TRAINED actor places on its MESSAGE inputs relative to
-    its OBS inputs, at (1) the GRU input gate and (2) the base-stock head. ratio ~ 0 => the optimizer
-    pruned the channel (dead by construction); a sizeable ratio => the channel is wired in and the
-    null must be redundancy, not pruning. Cheap, weights-only, no rollout."""
+    """Structural companion: the L2 norm the trained actor places on its message inputs relative to
+    its obs inputs, at (1) the GRU input gate and (2) the base-stock head. A ratio ~ 0 means the
+    optimizer pruned the channel (dead by construction); a sizeable ratio means the channel is wired
+    in and the null must be redundancy, not pruning. Weights-only, no rollout."""
     if env is None:
         env = BeerGameParallelEnv({**(ENV_BASE if env_base is None else env_base),
                                    "demand_type": "poisson"})
@@ -631,18 +629,18 @@ def message_weight_audit(ckpt, env=None, env_base=None):
     return out
 
 def message_intervention_probe(ckpt, episodes=20, env=None, label=None, env_base=None):
-    """CAUSAL content test by INTERVENTION on the channel, do(m) (Jaques et al. 2019; the design
-    Lowe et al. 2019 license): re-run the SAME CRN episodes with the message stream replaced by
+    """Causal content test by intervention on the channel, do(m) (Jaques et al. 2019; the design
+    licensed by Lowe et al. 2019): re-run the same CRN episodes with the message stream replaced by
       honest   : live messages (reference)
       shuffled : the episode's own honest messages, time-permuted  (same marginals, timing destroyed)
       cross    : another episode's honest messages                 (same process, wrong realization)
       zeroed   : channel off (the existing ablation)
-    If the channel's value is CONTENT (state-correlated information), cost(shuffled)/cost(cross)
-    degrade toward cost(zeroed); if only PRESENCE/scale matters, shuffled ~ honest. This upgrades
+    If the channel's value is content (state-correlated information), cost(shuffled)/cost(cross)
+    degrade toward cost(zeroed); if only presence/scale matters, shuffled ~ honest. This upgrades
     the H3 mechanism claim from correlational to interventional and is the registered gate for
-    attributing a positive V to content. SELF-CHECK: replaying episode 0's own honest stream
-    (identity intervention) must reproduce its cost bit-for-bit -- printed and asserted.
-    Unit of analysis here is the EPISODE within one checkpoint (an instrument, not the cross-seed
+    attributing a positive V to content. Self-check: replaying episode 0's own honest stream
+    (identity intervention) must reproduce its cost within tolerance -- printed and asserted.
+    The unit of analysis here is the episode within one checkpoint (an instrument, not the cross-seed
     confirmatory statistic); deltas are episode-paired with bootstrap-t CIs."""
     from scripts.c1_stats import bootstrap_ci, paired
     if env is None:
@@ -664,7 +662,7 @@ def message_intervention_probe(ckpt, episodes=20, env=None, label=None, env_base
     c_hon = np.array([r["cost"] for r in honest])
     msgs = [r["trace"]["msg"] for r in honest]       # [T,N,md] each
 
-    # identity replay self-check on episode 0 (must reproduce the honest cost exactly)
+    # identity replay self-check on episode 0 (must reproduce the honest cost within tolerance)
     pol.msg_override = _prev_of(msgs[0])
     c_replay = run_episode(pol, env, SEED_BASE + 0)["cost"]
     pol.msg_override = None
@@ -689,7 +687,7 @@ def message_intervention_probe(ckpt, episodes=20, env=None, label=None, env_base
     print(f"    {'condition':<12}{'mean cost':>11}{'delta vs honest':>17}{'95% CI':>20}{'p(Wilcoxon)':>13}")
     out = {"honest": float(c_hon.mean())}
     for nm, c in [("shuffled", c_shuf), ("cross", c_cross), ("zeroed", c_zero)]:
-        d = c - c_hon                                # + => intervention HURTS => content mattered
+        d = c - c_hon                                # + => intervention hurts => content mattered
         pr = paired(d, np.zeros_like(d))
         lo, hi = bootstrap_ci(d)
         out[nm] = {"mean": float(c.mean()), "delta": float(d.mean()),
@@ -734,8 +732,8 @@ def per_stage_dashboard(ckpt, episodes, scenario, eps=None, env_base=None):
 # Producers: per-seed dumps for the cross-seed aggregators
 # ==============================================================================
 def dump_c1(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS, env_base=None):
-    """PRODUCER for scripts/c1_stats.py: write {lambda: mean_cost} for THIS checkpoint to
-    out_dir/seed{S}.json (+ seed{S}_bw.json), scored on the EVAL seeds (CRN with baselines)."""
+    """Producer for scripts/c1_stats.py: write {lambda: mean_cost} for this checkpoint to
+    out_dir/seed{S}.json (+ seed{S}_bw.json), scored on the eval seeds (CRN with baselines)."""
     base = dict(ENV_BASE if env_base is None else env_base)
     if seed is None:
         seed = ckpt.get("seed", ckpt.get("config", {}).get("seed", 0))   # top-level seed first (see train_signal save)
@@ -760,13 +758,13 @@ def dump_c1(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS, env_bas
 
 def dump_comm(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS, env_base=None,
               ar1_rhos=None, ar1_mu=12.0, ar1_sigma=3.0):
-    """PRODUCER for scripts/comm_stats.py: write per-seed {key: cost} (the comm/no-comm arm's
-    cost vector) AND the per-echelon upstream forecast error to out_dir/seed{S}.json /
+    """Producer for scripts/comm_stats.py: write per-seed {key: cost} (the comm/no-comm arm's
+    cost vector) and the per-echelon upstream forecast error to out_dir/seed{S}.json /
     seed{S}_ferr.json. Run once per checkpoint into a comm-on dir and a comm-off (use_comm=false)
     dir; comm_stats CRN-pairs them across seeds.
-    KEYS: Poisson lambdas by default. Pass ar1_rhos=[0,0.3,0.6,0.9] (CLI --dump-ar1) to key the
-    SAME format by AR(1) rho instead -- the H2 producer. comm_stats' loaders and
-    value_of_sharing are key-agnostic, and prereg.h2_slope consumes the per-rho structure."""
+    Keys: Poisson lambdas by default. Pass ar1_rhos=[0,0.3,0.6,0.9] (CLI --dump-ar1) to key the
+    same format by AR(1) rho instead -- the H2 producer. comm_stats' loaders and value_of_sharing
+    are key-agnostic, and prereg.h2_slope consumes the per-rho structure."""
     base = dict(ENV_BASE if env_base is None else env_base)
     if seed is None:
         seed = ckpt.get("seed", ckpt.get("config", {}).get("seed", 0))   # top-level seed first (see train_signal save)
@@ -785,7 +783,7 @@ def dump_comm(ckpt, episodes, out_dir, seed=None, lambdas=HELDOUT_LAMBDAS, env_b
         rs = [run_episode(pol, env, HELDOUT_SEED_BASE + e, trace=True) for e in range(episodes)]
         per[key] = float(np.mean([r["cost"] for r in rs]))
         per_ferr[key] = _upstream_forecast_error([r["trace"] for r in rs])
-        # censoring fingerprint on the SAME CRN episodes as the cost (Proposition 1 signature):
+        # Censoring fingerprint on the same CRN episodes as the cost (Proposition 1 signature):
         # per-stage fraction of lower-censored (order==0) and upper-censored (order==max) steps.
         per_censor[key] = {a: {"zero": float(np.mean([r["zero_order_frac"][a] for r in rs])),
                                "max": float(np.mean([r["max_order_frac"][a] for r in rs]))}
@@ -878,9 +876,9 @@ def main():
                   ar1_rhos=rhos, ar1_mu=args.ar1_mu, ar1_sigma=args.ar1_sigma)
         return
     if args.dump_iv:
-        # PRODUCER for the registered content-attribution gate: one seed{S}_iv.json per checkpoint
+        # Producer for the registered content-attribution gate: one seed{S}_iv.json per checkpoint
         # (episode-mean cost under do(m): honest/shuffled/cross/zeroed). Cross-seed inference lives
-        # in scripts/comm_stats.py `interventions` (the SEED is the unit; this file is the instrument).
+        # in scripts/comm_stats.py `interventions` (the seed is the unit; this file is the instrument).
         if args.ar1:
             iv_env = make_ar1_env(args.ar1_rho, args.ar1_mu, args.ar1_sigma, env_base)
             lbl = f"ar1 rho={args.ar1_rho:g}"

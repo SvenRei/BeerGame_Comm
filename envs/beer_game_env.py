@@ -4,37 +4,35 @@ from pettingzoo.utils.env import ParallelEnv
 from gymnasium.spaces import Box
 
 # ==============================================================================
-# CONFIGURABLE LEAD TIMES (this revision)
+# CONFIGURABLE LEAD TIMES
 # ------------------------------------------------------------------------------
-# Previously the three physical delays were hardcoded. They are now driven by the
-# config, and EVERY default reproduces the old constant exactly -- so an existing
-# config that does not set these keys behaves identically to before, and all prior
-# checkpoints/runs remain valid. The three delays are:
+# The three physical delays are driven by config; every default reproduces the
+# original hardcoded constant, so a config that omits these keys is unchanged.
+# The delays are:
 #
-#   1. ORDER lead time      : how long an agent's ORDER takes to reach its supplier
-#                             (information delay up the chain). Old: manufacturer=1,
-#                             everyone else=2.  Config: order_lead_time / _mfr.
-#   2. SHIPPING lead time   : how long fulfilled GOODS take to travel down to the
-#                             customer (physical delay). Old: fixed 2, or U(1,9) if
-#                             the jittery_lead_time flag was set. Config:
-#                             ship_lead_time (fixed) or ship_lead_time_range [lo,hi].
-#   3. PRODUCTION lead time  : how long the manufacturer takes to PRODUCE goods it
-#                             releases into its own shipping pipeline. Old: fixed 2.
-#                             Config: production_lead_time / _range.
+#   1. ORDER lead time      : time for an agent's ORDER to reach its supplier
+#                             (information delay up the chain). Default:
+#                             manufacturer=1, others=2. Config: order_lead_time / _mfr.
+#   2. SHIPPING lead time   : physical transit of fulfilled GOODS down to the
+#                             customer. Default: fixed 2. Config: ship_lead_time
+#                             (fixed) or ship_lead_time_range [lo, hi]; the legacy
+#                             jittery_lead_time flag maps to U(1,9).
+#   3. PRODUCTION lead time  : time for the manufacturer to PRODUCE received orders
+#                             before they enter its own shipping pipeline. Default:
+#                             fixed 2. Config: production_lead_time / _range.
 #
-# Each delay can be a FIXED int, or a RANDOM range [lo, hi] sampled i.i.d. per
-# shipment from the integers lo..hi inclusive. Setting a range is how you build
-# "non-classical" scenarios (stochastic transit, supplier disruption) for training
-# and OOD testing. Set narrow ranges == old behaviour; widen them for stress tests.
+# Each delay is a FIXED int or a RANDOM range [lo, hi] sampled i.i.d. per shipment
+# from integers lo..hi inclusive. Ranges build non-classical scenarios (stochastic
+# transit, supplier disruption) for training and OOD testing.
 #
-# OBSERVATION SCOPE: the AGENT observes only four local scalars (inventory, backlog,
-# total on-order, last realised demand) -- no phased in-transit pipeline. The full
-# physical pipeline remains available to the centralized CRITIC via get_global_state()
-# (CTDE), but NOT any future demand oracle.
-# REVISION 1/2: get_global_state() no longer appends next_d / next demand. Agents
-# still receive post-step diagnostics through infos, including supply_chain_cost.
-# HARD CONSTRAINT: any realised delay must still fit the critic's pipeline horizon, so
-# __init__ validates every configured max delay is <= MAX_DELAY (the number of slots
+# OBSERVATION SCOPE: the agent observes only four local scalars (inventory, backlog,
+# total on-order, last realized demand) -- no phased in-transit pipeline. The full
+# physical pipeline is available to the centralized critic via get_global_state()
+# (CTDE), which exposes no future-demand oracle. Agents receive post-step
+# diagnostics (including supply_chain_cost) through infos.
+#
+# HARD CONSTRAINT: every realized delay must fit the critic's pipeline horizon, so
+# __init__ validates each configured max delay is <= MAX_DELAY (the number of slots
 # get_global_state() walks); a longer delay would land in a slot the critic cannot see.
 # ==============================================================================
 
@@ -45,22 +43,22 @@ def _is_strict_int(v):
     return isinstance(v, (int, np.integer)) and not isinstance(v, bool)
 
 def _is_strict_num(v):
-    # Explicitly block NumPy complex types (np.complex64, np.complex128)
+    # Reject NumPy complex types (np.complex64, np.complex128).
     if isinstance(v, bool) or isinstance(v, complex) or np.iscomplexobj(v):
         return False
     return isinstance(v, (int, float, np.number))
 
 
 def _parse_lead_spec(cfg, fixed_key, range_key, default_fixed):
-    """Return a sampler() -> int for a lead time.
+    """Build a lead-time sampler and report its maximum delay.
 
-    Resolution order (first match wins):
-      * range_key present and a 2-list [lo, hi] -> sample integers lo..hi inclusive
-      * fixed_key present                       -> constant int
-      * else                                    -> default_fixed (the OLD constant)
+    Returns (sampler(rng) -> int, max_delay). Resolution order (first match wins):
+      * range_key present as a 2-list [lo, hi] -> sample integers lo..hi inclusive
+      * fixed_key present                      -> constant int
+      * else                                   -> default_fixed
 
-    The returned closure takes the env's np_random so sampling stays reproducible
-    under the episode seed. Validation of bounds happens in __init__, not here.
+    The sampler takes the env's np_random so draws stay reproducible under the
+    episode seed. Bounds are validated in __init__, not here.
     """
     rng_spec = cfg.get(range_key, None)
     if rng_spec is not None:
@@ -79,10 +77,11 @@ def _parse_lead_spec(cfg, fixed_key, range_key, default_fixed):
 
 
 class TransitPipeline:
-    """A delay line for goods or orders in transit. `pipeline` maps an ARRIVAL step -> quantity:
-    add_shipment(t, q, lead) schedules q to land at t+lead; receive_shipment(t) pops (and removes)
-    whatever arrives at step t. Used for both the order pipeline (an order travelling UP to the
-    supplier) and the shipment pipeline (goods travelling DOWN to the customer)."""
+    """Delay line for goods or orders in transit. `pipeline` maps an arrival step to
+    quantity: add_shipment(t, q, lead) schedules q to land at t+lead; receive_shipment(t)
+    pops and removes whatever arrives at step t. Used for both the order pipeline (orders
+    traveling UP to the supplier) and the shipment pipeline (goods traveling DOWN to the
+    customer)."""
     def __init__(self):
         self.pipeline = {}
 
@@ -116,11 +115,9 @@ class BeerGameParallelEnv(ParallelEnv):
         self.agents = self.possible_agents[:]
 
         self._config = config.copy() if config else {}
-        # REVISION 3: remove the legacy/unused `lookahead` key from the env-owned
-        # config. The current observation is intentionally four local scalars and
-        # never exposes phased pipeline slots, so keeping `lookahead` here only
-        # suggested behavior that no longer exists. Existing YAML files that still
-        # contain the key remain loadable because we silently discard it.
+        # Drop the unused `lookahead` key: the observation is four local scalars and
+        # never exposes phased pipeline slots, so the key would imply behavior that
+        # does not exist. Discarding it keeps existing YAML configs loadable.
         self._config.pop("lookahead", None)
         self.horizon = self._config.get("horizon", 50)
         self.max_order = self._config.get("max_order", 100)
@@ -133,32 +130,29 @@ class BeerGameParallelEnv(ParallelEnv):
         if not _is_strict_num(self.h) or not _is_strict_num(self.b): raise ValueError("Costs must be numeric")
         if not np.isfinite(self.h) or not np.isfinite(self.b) or self.h < 0 or self.b < 0: raise ValueError("Costs must be finite positive")
 
-        # CANONICAL-COST FLAG (default off -> behavior unchanged; old checkpoints/runs stay valid).
-        # When True, the backorder penalty is charged ONLY at the retailer (customer-facing) stage:
-        # the canonical Clark-Scarf (1960) serial cost, for which an echelon base-stock policy is
-        # PROVABLY optimal and the cost is provably convex. Default False = the beer-game team cost
-        # (service at every echelon: each stage pays for its own backlog). Holding cost is charged
-        # at every stage in BOTH modes (standard for the serial model).
+        # Canonical-cost flag (default False). When True, the backorder penalty is
+        # charged only at the retailer (customer-facing) stage: the canonical
+        # Clark-Scarf (1960) serial cost, under which an echelon base-stock policy is
+        # provably optimal and the cost is convex. When False, the beer-game team cost
+        # charges each stage for its own backlog. Holding cost is charged at every
+        # stage in both modes (standard for the serial model).
         self._penalty_at_retailer_only = self._config.get("penalty_at_retailer_only", False)
         if type(self._penalty_at_retailer_only) is not bool:
             raise ValueError("penalty_at_retailer_only must be a strict boolean")
 
         # --- LEAD-TIME CONFIGURATION --------------------------------------------
-        # REVISION 6: behavior is unchanged here; the corrected test suite adds
-        # explicit coverage for fixed-width random ranges, invalid ranges, and the
-        # MAX_DELAY guard so these config paths are now benchmark-safe.
-        # Each call returns (sampler(rng)->int, max_possible_delay). Defaults below
-        # reproduce the original hardcoded constants exactly:
-        #   order:        non-manufacturer = 2, manufacturer = 1
-        #   shipping:     2  (old jittery flag = U(1,9); now express that as a range)
-        #   production:   2
+        # Each call returns (sampler(rng) -> int, max_possible_delay). Defaults below
+        # reproduce the original hardcoded constants:
+        #   order:       non-manufacturer = 2, manufacturer = 1
+        #   shipping:    2  (legacy jittery flag = U(1,9), now expressible as a range)
+        #   production:  2
         cfg = self._config
         self._order_lead, ord_max = _parse_lead_spec(cfg, "order_lead_time", "order_lead_time_range", 2)
         self._order_lead_mfr, ord_mfr_max = _parse_lead_spec(cfg, "order_lead_time_mfr", "order_lead_time_mfr_range", 1)
         self._production_lead, prod_max = _parse_lead_spec(cfg, "production_lead_time", "production_lead_time_range", 2)
 
-        # Backward-compat shim for the old boolean `jittery_lead_time`: if it is set
-        # True and no explicit shipping spec is given, reproduce the legacy U(1,9).
+        # Backward-compat shim: if the legacy boolean `jittery_lead_time` is True and
+        # no explicit shipping spec is given, reproduce the legacy U(1,9).
         jitter = cfg.get("jittery_lead_time", False)
         if type(jitter) is not bool:
             raise ValueError("jittery_lead_time must be a strict boolean")
@@ -187,7 +181,7 @@ class BeerGameParallelEnv(ParallelEnv):
 
         self.np_random = np.random.default_rng()
         self._action_spaces = {a: Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32) for a in self.possible_agents}
-        # MINIMALIST OBSERVATION (Oroojlooyjadid-style, fully partially-observable):
+        # Minimalist observation (Oroojlooyjadid-style, fully partially observable):
         # [inventory, backlog, total_on_order, last_realized_incoming]. No pipeline phasing.
         obs_dim = 4
         self._observation_spaces = {a: Box(low=-2000.0, high=2000.0, shape=(obs_dim,), dtype=np.float32) for a in self.possible_agents}
@@ -232,15 +226,14 @@ class BeerGameParallelEnv(ParallelEnv):
     def get_global_state(self):
         """True unclipped physical global state for CTDE.
 
-        REVISION 1/2: Removed the former one-step-ahead demand channel (`next_d`).
-        That value was a future exogenous demand oracle for the centralized critic.
-        The decentralized agents never observed it, but allowing the critic to train
-        with it would make SIGNAL/baseline comparisons unfair unless every method had
-        the same forecast oracle. This state now contains only current physical
-        variables and scheduled pipeline contents.
+        Contains only current physical variables and scheduled pipeline contents;
+        the former one-step-ahead demand channel (`next_d`) was removed. That value
+        was a future-demand oracle for the centralized critic that the decentralized
+        agents never observed, so training the critic with it would make method
+        comparisons unfair unless every baseline shared the same forecast oracle.
 
-        Walks MAX_DELAY pipeline slots -- which is why every configured lead time
-        must be <= MAX_DELAY (validated in __init__)."""
+        Walks MAX_DELAY pipeline slots, so every configured lead time must be
+        <= MAX_DELAY (validated in __init__)."""
         state = [float(self.current_step)]
         for a in self.possible_agents:
             state.extend([self.inventory[a], self.backlog[a], self.unfulfilled_orders[a]])
@@ -252,10 +245,8 @@ class BeerGameParallelEnv(ParallelEnv):
 
     def _roll_stochastic_demand(self, step):
         d_type = self._config.get("demand_type")
-        # REVISION 5: The two stress regimes below are intentionally custom OOD
-        # scenarios, not canonical Beer Game benchmark demand decks. Behavior is
-        # unchanged; the comment prevents over-claiming these as literature-standard
-        # demand processes.
+        # The two stress regimes below are custom OOD scenarios, not canonical Beer
+        # Game benchmark demand decks.
         if d_type == "black_swan": return self.np_random.poisson(8 if step < 25 else 20)
         if d_type == "extreme_chaos":
             base = 8 if step < 10 else 30 if step < 20 else 0 if step < 30 else self.np_random.integers(5, 25)
@@ -263,8 +254,8 @@ class BeerGameParallelEnv(ParallelEnv):
         return self.np_random.poisson(8)
 
     def _peek_incoming_demand(self, agent, target_step):
-        """Privileged lookup used ONLY by simulation mechanics and training-only
-        channels. NOT called by _build_obs, so future demand never reaches the obs."""
+        """Privileged lookup used only by simulation mechanics and training-only
+        channels. Not called by _build_obs, so future demand never reaches the obs."""
         if agent == "retailer":
             d_type = self._config.get("demand_type")
             if d_type == "step": return 4 if target_step < 5 else 8
@@ -276,15 +267,15 @@ class BeerGameParallelEnv(ParallelEnv):
         return self.order_pipelines[self.possible_agents[idx - 1]].pipeline.get(target_step, 0)
 
     def _build_obs(self, agent):
-        # MINIMALIST PARTIAL OBSERVABILITY. Four local scalars only:
-        #   [inventory, backlog, total on-order, last realised incoming demand/order]
-        # - 4th slot is the LAST realised demand (already observed), NOT a future peek.
-        # - No phased in-transit pipeline is exposed. Inventory position
-        #   (inv - backlog + on_order) is still recoverable from slots 0-2, so the
-        #   base-stock head is unaffected; the agent loses only the ARRIVAL TIMING of
-        #   in-transit goods, which it must now infer -- this is what turns variable
-        #   lead times into a genuine hidden-dynamics test. The centralized critic still
-        #   sees the full pipeline via get_global_state() (CTDE).
+        # Minimalist partial observability. Four local scalars only:
+        #   [inventory, backlog, total on-order, last realized incoming demand/order]
+        # The 4th slot is the last realized demand (already observed), not a future
+        # peek. No phased in-transit pipeline is exposed, but inventory position
+        # (inv - backlog + on_order) is still recoverable from slots 0-2, so the
+        # base-stock head is unaffected; the agent loses only the arrival timing of
+        # in-transit goods, which it must infer. This is what turns variable lead
+        # times into a genuine hidden-dynamics test. The centralized critic still
+        # sees the full pipeline via get_global_state() (CTDE).
         last_inc = self.current_incoming_order[agent]
         obs = [float(self.inventory[agent]), float(self.backlog[agent]),
                float(self.unfulfilled_orders[agent]), float(last_inc)]
@@ -313,16 +304,19 @@ class BeerGameParallelEnv(ParallelEnv):
                 raise ValueError(f"Action for {agent} must be finite")
 
     def step(self, actions):
-        """Advance one period (week). The four phases below execute in this fixed order each step:
+        """Advance one period (week). The four phases execute in this fixed order:
           PHASE 1  RECEIVE  -- goods scheduled to arrive now land in inventory.
-          PHASE 2  FULFIL   -- each stage sees its incoming demand (retailer: customer demand;
-                               others: the downstream stage's arriving orders), ships what it can
-                               (rest -> backlog) DOWN the chain; the manufacturer turns received
-                               orders into production (-> its own shipment pipe after production lead).
-          PHASE 3  ORDER    -- each agent's action S becomes order = clip(S-IP); it travels UP to the
-                               supplier after the order (information) lead.
-          PHASE 4  COST     -- charge h*inventory (+ b*backlog, every stage by default / retailer only
-                               if penalty_at_retailer_only); reward = -total_system_cost (shared).
+          PHASE 2  FULFILL  -- each stage sees its incoming demand (retailer: customer
+                               demand; others: the downstream stage's arriving orders),
+                               ships what it can (remainder -> backlog) DOWN the chain;
+                               the manufacturer turns received orders into production
+                               (-> its own shipment pipe after the production lead).
+          PHASE 3  ORDER    -- each agent's action in [0,1] maps to an integer order in
+                               [0, max_order] that travels UP to the supplier after the
+                               order (information) lead.
+          PHASE 4  COST     -- charge h*inventory (+ b*backlog at every stage by default,
+                               or the retailer only if penalty_at_retailer_only);
+                               reward = -total_system_cost (shared).
         Returns the PettingZoo parallel tuple (obs, rewards, terminations, truncations, infos)."""
         if not self.agents:
             raise RuntimeError("Environment stepped after done")
@@ -394,9 +388,8 @@ class BeerGameParallelEnv(ParallelEnv):
         # --- PHASE 4: ACCOUNTING & REWARDS ---
         done = self.current_step >= self.horizon
 
-        # REVISION 1: agents may inspect the realized supply-chain cost AFTER the
-        # round through infos. This is post-decision feedback, not a future-demand
-        # signal. Existing keys are kept for backwards compatibility.
+        # Agents may inspect the realized supply-chain cost after the round through
+        # infos: post-decision feedback, not a future-demand signal.
         local_costs = {}
         for agent in self.agents:
             # canonical (Clark-Scarf) cost charges the backorder penalty at the retailer only;
@@ -409,11 +402,11 @@ class BeerGameParallelEnv(ParallelEnv):
             total_system_cost += cost
 
         for agent in self.agents:
-            # "demand" = demand realized THIS step (already observed) -> encoder's
-            # self-supervised forecasting target (not in the obs the agent acted on).
+            # "demand" = demand realized this step (already observed): the encoder's
+            # self-supervised forecasting target, not part of the obs the agent acted on.
             infos[agent] = {"local_cost": local_costs[agent],
                             "supply_chain_cost": total_system_cost,
-                            "training_targets": {             # <--- NESTED FOR CLEAN ISOLATION
+                            "training_targets": {             # nested to isolate training-only targets
                                 "demand": self._period_demand[agent],
                                 "demand_met": self._period_demand_met[agent]
                             }

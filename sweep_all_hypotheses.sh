@@ -103,11 +103,20 @@
 #   STAGE=dump    ./sweep_all_hypotheses.sh                  # per-seed producers (needs checkpoints)
 #   STAGE=probe   ./sweep_all_hypotheses.sh                  # do(m) intervention dumps (V-claiming arms)
 #   STAGE=analyze ./sweep_all_hypotheses.sh                  # registered statistics
+#   STAGE=plot    ./sweep_all_hypotheses.sh                  # seed-aggregated learning-curve PDFs -> sweep_out/figs
+#   STAGE=calibrate ./sweep_all_hypotheses.sh                # 2-min NPROC throughput probe (optional)
 #
 # OVERRIDABLE ENV (defaults in brackets):
 #   SEEDS[10..24 =15] EP[8000] PATIENCE[2000] HELDOUT_EPISODES[8] THREADS_PER_JOB[1]
-#   NPROC[cores/threads] TAU_STAR[1.0] PHASES[core] STAGE[train] DRYRUN[0] PYTHON[python]
+#   NPROC[min(physical cores, RAM/JOB_MB)] JOB_MB[700 = measured per-job RSS high-water]
+#   SHUFFLE[1 = randomize job order; result-invariant, CRN is by seed value] PIN[0 = taskset per slot]
+#   TAU_STAR[1.0] PHASES[core] STAGE[train|dump|probe|analyze|plot|calibrate|all] DRYRUN[0] PYTHON[python]
+#   SIGNAL_CSVLOG[1 = write per-run metrics_heldout.csv / metrics_update.csv / run_meta.json into
+#                    each run_dir; the learning-curve artifact. Set 0 to skip. Pure observation.]
 #   OUTROOT[./sweep_out] MILESTONES[[1000,2000,4000,8000]] DUMP_EPISODES[200]
+#   NOTE: agent.budget_milestones now EXISTS in conf/agent/signal.yaml, so the plain (non-+)
+#   override below is valid Hydra; RESUME is sentinel-based (weights_signal/.done_<arm>_s<seed>),
+#   because a best-checkpoint alone does NOT mean the run completed (spot-pod preemption).
 #   PROBE_EPISODES[40] PROBE_ARMS[ar1r9_upstream ar1r9_rbroadcast ar1r9_rbroadcast_learned
 #                                 ar1r9_rbroadcast_raw ar1r9_beta0_upstream ar1r9_beta05_upstream]
 # ============================================================================
@@ -134,18 +143,75 @@ AR1_MU="${AR1_MU:-12.0}"; AR1_SIGMA="${AR1_SIGMA:-3.0}"          # AR(1) eval pa
 MILESTONES="${MILESTONES:-[1000,2000,4000,8000]}"                # REGISTERED substitution-curve grid
 PROBE_EPISODES="${PROBE_EPISODES:-40}"                            # episodes/seed for the do(m) probe
 PROBE_ARMS="${PROBE_ARMS:-ar1r9_upstream ar1r9_rbroadcast ar1r9_rbroadcast_learned ar1r9_rbroadcast_raw ar1r9_beta0_upstream ar1r9_beta05_upstream}"
+SHUFFLE="${SHUFFLE:-1}"                                           # randomize job order (straggler hedge)
+PIN="${PIN:-0}"                                                    # 1 = taskset each worker to a core slot
+JOB_MB="${JOB_MB:-700}"                                            # measured per-job RSS high-water (~685 MB)
 DRYRUN="${DRYRUN:-0}"
 OUTROOT="${OUTROOT:-$ROOT/sweep_out}"
 LOGDIR="$OUTROOT/logs"
-mkdir -p "$OUTROOT" "$LOGDIR"
+mkdir -p "$OUTROOT" "$LOGDIR" weights_signal
+
+# integer sanity (fail fast with ONE message instead of N identical hydra errors)
+for _v in EP PATIENCE HELDOUT_EPISODES THREADS_PER_JOB DUMP_EPISODES PROBE_EPISODES JOB_MB; do
+  [[ "${!_v}" =~ ^[0-9]+$ ]] || { echo "ERROR: $_v must be a non-negative integer (got '${!_v}')"; exit 1; }
+done
 
 HE=$((EP / 4)); (( HE > 200 )) && HE=200; (( HE < 1 )) && HE=1
-CORES="$(nproc 2>/dev/null || echo 4)"
+
+# PHYSICAL cores, not SMT threads: single-threaded numeric jobs gain ~0-20% from HT at 2x RAM
+# and scheduler churn -- start at physical, raise via NPROC/STAGE=calibrate if measured worthwhile.
+# (|| true inside the substitutions: lscpu/grep failures must not trip set -e/pipefail.)
+PHYS_CORES="$(lscpu -b -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l || true)"
+[[ "$PHYS_CORES" =~ ^[0-9]+$ ]] && (( PHYS_CORES >= 1 )) || PHYS_CORES="$(nproc 2>/dev/null || echo 4)"
+CORES="$PHYS_CORES"
 NPROC="${NPROC:-$(( CORES / THREADS_PER_JOB ))}"; (( NPROC < 1 )) && NPROC=1
+# RAM law: never launch more workers than memory sustains (OOM-killed jobs would otherwise
+# leave partial checkpoints; see sentinel-resume). Skipped when MemAvailable is unreadable.
+MEM_MB="$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null || true)"
+if [[ "$MEM_MB" =~ ^[0-9]+$ ]] && (( MEM_MB > 0 )); then
+  NPROC_MEM=$(( MEM_MB * 85 / 100 / JOB_MB )); (( NPROC_MEM < 1 )) && NPROC_MEM=1
+  if (( NPROC > NPROC_MEM )); then
+    echo "NPROC clamped ${NPROC} -> ${NPROC_MEM} by RAM (${MEM_MB} MB avail @ ${JOB_MB} MB/job)"
+    NPROC=$NPROC_MEM
+  fi
+fi
+# does this xargs support per-slot vars (findutils >= 4.7)? needed only for PIN=1 core-pinning.
+if xargs --process-slot-var=XSLOT true </dev/null >/dev/null 2>&1; then
+  SLOTVAR=(--process-slot-var=XSLOT)
+else
+  SLOTVAR=(); [[ "$PIN" == 1 ]] && echo "WARN: xargs lacks --process-slot-var; PIN=1 ignored"
+fi
 
 export OMP_NUM_THREADS="$THREADS_PER_JOB" MKL_NUM_THREADS="$THREADS_PER_JOB"
 export OPENBLAS_NUM_THREADS="$THREADS_PER_JOB" NUMEXPR_NUM_THREADS="$THREADS_PER_JOB"
+export MALLOC_ARENA_MAX=2                                          # curb glibc arena bloat across N procs
 export WANDB_MODE=disabled PYTHONUNBUFFERED=1
+# SCIENTIFIC SCALAR LOGGER: on by default for the air-gapped sweep this was built for (W&B is
+# disabled above, so the per-run metrics_*.csv IS the learning-curve artifact). Pure observation,
+# byte-identical training (see agents/signal_csvlog.py). Override with SIGNAL_CSVLOG=0 to skip it.
+export SIGNAL_CSVLOG="${SIGNAL_CSVLOG:-1}"
+
+# ------------------------------------------------------------ 1b. CALIBRATE (optional): measure the
+# NPROC knee ON THIS POD. Runs a fixed 60-episode arm at NPROC in {physical, 1.5x physical}
+# (RAM-capped) and reports aggregate episodes/second; pick the winner, export NPROC, launch.
+if [[ "$STAGE" == calibrate ]]; then
+  _cands="$CORES $(( CORES * 3 / 2 ))"
+  [[ -n "${NPROC_MEM:-}" ]] && _cands="$(for c in $_cands; do (( c > NPROC_MEM )) && c=$NPROC_MEM; echo "$c"; done)"
+  _cands="$(echo "$_cands" | tr ' ' '\n' | sort -un | tr '\n' ' ')"
+  echo "== CALIBRATE: candidates NPROC in {${_cands% }} (60 eps/job, gate suppressed) =="
+  [[ "$DRYRUN" == "1" ]] && { echo "-- DRYRUN: nothing executed --"; exit 0; }
+  for np in $_cands; do
+    t0=$(date +%s)
+    seq 1 "$np" | xargs -d '\n' -P "$np" -I S bash -c \
+      "$PYTHON agents/train_signal.py agent=signal seed=\$((900+S)) total_episodes=60 \
+       agent.heldout_every=60 agent.heldout_episodes=1 agent.patience=0 \
+       agent.algorithm=cal_sS >/dev/null 2>&1 || true"
+    dt=$(( $(date +%s) - t0 )); (( dt < 1 )) && dt=1
+    echo "  NPROC=$np : $(( np * 60 / dt )) eps/s aggregate  (${dt}s wall)"
+  done
+  rm -rf weights_signal/run_signal_*_cal_s* 2>/dev/null || true
+  exit 0
+fi
 
 # ------------------------------------------------------------ 2. phase selection
 SEL=""
@@ -300,32 +366,58 @@ if [[ "$DRYRUN" == "1" ]]; then
   echo "-- DRYRUN: nothing executed --"; exit 0
 fi
 
+# ------------------------------------------------------------ 3b. checkpoint resolver
+# NEWEST checkpoint for (arm, seed): sentinel-based resume can legitimately leave one STALE
+# run dir (incomplete, but with a best.pt) next to the completed retrain -- the dump/probe
+# stages must then score the completed one, and never race two writers onto one seed file.
+latest_ck() {   # latest_ck <arm_tag> <seed> <filename>  -> newest matching path (or nothing)
+  ls -1dt weights_signal/run_signal_*_"$1"_s"$2"/"$3" 2>/dev/null | head -1 || true
+}
+
 # ------------------------------------------------------------ 4. TRAIN (parallel, resumable)
+# RESUME SEMANTICS: a run counts as complete ONLY when its sentinel weights_signal/.done_<full>
+# exists (written after the trainer's final line). A best-checkpoint alone means "passed >=1
+# gate before dying" -- the old skip-on-checkpoint rule silently froze preempted arms at a
+# 200-episode policy. To mark a legacy run complete by hand: touch weights_signal/.done_<full>.
 run_one() {
-  local algo seed args full log
+  local algo seed args full log done_f pin
   IFS=$'\t' read -r algo seed args <<< "$1"
   full="${algo}_s${seed}"
+  done_f="weights_signal/.done_${full}"
+  if [[ -f "$done_f" ]]; then
+    echo "[skip] $full (done)"; return 0
+  fi
   if compgen -G "weights_signal/run_signal_*_${full}/signal_checkpoint_best.pt" > /dev/null 2>&1; then
-    echo "[skip] $full"; return 0
+    echo "[resume-warn] $full: checkpoint exists but no completion sentinel -> retraining"
+    echo "              (fresh run dir; stale dir kept, dump/probe pick the NEWEST via latest_ck)"
+  fi
+  pin=""
+  if [[ "${PIN:-0}" == 1 ]] && command -v taskset >/dev/null 2>&1; then
+    pin="taskset -c $(( ${XSLOT:-0} % ${CORES:-1} ))"
   fi
   log="$LOGDIR/${full}.log"
   echo "[start] $full"
-  # shellcheck disable=SC2086  -- $args is intentionally word-split into hydra tokens
-  if $PYTHON agents/train_signal.py agent=signal seed="$seed" total_episodes="$EP" \
+  # shellcheck disable=SC2086  -- $args / $pin are intentionally word-split
+  if $pin $PYTHON agents/train_signal.py agent=signal seed="$seed" total_episodes="$EP" \
         agent.heldout_every="$HE" agent.heldout_episodes="$HELDOUT_EPISODES" agent.patience="$PATIENCE" \
         "agent.budget_milestones=$MILESTONES" \
         $args agent.algorithm="$full" > "$log" 2>&1; then
+    touch "$done_f"
     echo "[done] $full"
   else
     echo "[FAIL] $full  (tail: $(tail -n1 "$log" 2>/dev/null))"
   fi
 }
 export -f run_one
-export PYTHON EP HE HELDOUT_EPISODES PATIENCE LOGDIR MILESTONES
+export PYTHON EP HE HELDOUT_EPISODES PATIENCE LOGDIR MILESTONES CORES PIN
 
 if [[ "$STAGE" == train || "$STAGE" == all ]]; then
   echo "== TRAIN: $NJOBS jobs, $NPROC parallel =="
-  xargs -P "$NPROC" -I LINE bash -c 'run_one "$1"' _ LINE < "$JOBS" | tee "$OUTROOT/run.log"
+  # shuffle hedges stragglers (durations vary ~2x via patience); provably result-invariant.
+  [[ "$SHUFFLE" == 1 ]] && command -v shuf >/dev/null 2>&1 && shuf "$JOBS" -o "$JOBS"
+  # -d '\n': disable xargs quote-parsing -- one malformed line then fails ALONE instead of
+  # aborting the whole stage (verified: default xargs drops all remaining jobs on an unmatched quote).
+  xargs -d '\n' "${SLOTVAR[@]}" -P "$NPROC" -I LINE bash -c 'run_one "$1"' _ LINE < "$JOBS" | tee "$OUTROOT/run.log"
   echo "== TRAIN complete: done=$(grep -cF '[done]' "$OUTROOT/run.log" || true)" \
        "skip=$(grep -cF '[skip]' "$OUTROOT/run.log" || true)" \
        "FAIL=$(grep -cF '[FAIL]' "$OUTROOT/run.log" || true) =="
@@ -333,7 +425,7 @@ if [[ "$STAGE" == train || "$STAGE" == all ]]; then
 fi
 
 # ------------------------------------------------------------ 5. DUMP: per-seed producers (H1/H2/H3)
-# H2 is IN-REGIME: each rho-trained Phase-A model (ar1r{0,3,6,9}_{neighbor,nocomm}) is scored at ITS
+# H2 is IN-REGIME: each rho-trained Phase-A model (ar1r{0,3,6,9}_{upstream,nocomm}) is scored at ITS
 # OWN rho (--dump-ar1 "<r>") into a per-rho subdir, then MERGED into one rho-keyed file per seed --
 # the {seed:{rho:cost}} format prereg.h2_slope + comm_stats consume. (Scoring one model across all
 # rhos would be a generalization curve, NOT the value-of-sharing gradient.) The _ferr siblings the
@@ -341,6 +433,7 @@ fi
 # H7 (Phases D/Dext) is NOT dumped here: its analysis needs the best-response/measured-PoA probe,
 # which does not exist in eval_signal.py yet (train the arms now; analyze when the probe lands).
 H2ROOT="$OUTROOT/h2"; H1ROOT="$OUTROOT/h1pois"; CURVROOT="$OUTROOT/curve"; EROOT="$OUTROOT/incentive"
+FAMROOT="$OUTROOT/fam"          # F_GEOMETRY / F_CONTENT member dumps (registered Holm families)
 MLIST="$(echo "$MILESTONES" | tr -d '[] ' | tr ',' ' ')"
 if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
   echo "== DUMP: H1 Poisson (+S1) + H2/H1 AR1 (in-regime) + H3 ferr + curve milestones + V(beta) =="
@@ -349,8 +442,8 @@ if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
   for r in 0.0 0.3 0.6 0.9; do t="${RHOTAG[$r]}"
     for pair in "upstream comm" "nocomm nocomm"; do
       suf="${pair% *}"; grp="${pair#* }"
-      for ck in weights_signal/run_signal_*_"${t}_${suf}"_s*/signal_checkpoint_best.pt; do
-        [[ -e "$ck" ]] || continue
+      for s in $SEEDS; do
+        ck="$(latest_ck "${t}_${suf}" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
         echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$H2ROOT/${grp}_${t}' \
 --dump-ar1 '$r' --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
       done
@@ -359,8 +452,8 @@ if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
   # -- H1 Poisson pair + the S1 sensitivity arm (max-favorable geometry under the null) --------
   for pair in "upstream comm" "nocomm nocomm" "rbroadcast rbroadcast"; do
     suf="${pair% *}"; grp="${pair#* }"
-    for ck in weights_signal/run_signal_*_"dp_${suf}"_s*/signal_checkpoint_best.pt; do
-      [[ -e "$ck" ]] || continue
+    for s in $SEEDS; do
+      ck="$(latest_ck "dp_${suf}" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
       echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$H1ROOT/${grp}' \
 --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
     done
@@ -371,13 +464,13 @@ if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
   for M in $MLIST; do
     for pair in "upstream comm" "nocomm nocomm"; do
       suf="${pair% *}"; grp="${pair#* }"
-      for ck in weights_signal/run_signal_*_"dp_${suf}"_s*/"signal_checkpoint_budget${M}.pt"; do
-        [[ -e "$ck" ]] || continue
+      for s in $SEEDS; do
+        ck="$(latest_ck "dp_${suf}" "$s" "signal_checkpoint_budget${M}.pt")"; [[ -n "$ck" ]] || continue
         echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$CURVROOT/dp_${grp}_b${M}' \
 --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
       done
-      for ck in weights_signal/run_signal_*_"ar1r9_${suf}"_s*/"signal_checkpoint_budget${M}.pt"; do
-        [[ -e "$ck" ]] || continue
+      for s in $SEEDS; do
+        ck="$(latest_ck "ar1r9_${suf}" "$s" "signal_checkpoint_budget${M}.pt")"; [[ -n "$ck" ]] || continue
         echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$CURVROOT/ar1r9_${grp}_b${M}' \
 --dump-ar1 0.9 --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
       done
@@ -387,15 +480,26 @@ if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
   for b in beta0 beta05; do
     for pair in "upstream comm" "nocomm nocomm"; do
       suf="${pair% *}"; grp="${pair#* }"
-      for ck in weights_signal/run_signal_*_"ar1r9_${b}_${suf}"_s*/signal_checkpoint_best.pt; do
-        [[ -e "$ck" ]] || continue
+      for s in $SEEDS; do
+        ck="$(latest_ck "ar1r9_${b}_${suf}" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
         echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$EROOT/${b}_${grp}' \
 --dump-ar1 0.9 --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
       done
     done
   done
+  # -- F_GEOMETRY / F_CONTENT members (registered Holm families), in-regime at rho 0.9. --------
+  # Baseline needs no extra runs: analyze pairs each member against the MERGED Phase-A nocomm
+  # dumps restricted to the 0.9 key. The upstream geometry member is the Phase-A comm dump.
+  for arm in rbroadcast neighbor noneighbor downstream mbroadcast skip full linktop linkbot \
+             rbroadcast_ip rbroadcast_dhatip rbroadcast_learned rbroadcast_raw; do
+    for s in $SEEDS; do
+      ck="$(latest_ck "ar1r9_${arm}" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
+      echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$FAMROOT/ar1r9_${arm}' \
+--dump-ar1 0.9 --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+    done
+  done
   echo "  $(wc -l < "$DJOBS") dump jobs, $NPROC parallel"
-  xargs -P "$NPROC" -I LINE bash -c 'eval "$1"' _ LINE < "$DJOBS" > "$OUTROOT/dump.log" 2>&1 || true
+  xargs -d '\n' -P "$NPROC" -I LINE bash -c 'eval "$1"' _ LINE < "$DJOBS" > "$OUTROOT/dump.log" 2>&1 || true
   # merge per-rho AR1 subdirs -> rho-keyed per-seed files (the h2_slope format)
   "$PYTHON" - "$H2ROOT" <<'PY'
 import sys, os, glob, json
@@ -433,8 +537,8 @@ if [[ "$STAGE" == probe || "$STAGE" == all ]]; then
   mkdir -p "$PROBEROOT/logs"
   PJOBS="$OUTROOT/probe_jobs.sh"; : > "$PJOBS"
   for arm in $PROBE_ARMS; do
-    for ck in weights_signal/run_signal_*_"${arm}"_s*/signal_checkpoint_best.pt; do
-      [[ -e "$ck" ]] || continue
+    for s in $SEEDS; do
+      ck="$(latest_ck "${arm}" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
       rid="$(basename "$(dirname "$ck")")"
       echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --ar1 --ar1-rho 0.9 --ar1-mu $AR1_MU \
 --ar1-sigma $AR1_SIGMA --episodes $PROBE_EPISODES --dump-iv '$PROBEROOT/iv_${arm}' \
@@ -442,7 +546,7 @@ if [[ "$STAGE" == probe || "$STAGE" == all ]]; then
     done
   done
   echo "  $(wc -l < "$PJOBS") probe jobs, $NPROC parallel"
-  xargs -P "$NPROC" -I LINE bash -c 'eval "$1"' _ LINE < "$PJOBS" > "$OUTROOT/probe.log" 2>&1 || true
+  xargs -d '\n' -P "$NPROC" -I LINE bash -c 'eval "$1"' _ LINE < "$PJOBS" > "$OUTROOT/probe.log" 2>&1 || true
   for arm in $PROBE_ARMS; do
     d="$PROBEROOT/iv_${arm}"
     [[ -d "$d" ]] && echo "  $arm: $(ls "$d"/seed*_iv.json 2>/dev/null | wc -l) seed dumps -> $d"
@@ -452,12 +556,13 @@ fi
 # ------------------------------------------------------------ 6. ANALYZE: registered H1/H2/H3 statistics
 if [[ "$STAGE" == analyze || "$STAGE" == all ]]; then
   echo "== ANALYZE: H1 (TOST) + S1 + H2 (registered slope) + H3 + V(beta) =="
-  "$PYTHON" - "$H2ROOT" "$H1ROOT" "$EROOT" <<'PY'
+  "$PYTHON" - "$H2ROOT" "$H1ROOT" "$EROOT" "$FAMROOT" <<'PY'
 import sys, json
 sys.path.insert(0, ".")
 from scripts.comm_stats import load_cost_dir, value_of_sharing, load_ferr_dir, forecast_delta
 from scripts.prereg import h2_slope, h1_decision
 h2root, h1root, eroot = sys.argv[1], sys.argv[2], sys.argv[3]
+famroot = sys.argv[4] if len(sys.argv) > 4 else ""
 comm, nocomm = load_cost_dir(h2root + "/comm"), load_cost_dir(h2root + "/nocomm")
 if comm and nocomm:
     h2 = h2_slope(comm, nocomm)
@@ -511,8 +616,63 @@ try:
                      "sig" if v["v_cost_ci_excludes_0"] else "ns"))
         print("      (informative-communication survives misalignment if V stays positive as beta falls;")
         print("       babbling-equilibrium collapse shows as V -> 0/ns at low beta. Crawford-Sobel 1982.)")
+        if not (comm and nocomm):
+            print("      [warn] beta=1.0 point unavailable: Phase-A H2 dumps missing (it is REUSED, not retrained).")
 except Exception as e:
     print("  F_INCENTIVE: skipped (%s)" % e)
+# ---- F_GEOMETRY / F_CONTENT (registered Holm families) + D1 + C3, in-regime at rho 0.9 ----
+try:
+    if famroot and nocomm:
+        from scripts.prereg import holm_family
+        NULLS = {"no_neighbor", "downstream_only", "manufacturer_broadcast"}
+        GEOM = {"upstream_only (reused A)": None, "retailer_broadcast": "rbroadcast",
+                "neighbor": "neighbor", "skip": "skip", "full": "full",
+                "link_top_only": "linktop", "link_bottom_only": "linkbot",
+                "no_neighbor": "noneighbor", "downstream_only": "downstream",
+                "manufacturer_broadcast": "mbroadcast"}
+        CONT = {"ip": "rbroadcast_ip", "dhat_ip": "rbroadcast_dhatip",
+                "learned": "rbroadcast_learned", "raw": "rbroadcast_raw"}
+        def _arm(tag): return load_cost_dir("%s/ar1r9_%s" % (famroot, tag))
+        for fam_name, members in (("F_GEOMETRY", GEOM), ("F_CONTENT", CONT)):
+            res = {}
+            for label, tag in members.items():
+                d = comm if tag is None else _arm(tag)         # upstream member = Phase-A comm dumps
+                if d:
+                    try:
+                        res[label] = value_of_sharing(d, nocomm, lambdas=[0.9])
+                    except Exception:
+                        pass
+            if not res:
+                continue
+            hol = holm_family({k: v["wilcoxon_p"] for k, v in res.items()
+                               if v["wilcoxon_p"] == v["wilcoxon_p"]})     # drop NaN p
+            print("  %s @ rho0.9 (member vs merged Phase-A nocomm, seed-paired; Holm over %d):"
+                  % (fam_name, len(hol)))
+            for label, v in sorted(res.items(), key=lambda kv: -kv[1]["v_cost_mean"]):
+                h = hol.get(label, {})
+                nn = ("  TOST p=%.3g%s" % (v["tost_p"], " EQUIV" if v["equivalent"] else "")
+                      ) if label in NULLS else ""
+                print("      %-26s V=%+8.1f (%+5.1f%%) CI=[%.1f,%.1f] n=%d  p=%.3g adj=%.3g %s%s"
+                      % (label, v["v_cost_mean"], v["v_cost_pct"], v["v_cost_ci"][0], v["v_cost_ci"][1],
+                         v["n_seeds"], h.get("raw", float("nan")), h.get("adjusted", float("nan")),
+                         "REJ" if h.get("reject") else "ns ", nn))
+        dh, rw = _arm("rbroadcast"), _arm("rbroadcast_raw")    # D1: dhat vs raw (both rbroadcast)
+        if dh and rw:
+            d1 = value_of_sharing(dh, rw, lambdas=[0.9])       # V = cost(raw) - cost(dhat)
+            print("  D1 forecast-vs-data (dhat vs raw @ rbroadcast): V=%+.1f CI=[%.1f,%.1f]"
+                  " (+ => dhat cheaper; Aviv-consistent)"
+                  % (d1["v_cost_mean"], d1["v_cost_ci"][0], d1["v_cost_ci"][1]))
+        le, di = _arm("rbroadcast_learned"), _arm("rbroadcast_dhatip")     # C3 (executed design)
+        if le and di:
+            c3 = value_of_sharing(le, di, lambdas=[0.9])       # diff = cost(dhat_ip) - cost(learned)
+            print("  C3 interpretability bound (learned vs dhat_ip @ rbroadcast): diff=%+.1f"
+                  " CI=[%.1f,%.1f] TOST p=%.3g -> %s"
+                  % (c3["v_cost_mean"], c3["v_cost_ci"][0], c3["v_cost_ci"][1], c3["tost_p"],
+                     "EQUIVALENT" if c3["equivalent"] else "not equivalent"))
+        print("  (NOTE the C3 wording amendment: prereg v1.1 says upstream_only; the executed Phase-C")
+        print("   arms are retailer_broadcast -- reconcile by DATED amendment before unblinding.)")
+except Exception as e:
+    print("  F_GEOMETRY/F_CONTENT: skipped (%s)" % e)
 print("  (H4 geometry / H5 content: same producers on the rho0.9 topology/content arms + "
       "comm_stats.value_of_sharing per arm with Holm across the family; H7 needs the PoA probe.)")
 PY
@@ -538,6 +698,63 @@ PY
       "$PYTHON" scripts/comm_stats.py interventions --dir "$d" || true
     fi
   done
+fi
+
+# ------------------------------------------------------------ 7. PLOT: seed-aggregated learning curves
+# Builds the publishable comm-vs-no-comm held-out learning-curve PDFs directly from the per-run
+# metrics_heldout.csv the trainer wrote under SIGNAL_CSVLOG (default on). One figure per registered
+# comparison; arms with no CSVs yet are skipped, so this is safe to run at any point after TRAIN.
+# The band is plot_curves.py's default (studentized bootstrap-95% CI over seeds).
+PLOTROOT="$OUTROOT/figs"
+_ck() { echo "weights_signal/run_signal_*_${1}_s*/metrics_heldout.csv"; }   # per-arm CSV glob (all seeds)
+_have() { compgen -G "$1" >/dev/null 2>&1; }
+plot_fig() {                                    # plot_fig OUT METRIC  LABEL GLOB [LABEL GLOB ...]
+  local out="$1" metric="$2"; shift 2
+  local args=() lbl glob
+  while (( $# >= 2 )); do
+    lbl="$1"; glob="$2"; shift 2
+    _have "$glob" && args+=(--arm "$lbl" "$glob")
+  done
+  if (( ${#args[@]} == 0 )); then echo "  [plot] $out: no seed CSVs yet -- skipped"; return; fi
+  "$PYTHON" plot_curves.py "${args[@]}" --metric "$metric" --out "$PLOTROOT/$out" || true
+}
+
+if [[ "$STAGE" == plot || "$STAGE" == all ]]; then
+  echo "== PLOT: seed-aggregated learning-curve figures -> $PLOTROOT =="
+  if ! "$PYTHON" -c "import matplotlib" >/dev/null 2>&1; then
+    echo "  [plot] matplotlib not installed ('$PYTHON -m pip install matplotlib') -- PLOT stage skipped"
+  else
+    mkdir -p "$PLOTROOT"
+    # H1 (Poisson): registered primary + the S1 max-favorable-geometry sensitivity, vs no-comm.
+    plot_fig fig_h1_poisson.pdf       heldout_mean_cost  upstream "$(_ck dp_upstream)"   nocomm "$(_ck dp_nocomm)"
+    plot_fig fig_h1_s1_rbroadcast.pdf heldout_mean_cost  rbroadcast "$(_ck dp_rbroadcast)" nocomm "$(_ck dp_nocomm)"
+    # H2 (in-regime, per rho): upstream comm vs matched no-comm at each autocorrelation.
+    for r in 0.0 0.3 0.6 0.9; do t="${RHOTAG[$r]}"
+      plot_fig "fig_h2_${t}.pdf" heldout_mean_cost  comm "$(_ck ${t}_upstream)"  nocomm "$(_ck ${t}_nocomm)"
+    done
+    # H4 geometry @ rho0.9: every topology overlaid against the no-comm baseline.
+    gargs=()
+    for topo in upstream rbroadcast neighbor downstream mbroadcast noneighbor; do
+      _have "$(_ck ar1r9_${topo})" && gargs+=("$topo" "$(_ck ar1r9_${topo})")
+    done
+    plot_fig fig_h4_geometry_ar1r9.pdf heldout_mean_cost "${gargs[@]}" nocomm "$(_ck ar1r9_nocomm)"
+    # H5 content ladder @ rho0.9 (dhat point is Phase-B ar1r9_rbroadcast), vs no-comm.
+    plot_fig fig_h5_content_ar1r9.pdf heldout_mean_cost \
+      dhat "$(_ck ar1r9_rbroadcast)" ip "$(_ck ar1r9_rbroadcast_ip)" dhat_ip "$(_ck ar1r9_rbroadcast_dhatip)" \
+      learned "$(_ck ar1r9_rbroadcast_learned)" raw "$(_ck ar1r9_rbroadcast_raw)" nocomm "$(_ck ar1r9_nocomm)"
+    # E incentive: matched-beta comm/no-comm pairs.
+    plot_fig fig_e_incentive_ar1r9.pdf heldout_mean_cost \
+      b0_comm "$(_ck ar1r9_beta0_upstream)" b0_nocomm "$(_ck ar1r9_beta0_nocomm)" \
+      b05_comm "$(_ck ar1r9_beta05_upstream)" b05_nocomm "$(_ck ar1r9_beta05_nocomm)"
+    # D strategic (canonical): coop / selfish / contract.
+    plot_fig fig_d_strategic_dp.pdf   heldout_mean_cost \
+      coop "$(_ck cn_dp_coop)" selfish "$(_ck cn_dp_selfish)" contract "$(_ck cn_dp_contract)"
+    plot_fig fig_d_strategic_ar1r9.pdf heldout_mean_cost \
+      coop "$(_ck cn_ar1r9_coop)" selfish "$(_ck cn_ar1r9_selfish)" contract "$(_ck cn_ar1r9_contract)"
+    # Mechanism curve (H3): upstream forecast error over training, comm vs no-comm at rho0.9.
+    plot_fig fig_h3_ferr_ar1r9.pdf    forecast_error  comm "$(_ck ar1r9_upstream)" nocomm "$(_ck ar1r9_nocomm)"
+    echo "  wrote $(ls "$PLOTROOT"/*.pdf 2>/dev/null | wc -l) figure(s) to $PLOTROOT"
+  fi
 fi
 
 echo "ALL SELECTED STAGES COMPLETE ($(date))"

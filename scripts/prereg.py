@@ -1,18 +1,18 @@
 """
-prereg.py -- PRE-REGISTRATION of the SIGNAL confirmatory analysis.
+prereg.py -- pre-registration of the SIGNAL confirmatory analysis.
 ================================================================================
-Frozen 2026-07-02, BEFORE the multi-seed sweep is launched. This module is the
-single source of truth for WHICH contrasts are confirmatory, WHAT statistic and
-decision rule each uses, and HOW multiplicity is corrected. Everything not named
-here is exploratory and is reported as such. The point is referee-proofing: with
-10 topologies x 4 contents x several regimes the design has dozens of possible
-contrasts, and an unregistered analysis of that grid is a garden of forking
-paths -- any 'significant' cell is uninterpretable. One primary contrast, one
-designated sensitivity, two Holm-corrected secondary families, one slope test.
+Frozen 2026-07-02, before the multi-seed sweep is launched. This module is the
+single source of truth for which contrasts are confirmatory, what statistic and
+decision rule each uses, and how multiplicity is corrected. Everything not named
+here is exploratory and is reported as such. This controls the multiple-comparison
+(forking-paths) risk: with 10 topologies x 4 contents x several regimes the design
+admits dozens of contrasts, and an unregistered analysis of that grid leaves any
+'significant' cell uninterpretable. One primary contrast, one designated
+sensitivity, two Holm-corrected secondary families, one slope test.
 
-INTEGRITY: `python scripts/prereg.py` prints the registration and its SHA256
-over the canonical JSON. Commit that hash (thesis appendix / README). Any later
-edit to the registered fields changes the hash; legitimate changes go through
+Integrity: `python scripts/prereg.py` prints the registration and its SHA256 over
+the canonical JSON. Commit that hash (thesis appendix / README). Any later edit to
+the registered fields changes the hash; legitimate changes go through
 REGISTRATION['amendments'] with a date and reason, never by silent edit.
 
 BUDGET ARITHMETIC (training runs, 15 seeds/arm; == sweep_all_hypotheses.sh after v1.1):
@@ -24,7 +24,7 @@ BUDGET ARITHMETIC (training runs, 15 seeds/arm; == sweep_all_hypotheses.sh after
   CORE ~ 435 (+ extended Bext/Dext 105). Only P1/P2/S1/S2 arms are binding; secondary
   arms may be trimmed (fewer seeds) via a dated amendment BEFORE unblinding, not after.
 
-CONSUMERS: scripts/comm_stats.py produces value_of_sharing dicts; h1_decision()
+Consumers: scripts/comm_stats.py produces value_of_sharing dicts; h1_decision()
 applies the registered decision rule to one. holm_family() wraps
 c1_stats.compare_many for the secondary families. h2_slope() computes the
 registered H2 statistic from per-rho dumps (eval_signal --dump-comm --dump-ar1).

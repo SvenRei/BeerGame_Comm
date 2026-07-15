@@ -1,59 +1,4 @@
-"""
-signal_agent.py
-================================================================================
-SIGNAL (Strategic Information-sharing for Game-theoretic, Networked, Adaptive
-Logistics) -- a deliberately MINIMAL communicating MAPPO agent for the value-of-
-information-sharing study. The agent is an INSTRUMENT, not the contribution: it
-is kept as simple as possible so that any measured effect of communication is
-attributable to the message channel, not to architectural cleverness.
 
-Three parts, and nothing else:
-  (1) BELIEF  : one small GRU per agent over its local-observation history. The
-                hidden state IS the demand-regime belief. Trained end-to-end by
-                the policy gradient -- no separate ELBO/KL/reconstruction.
-  (2) HEAD    : ONE linear layer over [obs, belief, message] (and, when use_dhat_head,
-                the smoothed demand estimate d_hat) -> an order-up-to level S. softplus is
-                only a positivity link. d_hat is appended because gradient descent alone
-                failed to learn the demand-dependence within budget; its head weight is
-                warm-started near the textbook (lead+1) protection-interval multiplier.
-                It remains a fully-learnable linear layer -- no frozen lead/safety/corr prior.
-  (3) MESSAGE : the semantic ladder {dhat | ip | dhat_ip | learned}, routed along
-                a topology with a one-step delay. This is the ONLY part we engineer
-                with care, because it is the object of study.
-                TRAINING OF THE LADDER (deliberate asymmetry, declared in the paper):
-                the NAMED rungs (dhat/ip/dhat_ip) have FIXED semantics -- their channel is
-                detached, and their content trains only through the sender's own objectives
-                (aux grounding, own S-head), which is what keeps d_hat an honest forecast.
-                The 'learned' rung is BY DEFINITION content optimized end-to-end for team
-                benefit, so its channel is DIFFERENTIABLE in the update (DIAL, Foerster et
-                al. 2016) -- see SIGNALTrainer._coupled_forward. Without that, msg_head/
-                msg_gain receive no gradient and the rung is a frozen random projection.
-Underneath: textbook CTDE-MAPPO (centralized per-agent critic on the global state
-during training, decentralized execution; PPO-clip; GAE). The economics layer
-(srdqn_beta cost-sharing + the coordinating transfer tau) rides on the reward in a
-few lines and is independent of the agent.
-
-DATA FLOW (one timestep t), per agent i in [retailer, wholesaler, distributor, manufacturer]:
-
-        local obs_i,t ----+
-        (4 scalars)       |
-                          v
-   incoming msg_i,t --> [ GRU ] --> belief h_i,t --+--> [ linear head ] --> S_i,t --> order_i,t = clip(S - IP)
-   (routed, 1-step delay)                          |
-                                                   +--> [ linear d-readout ] --> d_hat_i,t
-                                                                                   |
-                                          message m_i,t = ladder(d_hat, IP, learned) --> routed by ADJ (delay) --> incoming_*,t+1
-
-   TRAINING ONLY: global state s_t --> [ MLP critic ] --> V_i(s_t)  (baseline; not used at execution)
-   REWARD:        r_i,t = -(own_cost_i + beta*others_cost) - tau*backlog_i (+ credit to customer)   <-- economics layer
-
-Honest status: this file is SYNTAX-checked (py_compile) and ships a shape self-test
-(`python signal_agent.py`, needs torch but NO env). The self-test now ALSO asserts the
-'learned' channel receives gradient (msg_head/msg_gain move after one update -- the DIAL
-fix). Smoke-test against the real env before trusting numbers. Pre-DIAL 'learned'
-checkpoints were trained with a FROZEN random-projection channel and must be retrained.
-================================================================================
-"""
 import numpy as np
 import torch
 import torch.nn as nn
@@ -62,8 +7,10 @@ from torch.distributions import Normal
 
 AGENTS = ["retailer", "wholesaler", "distributor", "manufacturer"]
 
-# message dimensionality per content type ("learned" uses cfg.learned_msg_dim)
-_FIXED_MSG_DIMS = {"dhat": 1, "ip": 1, "dhat_ip": 2}
+# Message dimensionality per content type ("learned" uses cfg.learned_msg_dim).
+# "raw" = the sender's last realized incoming demand (obs slot 3): point-of-sale data sharing
+# (Cachon-Fisher 2000), the data counterpart to the "dhat" forecast rung (Aviv 2001/2007).
+_FIXED_MSG_DIMS = {"raw": 1, "dhat": 1, "ip": 1, "dhat_ip": 2}
 
 
 def msg_dim_of(content, learned_dim):
@@ -90,17 +37,15 @@ class SIGNALActor(nn.Module):
         self.msg_dim = msg_dim
         self.hidden = hidden
         self.use_dhat_head = bool(use_dhat_head)
-        # (1) BELIEF. Input = [local obs, received message] so communication can update the belief.
-        #     One GRU layer; its hidden state is the entire memory the agent has. No KL, no ELBO.
+        # (1) Belief: a single GRU over [local obs, received message]; its hidden state is the agent's
+        #     entire memory and demand-regime belief (trained end-to-end; no KL/ELBO objective).
         self.gru = nn.GRU(obs_dim + msg_dim, hidden)                 # (seq, batch, feat)
-        # (2) BASE-STOCK HEAD. ONE linear layer -> scalar S (softplus = positivity link only).
-        #     use_dhat_head appends the SMOOTHED, grounded demand estimate d_hat to the head input so S
-        #     can condition on the demand regime: S ~= dhat_coef*d_hat + safety (textbook (lead+1)*demand
-        #     + safety). Using d_hat -- not raw last_demand -- keeps Poisson noise OUT of S (no bullwhip).
-        #     This is the deliberate demand->S coupling (OFF by default): the sweep showed optimization
-        #     alone cannot make the constant base-stock adapt, and the retailer fails to scale S even
-        #     with perfect local demand. It also gives COMM a path to S: a received message updates the
-        #     belief h -> d_hat -> S, so sharing can change ordering (testable with topology/AR1).
+        # (2) Base-stock head: one linear layer -> scalar S (softplus is a positivity link only).
+        #     With use_dhat_head, the smoothed demand estimate d_hat is appended so S conditions on the
+        #     demand regime: S ~= dhat_coef*d_hat + safety (textbook (lead+1)*mean-demand + safety).
+        #     Using d_hat rather than the raw last demand keeps sampling noise out of S (no bullwhip).
+        #     This demand->S coupling also gives communication a path to ordering (message -> belief h ->
+        #     d_hat -> S); disabling it recovers a constant base-stock level.
         head_in = obs_dim + hidden + msg_dim + (1 if self.use_dhat_head else 0)
         self.head = nn.Linear(head_in, 1)
         nn.init.constant_(self.head.bias, float(s_init))            # safety floor / constant level
@@ -108,18 +53,16 @@ class SIGNALActor(nn.Module):
             with torch.no_grad():
                 self.head.weight[0, -1] = float(dhat_coef)         # weight on the appended d_hat ~ lead+1
         self.log_std = nn.Parameter(torch.zeros(1) + float(log_std_init))   # exploration noise on S (init std=exp(log_std_init))
-        # (3) DEMAND READOUT. Linear belief -> d_hat (>=0). The 'dhat' message, grounded to realized
-        #     demand by the aux loss, AND (if use_dhat_head) the driver of the base-stock above.
+        # (3) Demand readout: linear belief -> d_hat (>=0). Serves as the "dhat" message (grounded to
+        #     realized demand by the aux loss) and, if use_dhat_head, drives the base-stock head above.
         self.d_head = nn.Linear(hidden, 1)
         if dhat_init:                                               # start d_hat ~ mean demand (softplus link)
             nn.init.constant_(self.d_head.bias, float(dhat_init))
-        # (4) LEARNED message head: ONLY built for the interpretability-control rung. A learnable GAIN
-        #     lifts the tanh output (bounded [-1,1]) to the SAME O(10) natural-unit scale as the dhat/ip
-        #     messages, so the receiver can weight it comparably -- without it the learned rung is
-        #     scale-handicapped (the /100 bug, but for learned) and a null result would be uninterpretable
-        #     (deaf receiver vs redundant content). Init = learned_msg_gain; the optimizer can adjust it.
-        #     NOTE: these parameters are trained ONLY via the DIAL path in SIGNALTrainer.update()
-        #     (_coupled_forward); they appear in no other loss.
+        # (4) Learned message head: built only for the interpretability-control rung. A learnable gain
+        #     lifts the tanh output ([-1,1]) to the O(10) natural-unit scale of the dhat/ip messages so
+        #     the receiver can weight it comparably; without it the learned rung is scale-handicapped and
+        #     a null result would be ambiguous (deaf receiver vs. redundant content). These parameters
+        #     train only via the DIAL path in SIGNALTrainer.update() (_coupled_forward).
         self.msg_head = (nn.Linear(obs_dim + hidden, learned_msg_dim)
                          if content == "learned" else None)
         self.msg_gain = (nn.Parameter(torch.tensor(float(learned_msg_gain)))
@@ -138,19 +81,24 @@ class SIGNALActor(nn.Module):
         return S_mu, self.log_std.exp().clamp(1e-2, 3.0)
 
     def message(self, obs, h):
-        """The semantic ladder. Each rung is a NAMED supply-chain signal except 'learned'.
-        SCALE: the named messages ride at NATURAL units (demand/inventory, ~O(10)) so they are
-        COMMENSURATE with the raw-unit observations they sit beside in the receiver's GRU input and
-        base-stock head. An earlier /100 scaling made the message ~100x smaller than obs, so the
-        receiver could not give it usable weight -- the positive-listening probe read dS/dmsg ~ 0
-        (honest messages, but the agent was deaf). See eval_signal.positive_listening + _MSG_SCALE."""
+        """Semantic message ladder; every rung is a named supply-chain signal except "learned".
+        The named messages ride at natural units (demand/inventory, ~O(10)) so they are commensurate
+        with the raw-unit observations beside them in the receiver's GRU input and base-stock head.
+        Scaling the message far below obs magnitude leaves the receiver unable to weight it (positive-
+        listening dS/dmsg ~ 0 despite honest messages); see eval_signal.positive_listening."""
         IP = (obs[..., 0:1] - obs[..., 1:2] + obs[..., 2:3])              # inventory-position signal (VMI), natural units
         dh = self.demand_estimate(h)                                     # demand signal (Lee), natural units
+        # "raw" = the sender's last realized incoming demand (obs slot 3): unprocessed point-of-sale
+        # data (Cachon-Fisher 2000). A parameter-free obs readout, honest by construction, at natural
+        # units (like "ip"). Emitted at step t it carries d_{t-1}, so the honesty probe's same-step
+        # correlation is <1 from one-step alignment, not misreporting. Registered contrast: dhat vs raw
+        # = forecast vs data.
+        if self.content == "raw":      return obs[..., 3:4]
         if self.content == "dhat":     return dh
         if self.content == "ip":       return IP
         if self.content == "dhat_ip":  return torch.cat([dh, IP], dim=-1)
-        # 'learned' = gain * tanh(...) so its bounded code rides at the SAME O(10) scale as dhat/ip and is
-        # audible to the receiver (see msg_gain). tanh keeps it bounded; the gain restores the magnitude.
+        # "learned" = gain * tanh(...): a bounded code rescaled to the O(10) scale of dhat/ip so it is
+        # audible to the receiver (see msg_gain). tanh bounds it; the gain restores the magnitude.
         if self.content == "learned":  return self.msg_gain * torch.tanh(self.msg_head(torch.cat([obs, h], dim=-1)))
         raise ValueError(self.content)
 
@@ -200,9 +148,9 @@ class SIGNALTrainer:
         self.ent_coef = float(cfg.get("entropy_coef", 0.0)); self.vf_coef = float(cfg.get("vf_coef", 0.5))
         self.aux_coef = float(cfg.get("aux_coef", 0.1))           # d_hat grounding (message interpretability)
         self.max_grad_norm = float(cfg.get("max_grad_norm", 0.5))
-        # reward_scale DIVIDES the shaped reward -> shrinks the critic's target/loss/gradient so it no
-        # longer dominates the shared grad-clip and starve the (standardized-advantage) actor. The gate
-        # still scores RAW env cost, so it stays comparable across reward_scale values. 1.0 = unchanged.
+        # reward_scale divides the shaped reward, shrinking the critic's target/loss/gradient so it no
+        # longer dominates the shared gradient clip and starves the (standardized-advantage) actor. The
+        # gate scores raw env cost, so results stay comparable across reward_scale values (1.0 = off).
         self.reward_scale = float(cfg.get("reward_scale", 1.0))
         self.params = list(self.actors.parameters()) + list(self.critic.parameters())
         self.opt = torch.optim.Adam(self.params, lr=float(cfg.get("lr", 3e-4)))
@@ -211,26 +159,37 @@ class SIGNALTrainer:
         tau = float(cfg.get("tau", 0.0))                          # coordinating transfer (0=no contract)
         self.tau_vec = torch.tensor([0.0] + [tau] * (n_agents - 1),
                                     device=self.device).view(1, -1)  # charged on UPSTREAM backorders only
+        # --- Pure-observation logging sinks (see agents/signal_csvlog.py) ---------------------------
+        # None unless train_signal runs with SIGNAL_CSVLOG=1, which sets them before update()/collect()
+        # and reads them after. Every write below is guarded by `is not None` and only reads tensors
+        # already computed here (detached, under no_grad): no random draw, no reordering, no change to
+        # any registered number (loss, gradient, Adam step, checkpoint, RNG stream). Unset => this class
+        # is byte-identical to the frozen instrument.
+        self.upd_obs = None       # dict : per-update PPO diagnostics (approx_kl, clip_frac, grad_norm, ...)
+        self.roll_obs = None      # list : per-collect rollout tensors (emitted msg, d_hat, belief h)
 
     # ---------------------------------------------------------------- rollout
     @torch.no_grad()
     def collect(self, env, seed, deterministic=False):
-        """Roll ONE episode. Messages are stored as RECEIVED and DETACHED. In the update they are
-        fixed extended observations for the NAMED contents (plain MAPPO -- a clean, defensible
-        default that keeps d_hat/ip semantics grounded). For content='learned' the update IGNORES
-        the stored messages and recomputes them IN-GRAPH (_coupled_forward), so the channel trains
-        (DIAL). The rollout itself is identical either way: deterministic messages, one-step delay."""
+        """Roll one episode. Messages are stored as received and detached: in the update they are
+        fixed extended observations for the named contents (plain MAPPO, which keeps d_hat/ip semantics
+        grounded). For content="learned" the update ignores the stored messages and recomputes them
+        in-graph (_coupled_forward) so the channel trains (DIAL). The rollout is identical either way:
+        deterministic messages with a one-step delay."""
         dev = self.device
         obs, _ = env.reset(seed=seed)
         h = [torch.zeros(1, 1, self.actors[i].hidden, device=dev) for i in range(self.N)]
         m_prev = torch.zeros(self.N, self.msg_dim, device=dev)
         O, MIN, GS, SA, LP, C, DT, DN = ([] for _ in range(8))
+        R_MSG, R_DHAT, R_H = ([], [], []) if self.roll_obs is not None else (None, None, None)  # obs-only sink
         while True:
             o = torch.tensor(np.stack([obs[a] for a in AGENTS]), dtype=torch.float32, device=dev)  # [N,obs]
             incoming = self.adj @ m_prev                                       # [N,msg] (delivered next step)
             S = torch.zeros(self.N, 1, device=dev)
             logp = torch.zeros(self.N, device=dev)
             m_out = torch.zeros(self.N, self.msg_dim, device=dev)
+            _h_step = [] if self.roll_obs is not None else None
+            _d_step = [] if self.roll_obs is not None else None
             for i in range(self.N):
                 h_seq, h[i] = self.actors[i].belief(o[i].view(1, 1, -1), incoming[i].view(1, 1, -1), h[i])
                 hi = h_seq[-1]                                                 # [1,hidden]
@@ -239,6 +198,13 @@ class SIGNALTrainer:
                 logp[i] = Normal(S_mu, S_std).log_prob(Si).sum()
                 S[i] = Si
                 m_out[i] = self.actors[i].message(o[i:i + 1], hi).reshape(-1)
+                if self.roll_obs is not None:                                 # read-only: forecast + belief on hand
+                    _h_step.append(hi.reshape(-1))
+                    _d_step.append(self.actors[i].demand_estimate(hi).reshape(-1))
+            if self.roll_obs is not None:
+                R_MSG.append(m_out.detach().clone())                          # [N,msg] emitted this step
+                R_H.append(torch.stack(_h_step))                             # [N,hidden] belief that fed the head
+                R_DHAT.append(torch.cat(_d_step))                            # [N] demand estimate
             order, _ = order_from_S(S, o, self.max_order)
             frac = (order / self.max_order).clamp(0.0, 1.0)
             gstate = torch.tensor(env.get_global_state(), dtype=torch.float32, device=dev).view(-1)
@@ -254,16 +220,20 @@ class SIGNALTrainer:
             obs = nobs
             if done:
                 break
+        if self.roll_obs is not None:                                          # one record per collect() call
+            self.roll_obs.append({"msg_out": torch.stack(R_MSG).cpu().numpy(),   # [T,N,msg]
+                                  "dhat":    torch.stack(R_DHAT).cpu().numpy(),   # [T,N]
+                                  "h":       torch.stack(R_H).cpu().numpy()})     # [T,N,hidden]
         return dict(obs=torch.stack(O), msg_in=torch.stack(MIN), gstate=torch.stack(GS),
                     S=torch.stack(SA), logp=torch.stack(LP), cost=torch.stack(C),
                     dtgt=torch.stack(DT), done=torch.stack(DN))                # all [T, N, *] or [T,*]
 
     # ------------------------------------------------------------------- GAE
     def _gae(self, rew, V, done):
-        # NOTE (truncation vs termination): episodes end by TIME-LIMIT truncation (the env's
-        # terminations are always False), but `done` marks the final step, so the last step is treated
-        # as terminal -- no value bootstrap from V(s_T). At the fixed horizon this is a small CONSTANT
-        # bias; bootstrap the truncated tail if you ever vary the horizon or need the absolute return scale.
+        # Truncation vs termination: episodes end by time-limit truncation (env terminations are always
+        # False), but `done` marks the final step, so the last step is treated as terminal with no value
+        # bootstrap from V(s_T). At a fixed horizon this is a small constant bias; bootstrap the
+        # truncated tail if the horizon varies or the absolute return scale is needed.
         T = rew.size(0); adv = torch.zeros_like(rew); last = torch.zeros((), device=rew.device)
         for t in reversed(range(T)):
             nonterm = 1.0 - done[t]
@@ -275,30 +245,24 @@ class SIGNALTrainer:
 
     # ------------------------------------------- DIAL forward (learned rung ONLY)
     def _coupled_forward(self, obs_seq):
-        """Joint IN-GRAPH forward of all agents, coupled through ADJ with the SAME one-step message
+        """Joint in-graph forward of all agents, coupled through ADJ with the same one-step message
         delay as collect(): incoming_t = ADJ @ msg_{t-1}, msg_t = f_i(obs_t, h_t). Used by update()
-        ONLY when content='learned', so gradients flow  receiver-loss -> incoming -> ADJ -> sender
-        msg_gain / msg_head / GRU  (DIAL; Foerster et al. 2016) and the channel actually TRAINS.
+        only when content="learned", so gradients flow receiver-loss -> incoming -> ADJ -> sender
+        (msg_gain / msg_head / GRU); this is DIAL (Foerster et al. 2016) and is what trains the channel.
+        Without it the learned message is detached at collect time and never re-enters a loss, so its
+        parameters stay at initialization (a frozen random projection) and the learned rung is vacuous.
 
-        [FIX: previously the learned message was collected DETACHED and never re-entered any loss,
-        so msg_head/msg_gain received no gradient and stayed at initialization forever -- a frozen
-        random projection. The H5 'unconstrained learned channel' rung was therefore vacuous.
-        Pre-fix 'learned' checkpoints must be retrained.]
+        This does not change PPO's semantics: with the one-step delay the four actors plus channel form
+        one joint recurrent policy whose messages are cross-agent hidden state, recomputed across the
+        k_epochs exactly as recurrent PPO recomputes h. At epoch 1 the recomputed messages equal the
+        stored rollout messages (same parameters, deterministic channel); later epochs drift as h does.
 
-        FRAMING (why this does not change PPO's semantics): with the one-step delay, the four actors
-        + channel are ONE joint recurrent policy; the messages are cross-agent hidden state.
-        Recomputing them across the k_epochs is exactly what recurrent PPO already does with h --
-        at epoch 1 the recomputed messages equal the stored rollout messages bit-for-bit (same
-        parameters, deterministic channel), and later epochs drift the same way h drifts.
+        The named rungs are excluded deliberately: dhat must stay a demand forecast grounded by the aux
+        loss (a team gradient through the channel would co-opt it and void the honesty probe), and ip/raw
+        are parameter-free obs readouts with nothing to train.
 
-        WHY the NAMED rungs are excluded: dhat must remain a demand forecast grounded by the aux
-        loss -- a team-gradient through the channel would co-opt it into an arbitrary control signal
-        and void the honesty probe's premise; ip is a parameter-free obs readout with nothing to
-        train. Detaching the named channels is therefore load-bearing, not a shortcut.
-
-        COST: stepwise T*N single-step GRU calls instead of fused per-agent sequences (~0.3-0.5 s
-        per update at T=50, N=4, hidden=64 on CPU) -- learned arm only; named arms keep the fast
-        path byte-identical.
+        Cost: T*N single-step GRU calls instead of fused per-agent sequences (~0.3-0.5 s per update at
+        T=50, N=4, hidden=64 on CPU), for the learned arm only; named arms keep the fast path.
 
         obs_seq [T,N,obs] -> (h_all [T,N,hidden], msg_in_live [T,N,msg])."""
         T = obs_seq.size(0)
@@ -343,10 +307,16 @@ class SIGNALTrainer:
             a_mu, a_sd = all_adv.mean(0), all_adv.std(0) + 1e-8
             for d in episodes:
                 d["adv"] = (d["adv"] - a_mu) / a_sd
-        # (C) PPO-clip actor + MSE critic, re-running the GRU over stored sequences (BPTT). ---------
-        #     For content='learned' the MESSAGES are also recomputed in-graph via _coupled_forward
-        #     (DIAL), so the channel is trainable. Named contents keep the stored, DETACHED messages
-        #     (fixed semantics; grounded content). Same PPO surrogate either way.
+            if self.upd_obs is not None:          # OBSERVATION: critic fit at update time (read-only)
+                V_all = torch.cat([d["V"].reshape(-1) for d in episodes])
+                vt_all = torch.cat([d["vtarget"].reshape(-1) for d in episodes])
+                var_t = float(vt_all.var(unbiased=False))
+                self.upd_obs["explained_variance"] = (
+                    1.0 - float((vt_all - V_all).var(unbiased=False)) / var_t) if var_t > 1e-12 else float("nan")
+        # (C) PPO-clip actor + MSE critic, re-running the GRU over stored sequences (BPTT). For
+        #     content="learned" the messages are also recomputed in-graph via _coupled_forward (DIAL),
+        #     making the channel trainable; named contents keep the stored, detached messages (fixed,
+        #     grounded semantics). Same PPO surrogate either way.
         a_loss = c_loss = 0.0
         for _ in range(self.k_epochs):
             self.opt.zero_grad()
@@ -375,39 +345,69 @@ class SIGNALTrainer:
                     surr = torch.min(ratio * A, torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * A)
                     ent = Normal(S_mu, S_std).entropy().mean()
                     ploss = ploss - surr.mean() - self.ent_coef * ent
-                    # d_hat grounding: keeps the demand message INTERPRETABLE as a forecast (light)
+                    # d_hat grounding: keeps the demand message interpretable as a forecast (light aux loss)
                     dhat = self.actors[i].demand_estimate(h)                            # [T,1]
-                    ploss = ploss + self.aux_coef * F.mse_loss(dhat, d["dtgt"][:, i].unsqueeze(-1))
+                    aux = F.mse_loss(dhat, d["dtgt"][:, i].unsqueeze(-1))               # (named for observation only)
+                    ploss = ploss + self.aux_coef * aux
+                    if self.upd_obs is not None:   # OBSERVATION: PPO trust-region health (read-only)
+                        with torch.no_grad():
+                            ob = self.upd_obs
+                            ob.setdefault("approx_kl", []).append(float((d["logp"][:, i] - logp_new).mean()))
+                            ob.setdefault("clip_frac", []).append(
+                                float((torch.abs(ratio - 1.0) > self.eps).float().mean()))
+                            ob.setdefault("entropy", []).append(float(ent))
+                            ob.setdefault("aux_loss", []).append(float(aux))
+                            ob.setdefault("S_mean", []).append(float(S_mu.mean()))
+                            ob.setdefault("action_std", []).append(float(S_std.mean()))
                 total = total + (ploss + self.vf_coef * closs) / len(episodes)
                 a_loss += float(ploss.item()); c_loss += float(closs.item())
             total.backward()
-            nn.utils.clip_grad_norm_(self.params, self.max_grad_norm)
+            gnorm = nn.utils.clip_grad_norm_(self.params, self.max_grad_norm)   # RETURNS the pre-clip norm
+            if self.upd_obs is not None:          # OBSERVATION: dead-gradient signature (read-only)
+                self.upd_obs.setdefault("grad_norm", []).append(float(gnorm))
             self.opt.step()
         k = max(1, self.k_epochs * len(episodes))
         return a_loss / k, c_loss / k
 
 
 # ============================================================================ #
-# Shape self-test (run: `python signal_agent.py`). Needs torch, NOT the env.     #
-# Now also asserts the DIAL fix: for content='learned', msg_head/msg_gain MOVE   #
-# after one update (they receive gradient through the coupled in-graph channel). #
+# Shape self-test (run: `python signal_agent.py`). Needs torch, not the env.     #
+# Also asserts DIAL: for content="learned", msg_head/msg_gain move after one      #
+# update (they receive gradient through the coupled in-graph channel).            #
 # ============================================================================ #
 if __name__ == "__main__":
     torch.manual_seed(0)
     OBS, N, H, T = 4, 4, 64, 20
-    for content in ["dhat", "ip", "dhat_ip", "learned"]:
+    for content in ["raw", "dhat", "ip", "dhat_ip", "learned"]:
         md = msg_dim_of(content, 3)
         STATE = OBS * N
         cfg = {"msg_content": content, "hidden": H, "learned_msg_dim": 3,
                "srdqn_beta": 0.0, "tau": 9.5, "k_epochs": 2}
         adj = np.array([[0, 1, 0, 0], [.5, 0, .5, 0], [0, .5, 0, .5], [0, 0, 1, 0]], float)
         tr = SIGNALTrainer(cfg, N, OBS, STATE, adj, device="cpu")
-        # fabricate a buffer with the exact shapes collect() produces, then run an update
+        # Fabricate a buffer with the exact shapes collect() produces, then run an update. S and logp
+        # must come from the actual policy: fully fabricated values make the PPO ratio underflow to 0
+        # (stored S ~ U(0,40) vs S_mu ~ 50 at std ~ 0.6 -> logp_new ~ -1e3 -> exp() == 0), so the
+        # surrogate carries no gradient and a dead policy-gradient path would go undetected.
         ep = {"obs": torch.rand(T, N, OBS) * 20, "msg_in": torch.rand(T, N, md),
-              "gstate": torch.rand(T, STATE) * 20, "S": torch.rand(T, N, 1) * 40,
-              "logp": torch.randn(T, N), "cost": torch.rand(T, N) * 50,
+              "gstate": torch.rand(T, STATE) * 20, "cost": torch.rand(T, N) * 50,
               "dtgt": torch.rand(T, N) * 20, "done": torch.zeros(T)}
         ep["done"][-1] = 1.0
+        with torch.no_grad():
+            Ss, LPs = [], []
+            for i in range(N):
+                h_seq, _ = tr.actors[i].belief(ep["obs"][:, i, :].unsqueeze(1),
+                                               ep["msg_in"][:, i, :].unsqueeze(1))
+                mu, sd = tr.actors[i].base_stock(ep["obs"][:, i, :], h_seq.squeeze(1),
+                                                 ep["msg_in"][:, i, :])
+                Si = Normal(mu, sd).sample()
+                Ss.append(Si)
+                LPs.append(Normal(mu, sd).log_prob(Si).sum(-1))
+            ep["S"] = torch.stack(Ss, dim=1)                  # [T,N,1] true old actions
+            ep["logp"] = torch.stack(LPs, dim=1)              # [T,N]   true old log-probs -> ratio ~ 1 at epoch 1
+        # PPO-path assertion: with true old log-probs the surrogate gradient is nonzero, so the
+        # base-stock head must move after an update; a frozen head signals a dead policy-gradient path.
+        pre_head = tr.actors[0].head.weight.detach().clone()
         # DIAL gradient-flow assertion: snapshot the learned channel's params before the update.
         pre_w = pre_g = None
         if content == "learned":
@@ -419,6 +419,8 @@ if __name__ == "__main__":
         else:
             assert tr.actors[0].msg_head is None and tr.actors[0].msg_gain is None
         a, c = tr.update([ep, dict(ep)])
+        d_head = float((tr.actors[0].head.weight.detach() - pre_head).abs().max())
+        assert d_head > 1e-9, f"policy-gradient path DEAD: base-stock head unchanged (dW={d_head:.2e})"
         dial_note = ""
         if content == "learned":
             dw = float((tr.actors[0].msg_head.weight.detach() - pre_w).abs().max())
@@ -429,11 +431,15 @@ if __name__ == "__main__":
         # exercise a single-agent forward at one step
         h0 = torch.zeros(1, 1, H)
         hs, _ = tr.actors[0].belief(torch.rand(1, 1, OBS), torch.rand(1, 1, md), h0)
-        Smu, Ssd = tr.actors[0].base_stock(torch.rand(1, OBS), hs[-1], torch.rand(1, md))
-        m = tr.actors[0].message(torch.rand(1, OBS), hs[-1])
+        o1 = torch.rand(1, OBS) * 20
+        Smu, Ssd = tr.actors[0].base_stock(o1, hs[-1], torch.rand(1, md))
+        m = tr.actors[0].message(o1, hs[-1])
         assert Smu.shape == (1, 1) and m.shape[-1] == md
+        if content == "raw":                      # semantic check: raw IS the last realized incoming
+            assert torch.allclose(m, o1[..., 3:4]), "raw message must equal obs[..., 3:4] verbatim"
         n_params = sum(p.numel() for p in tr.params)
         print(f"  content={content:<8} msg_dim={md}  params={n_params:>7,}  "
-              f"a_loss={a:+.3f} c_loss={c:+.3f}  S={float(Smu):.1f}  msg_dim_out={m.shape[-1]}  OK{dial_note}")
-    print("signal_agent shape self-test PASS (all four message rungs build, update, and act;")
+              f"a_loss={a:+.3f} c_loss={c:+.3f}  S={float(Smu.detach()):.1f}  msg_dim_out={m.shape[-1]}  OK{dial_note}")
+    print("signal_agent shape self-test PASS (all FIVE message rungs build, update, and act;")
+    print("                                  policy-gradient path verified LIVE (head moves);")
     print("                                  'learned' channel verified TRAINABLE via DIAL)")

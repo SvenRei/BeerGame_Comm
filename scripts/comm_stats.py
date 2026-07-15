@@ -1,20 +1,20 @@
 """
-comm_stats.py -- cross-seed VALUE-OF-SHARING aggregator for the SIGNAL study.
+comm_stats.py -- cross-seed value-of-sharing aggregator for the SIGNAL study.
 
-Turns the H1 communication result from a point estimate into a defended claim. The unit of
-analysis is the INDEPENDENT TRAINING SEED: one comm arm and one no-comm arm trained at the same
-seed, each scored deterministically per-lambda on the EVAL seeds (CRN), then CRN-PAIRED by seed.
+Elevates the H1 communication result from a point estimate to a defended claim. The unit of
+analysis is the independent training seed: one comm arm and one no-comm arm trained at the same
+seed, each scored deterministically per-lambda on the eval seeds (CRN), then CRN-paired by seed.
 
 INPUT (produced by `python agents/eval_signal.py --dump-comm DIR`, one DIR per arm):
   DIR/seed{S}.json        {lambda(float): mean_cost(float)}                 # the arm's cost vector
   DIR/seed{S}_ferr.json   {lambda(float): {echelon: upstream_forecast_err}} # the Lee mechanism
 
-WHAT IT REPORTS:
+REPORTS:
   * V_cost(seed) = mean_lambda(no_comm[seed]) - mean_lambda(comm[seed])   (+ => communication is
-    cheaper => comm has value). Mean V_cost + bootstrap CI, paired Wilcoxon/sign test, and a TOST
-    EQUIVALENCE test against a +/-band (the H1 NULL: is comm value within a negligible band?).
-  * per-echelon FORECAST-ERROR DELTA = ferr(no_comm) - ferr(comm), upstream echelons (the
-    mechanism: comm should cut UPSTREAM forecast error -- Lee-So-Tang see-through-bullwhip).
+    cheaper => sharing has value). Mean V_cost with bootstrap CI, paired Wilcoxon/sign test, and a
+    TOST equivalence test against a +/-band (the H1 null: is comm value within a negligible band?).
+  * per-echelon forecast-error delta = ferr(no_comm) - ferr(comm), upstream echelons (the
+    mechanism: sharing should cut upstream forecast error -- Lee-So-Tang 2000).
 
 Reuses the inference primitives in scripts.c1_stats (bootstrap_ci / paired / tost), so the math is
 shared with the C1 report.
@@ -134,19 +134,19 @@ def _paired_diffs(comm, nocomm, lambdas=None):
 # Substitution curve: V(training budget)  (Tier-1 attachment; exploratory-registered)
 # ==============================================================================
 def substitution_curve(budget_dirs, lambdas=None, n_boot=10000):
-    """V as a function of TRAINING BUDGET, from the budget-milestone checkpoints train_signal now
-    writes (signal_checkpoint_budget{N}.pt) dumped per budget into paired dirs.
+    """V as a function of training budget, from the budget-milestone checkpoints train_signal
+    writes (signal_checkpoint_budget{N}.pt), dumped per budget into paired dirs.
 
     budget_dirs : {budget_episodes(int) -> (comm_dir, nocomm_dir)}   (same seed set per budget)
 
-    THE CLAIM THIS FEEDS: inference capacity and information sharing are SUBSTITUTES -- the
-    classical redundancy null (Raghunathan 2001) is the infinite-inference limit. Prediction
-    under substitution: V(budget) DECLINES as the no-comm agent's learned inference improves.
-    The opposite sign (V rises with budget: exploiting a channel itself must be learned) is a
-    complementarity finding -- equally reportable; the curve decides.
+    Claim this feeds: inference capacity and information sharing are substitutes -- the classical
+    redundancy null (Raghunathan 2001) is the infinite-inference limit. Under substitution,
+    V(budget) declines as the no-comm agent's learned inference improves; the opposite sign
+    (V rises with budget: exploiting a channel must itself be learned) is a complementarity
+    finding, equally reportable. The curve decides.
 
     Statistic (exploratory-registered): per-seed OLS slope of V_s over log2(budget) across seeds
-    with ALL budgets present + tie-naive per-seed Spearman; bootstrap-t CI over seeds."""
+    with all budgets present, plus a tie-naive per-seed Spearman; bootstrap-t CI over seeds."""
     budgets = sorted(int(b) for b in budget_dirs)
     per_seed, rows = {}, []
     for b in budgets:
@@ -230,14 +230,14 @@ def load_iv_dir(d):
 
 
 def interventions_summary(iv, n_boot=10000, ci=0.95):
-    """Cross-SEED aggregation of the per-checkpoint message-intervention probe. The per-seed
-    dumps carry episode-mean costs under do(m): honest / shuffled / cross / zeroed. Here the SEED
-    is the unit (episodes inside a checkpoint are the instrument's Monte Carlo, not replication):
-    per seed s, d_x(s) = cost_x(s) - cost_honest(s); report mean d_x, bootstrap CI (auto ->
-    studentized bootstrap-t for the seed mean), Wilcoxon; content_share = ratio of MEAN deltas
+    """Cross-seed aggregation of the per-checkpoint message-intervention probe. The per-seed dumps
+    carry episode-mean costs under do(m): honest / shuffled / cross / zeroed. The seed is the unit
+    (episodes inside a checkpoint are the instrument's Monte Carlo, not replication): per seed s,
+    d_x(s) = cost_x(s) - cost_honest(s); report mean d_x, bootstrap CI (auto -> studentized
+    bootstrap-t for the seed mean), Wilcoxon; content_share = ratio of mean deltas
     d_shuffled/d_zeroed (pooled, robust to near-zero per-seed denominators).
-    REGISTERED GATE (prereg content_attribution_rule): a positive V is attributed to message
-    CONTENT only if the cross-seed d_shuffled CI excludes 0 from below (shuffling hurts)."""
+    Registered gate (prereg content_attribution_rule): a positive V is attributed to message
+    content only if the cross-seed d_shuffled CI excludes 0 from below (shuffling hurts)."""
     seeds = sorted(iv)
     if not seeds:
         raise ValueError("no seed*_iv.json found")
