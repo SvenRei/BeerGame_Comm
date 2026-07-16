@@ -254,7 +254,22 @@ REGISTRATION = {
          "content-attribution rule added",
          "reason": "reconcile registration with sweep_all_hypotheses.sh before launch; statistics "
          "calibration; Tier-1/Tier-2 scope additions"},
+         {"date": "2026-07-16", "version": "v1.2",
+         "change": "C3 interpretability bound: contrast arms corrected to retailer_broadcast "
+                   "(both learned and dhat_ip), matching executed sweep Phase C; v1.1 said upstream_only.",
+         "reason": "wording/executed-design reconciliation; no data observed"},
+        {"date": "2026-07-16", "version": "v1.2",
+         "change": "S3 lead-time axis registered on a FIXED-lead grid (e.g. ship_lead in {2,3,4,5}); "
+                   "*_lead_time_range scenarios are unpaired-exploratory only.",
+         "reason": "action-gated RNG under lead ranges breaks CRN pairing (verified); "
+                   "fixed leads preserve exact pairing; no data observed"},
+        {"date": "2026-07-16", "version": "v1.2",
+         "change": "Pre-launch instrument fixes applied and verified before any run: raw message rung; "
+                   "budget_milestones key registration; milestone state_dict cloning; sweep sentinel "
+                   "resume; pure-observation CSV logger (flag-off byte-identical).",
+         "reason": "instrument correctness; no data observed"},
     ],
+    
 }
 
 
