@@ -217,12 +217,18 @@ def _selftest():
     assert "gap_mean" in out["c1"] and out["n_seeds"] == 3
     assert "SIGNAL" in out["bullwhip"] and "static-BAR" in out["bullwhip"] and "Bayes-floor" in out["bullwhip"]
     assert any("seeds <" in w for w in out["warnings"])      # the >=10 prereg warning fired
-    # comm self-test: two arms (no-comm dir + a cheaper "full" dir)
+    # comm self-test: two arms (no-comm dir + a cheaper "full" dir). The dirs carry the _ferr and
+    # _censor siblings that eval_signal.py --dump-comm actually writes next to each cost file --
+    # a cost-only fixture here is what let the 2026-07-17 loader bug reach a live campaign.
     cdir0 = os.path.join(tmp, "c2_nocomm"); cdir1 = os.path.join(tmp, "c2_full")
     os.makedirs(cdir0, exist_ok=True); os.makedirs(cdir1, exist_ok=True)
     for s in range(10, 15):
-        json.dump({"8.0": 3000.0 + rng.normal(0, 20)}, open(os.path.join(cdir0, f"seed{s}.json"), "w"))
-        json.dump({"8.0": 3005.0 + rng.normal(0, 20)}, open(os.path.join(cdir1, f"seed{s}.json"), "w"))
+        for cdir, base in ((cdir0, 3000.0), (cdir1, 3005.0)):
+            json.dump({"8.0": base + rng.normal(0, 20)}, open(os.path.join(cdir, f"seed{s}.json"), "w"))
+            json.dump({"8.0": {a: 1.0 + i for i, a in enumerate(AGENTS)}},
+                      open(os.path.join(cdir, f"seed{s}_ferr.json"), "w"))
+            json.dump({"8.0": {a: 0.1 * i for i, a in enumerate(AGENTS)}},
+                      open(os.path.join(cdir, f"seed{s}_censor.json"), "w"))
     comm = comm_analysis([cdir0, cdir1])
     assert "c2_full" in comm["topologies"] and comm["topologies"]["c2_full"]["n"] == 5
     print("\nrun_confirmatory_report self-test PASS")

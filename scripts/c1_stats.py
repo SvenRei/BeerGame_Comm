@@ -35,6 +35,7 @@ Run:
                                     --refs results/baselines_regime_v2.json
 """
 import os
+import re
 import sys
 import json
 import glob
@@ -404,20 +405,24 @@ def print_report(rep):
     print("   x=rep['performance_profile']['tau'], y=fraction of seeds with score>=tau.)")
 
 
+_COST_FILE_RE = re.compile(r"seed(\d+)\.json\Z")
+
+
 def load_signal_dir(signal_dir):
-    """Load results/signal_c1/seed{S}.json files -> {seed: {lambda: cost}}. Skips the sibling
-    seed{S}_bw.json bullwhip dumps (read separately by run_confirmatory_report)."""
+    """Load results/signal_c1/seed{S}.json files -> {seed: {lambda: cost}}.
+
+    Matches the cost-file name exactly; any seed{S}_*.json sibling dump (_bw bullwhip, _ferr
+    forecast error, _censor, _iv intervention -- see eval_signal.py --dump-*) is not a cost file
+    and is read by its own loader. Match-what-we-want rather than skip-a-list-of-siblings: the
+    dump producers grow independently of this loader, and a skip-list silently turns each new
+    sibling into a parse of the wrong file."""
     out = {}
     for p in sorted(glob.glob(os.path.join(signal_dir, "seed*.json"))):
-        if p.endswith("_bw.json"):
-            continue
-        base = os.path.basename(p)
-        try:
-            s = int("".join(ch for ch in base.split("seed")[1] if ch.isdigit()))
-        except (IndexError, ValueError):
+        m = _COST_FILE_RE.fullmatch(os.path.basename(p))
+        if not m:
             continue
         with open(p) as f:
-            out[s] = {float(k): float(v) for k, v in json.load(f).items()}
+            out[int(m.group(1))] = {float(k): float(v) for k, v in json.load(f).items()}
     return out
 
 
@@ -508,6 +513,24 @@ def _selftest():
     neq = tost(rng2.normal(5.0, 0.2, size=30), -1.0, 1.0)
     assert eq["equivalent"] is True and neq["equivalent"] is False, (eq, neq)
     print("  G) TOST equivalence test  PASS")
+
+    # H) load_signal_dir reads ONLY cost files, never a seed{S}_*.json sibling dump. Regression:
+    #    the pre-2026-07-17 loader skipped _bw only, so --dump-comm's _ferr/_censor siblings were
+    #    scraped as costs and float(dict) raised. Asserted against a dir holding every sibling
+    #    any eval_signal.py --dump-* writes, plus an unknown one standing in for the next.
+    import tempfile
+    d = tempfile.mkdtemp()
+    for s in (2, 10):
+        json.dump({"6.0": 3000.0 + s}, open(os.path.join(d, f"seed{s}.json"), "w"))
+        for sib, payload in (("_bw", {"6.0": {"0": 1.1}}), ("_ferr", {"6.0": {"0": 2.2}}),
+                             ("_censor", {"6.0": {"0": 3.3}}), ("_iv", {"honest": {"x": 1}}),
+                             ("_future", {"nested": {"x": 1}})):
+            json.dump(payload, open(os.path.join(d, f"seed{s}{sib}.json"), "w"))
+    loaded = load_signal_dir(d)
+    assert sorted(loaded) == [2, 10], sorted(loaded)          # siblings excluded, not mis-scraped
+    assert loaded[10] == {6.0: 3010.0}, loaded[10]            # and seed10 is seed 10's cost vector
+    print("  H) load_signal_dir excludes sibling dumps (_bw/_ferr/_censor/_iv/unknown)  PASS")
+
     print("\nc1_stats self-test PASS")
 
 
