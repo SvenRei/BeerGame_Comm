@@ -1,4 +1,3 @@
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,7 +9,12 @@ AGENTS = ["retailer", "wholesaler", "distributor", "manufacturer"]
 # Message dimensionality per content type ("learned" uses cfg.learned_msg_dim).
 # "raw" = the sender's last realized incoming demand (obs slot 3): point-of-sale data sharing
 # (Cachon-Fisher 2000), the data counterpart to the "dhat" forecast rung (Aviv 2001/2007).
-_FIXED_MSG_DIMS = {"raw": 1, "dhat": 1, "ip": 1, "dhat_ip": 2}
+_FIXED_MSG_DIMS = {"raw": 1, "dhat": 1, "ip": 1, "dhat_ip": 2,
+                   "eps": 1, "raw_lag1": 1, "raw_lag2": 1,               # v1.3 content rungs
+                   "condmean": 1, "true_lambda": 1, "oracle": 1}         # benchmarks ("oracle" =
+                   # DEPRECATED alias kept frozen for the 18/18 proof suite; condmean = correctly
+                   # specified AR(1) conditional-mean BENCHMARK (never an upper bound; ignores lam);
+                   # true_lambda = perfect regime-DISCLOSURE benchmark (requires the DP lam context).
 
 
 def msg_dim_of(content, learned_dim):
@@ -35,6 +39,10 @@ class SIGNALActor(nn.Module):
         super().__init__()
         self.content = content
         self.msg_dim = msg_dim
+        # v1.3 demand context for the eps/oracle/raw_lag* rungs (plain floats, NOT parameters;
+        # set by the owner: trainer from cfg, eval policy from the eval env's config).
+        self.demand_mu = 12.0
+        self.demand_rho = 0.0
         self.hidden = hidden
         self.use_dhat_head = bool(use_dhat_head)
         # (1) Belief: a single GRU over [local obs, received message]; its hidden state is the agent's
@@ -80,7 +88,7 @@ class SIGNALActor(nn.Module):
         S_mu = F.softplus(self.head(torch.cat(feats, dim=-1)))
         return S_mu, self.log_std.exp().clamp(1e-2, 3.0)
 
-    def message(self, obs, h):
+    def message(self, obs, h, dprev=None, lam=None):
         """Semantic message ladder; every rung is a named supply-chain signal except "learned".
         The named messages ride at natural units (demand/inventory, ~O(10)) so they are commensurate
         with the raw-unit observations beside them in the receiver's GRU input and base-stock head.
@@ -93,6 +101,30 @@ class SIGNALActor(nn.Module):
         # units (like "ip"). Emitted at step t it carries d_{t-1}, so the honesty probe's same-step
         # correlation is <1 from one-step alignment, not misreporting. Registered contrast: dhat vs raw
         # = forecast vs data.
+        # ---- v1.3 rungs (natural units, detached like every named rung) -------------------
+        # Timing contract (identical to "raw"): at step t, obs slot 3 holds d_{t-1}; dprev holds the
+        # caller-maintained lags [d_{t-2}, d_{t-3}] (mu-padded before real demand exists). dprev=None
+        # means the episode's first tick, where the env's obs slot is itself a 0-fill: the new rungs
+        # emit the same 0.0 so their step-0 convention matches raw's exactly (CRN-identical, documented).
+        if self.content in ("eps", "oracle", "condmean", "true_lambda", "raw_lag1", "raw_lag2"):
+            d_nat = obs[..., 3:4]
+            if dprev is None:
+                return torch.zeros_like(d_nat)
+            mu, rho = self.demand_mu, self.demand_rho
+            if self.content == "eps":                              # last realized innovation eps_{t-1}
+                return d_nat - (mu + rho * (dprev[..., 0:1] - mu))
+            if self.content == "condmean":                         # conditional-mean BENCHMARK (never lam)
+                return mu + rho * (d_nat - mu)
+            if self.content == "true_lambda":                      # perfect regime-disclosure benchmark
+                assert lam is not None, "true_lambda requires the DP lambda context (dr_poisson env)"
+                return torch.full_like(d_nat, float(lam))
+            if self.content == "oracle":                           # DEPRECATED alias (frozen behavior):
+                if lam is not None:                                # lam present -> true_lambda semantics,
+                    return torch.full_like(d_nat, float(lam))      # else condmean semantics.
+                return mu + rho * (d_nat - mu)
+            if self.content == "raw_lag1":                         # the POS datum one period late
+                return dprev[..., 0:1]
+            return dprev[..., 1:2]                                 # raw_lag2: two periods late
         if self.content == "raw":      return obs[..., 3:4]
         if self.content == "dhat":     return dh
         if self.content == "ip":       return IP
@@ -142,6 +174,9 @@ class SIGNALTrainer:
                         learned_msg_gain=float(cfg.get("learned_msg_gain", 10.0)))
             for _ in range(n_agents)]).to(self.device)
         self.critic = SIGNALCritic(state_dim, H, n_agents).to(self.device)
+        for _a in self.actors:                                     # v1.3 demand context (see SIGNALActor)
+            _a.demand_mu = float(cfg.get("ar1_mu", 12.0))
+            _a.demand_rho = float(cfg.get("ar1_rho", 0.0))
         # --- optimisation (textbook PPO) ---
         self.gamma = float(cfg.get("gamma", 0.99)); self.lam = float(cfg.get("gae_lambda", 0.95))
         self.eps = float(cfg.get("eps_clip", 0.2)); self.k_epochs = int(cfg.get("k_epochs", 4))
@@ -180,10 +215,19 @@ class SIGNALTrainer:
         obs, _ = env.reset(seed=seed)
         h = [torch.zeros(1, 1, self.actors[i].hidden, device=dev) for i in range(self.N)]
         m_prev = torch.zeros(self.N, self.msg_dim, device=dev)
+        # v1.3: per-episode demand-lag state for the eps/raw_lag* rungs, LOCAL to this rollout --
+        # it cannot survive an episode boundary because it does not exist outside this call.
+        lam_ctx = getattr(env, "_dr_lambda", None)                 # DP: this episode's true lambda
+        lam_ctx = float(lam_ctx) if lam_ctx is not None else None
+        dprev, o_last = None, None                                 # [N,2] own-demand lags; previous obs
         O, MIN, GS, SA, LP, C, DT, DN = ([] for _ in range(8))
         R_MSG, R_DHAT, R_H = ([], [], []) if self.roll_obs is not None else (None, None, None)  # obs-only sink
         while True:
             o = torch.tensor(np.stack([obs[a] for a in AGENTS]), dtype=torch.float32, device=dev)  # [N,obs]
+            if o_last is not None:                                 # v1.3 lag shift: skip the reset 0-fill,
+                dprev = (torch.full((self.N, 2), self.actors[0].demand_mu, device=dev)  # mu-pad first,
+                         if dprev is None else torch.cat([o_last[:, 3:4], dprev[:, 0:1]], dim=1))
+            o_last = o
             incoming = self.adj @ m_prev                                       # [N,msg] (delivered next step)
             S = torch.zeros(self.N, 1, device=dev)
             logp = torch.zeros(self.N, device=dev)
@@ -197,7 +241,9 @@ class SIGNALTrainer:
                 Si = S_mu if deterministic else Normal(S_mu, S_std).sample()
                 logp[i] = Normal(S_mu, S_std).log_prob(Si).sum()
                 S[i] = Si
-                m_out[i] = self.actors[i].message(o[i:i + 1], hi).reshape(-1)
+                m_out[i] = self.actors[i].message(
+                    o[i:i + 1], hi,
+                    dprev=(None if dprev is None else dprev[i:i + 1]), lam=lam_ctx).reshape(-1)
                 if self.roll_obs is not None:                                 # read-only: forecast + belief on hand
                     _h_step.append(hi.reshape(-1))
                     _d_step.append(self.actors[i].demand_estimate(hi).reshape(-1))

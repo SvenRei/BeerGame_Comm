@@ -187,6 +187,9 @@ class SIGNALPolicy:
     def reset(self):
         self.h = [torch.zeros(1, 1, self.hidden, device=DEVICE) for _ in range(self.N)]
         self.m_buf = torch.zeros(self.N, self.msg_dim, device=DEVICE)
+        self._dprev = None                          # v1.3: per-episode demand lags (cleared here)
+        self._o_last = None
+        self._lam = None
         self._t = 0                                 # step counter for msg_override indexing
         # self.msg_override is deliberately not cleared here: run_episode() calls reset()
         # internally, so the intervention runner sets the override before run_episode and clears it
@@ -199,6 +202,11 @@ class SIGNALPolicy:
     @torch.no_grad()
     def act(self, obs):
         o_t = torch.tensor(np.stack([obs[a] for a in AGENTS]), dtype=torch.float32, device=DEVICE)  # [N,obs]
+        if self._o_last is not None:                # v1.3 lag shift (mirrors SIGNALTrainer.collect)
+            self._dprev = (torch.full((self.N, 2), self.actors[0].demand_mu, device=DEVICE)
+                           if self._dprev is None else
+                           torch.cat([self._o_last[:, 3:4], self._dprev[:, 0:1]], dim=1))
+        self._o_last = o_t
         if self.msg_override is not None and self._t < len(self.msg_override):
             m_prev = torch.as_tensor(self.msg_override[self._t], dtype=torch.float32,
                                      device=DEVICE).view(self.N, self.msg_dim)
@@ -220,7 +228,9 @@ class SIGNALPolicy:
             S_mu, S_std = self.actors[i].base_stock(o_t[i:i + 1], hi, incoming[i:i + 1])
             S[i] = S_mu if self.deterministic else torch.distributions.Normal(S_mu, S_std).sample()
             dhat[i] = float(self.actors[i].demand_estimate(hi).reshape(-1)[0].item())
-            m_out[i] = self.actors[i].message(o_t[i:i + 1], hi).reshape(-1)
+            m_out[i] = self.actors[i].message(
+                o_t[i:i + 1], hi,
+                dprev=(None if self._dprev is None else self._dprev[i:i + 1]), lam=self._lam).reshape(-1)
 
         order, _ = order_from_S(S, o_t, self.max_order)
         frac = (order / self.max_order).clamp(0.0, 1.0)
@@ -253,6 +263,14 @@ def run_episode(policy, env, seed, trace=False):
     torch.manual_seed(seed)
     obs, _ = env.reset(seed=seed)
     policy.reset()
+    # v1.3 demand context: (mu, rho) follow the EVAL env (rho sweeps re-evaluate one ckpt across
+    # environments), lambda is this episode's DP draw (None outside DR-Poisson).
+    _cfgd = getattr(env, "_config", None) or {}
+    _lam = getattr(env, "_dr_lambda", None)
+    for _a in policy.actors:
+        _a.demand_mu = float(_cfgd.get("ar1_mu", 12.0))
+        _a.demand_rho = float(_cfgd.get("ar1_rho", 0.0))
+    policy._lam = float(_lam) if _lam is not None else None
     orders = {a: [] for a in AGENTS}
     demand = {a: [] for a in AGENTS}
     inv = {a: [] for a in AGENTS}

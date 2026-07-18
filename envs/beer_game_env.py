@@ -277,6 +277,13 @@ class BeerGameParallelEnv(ParallelEnv):
         # times into a genuine hidden-dynamics test. The centralized critic still
         # sees the full pipeline via get_global_state() (CTDE).
         last_inc = self.current_incoming_order[agent]
+        # v1.3 P2 treatment: OBSERVATION-side garbling of the order signal (physics untouched).
+        # Non-retailer agents observe min(o, c) of their last incoming order; the executed order,
+        # transition kernel, and costs are unchanged (POMDP observation map varies, MDP fixed).
+        # Deterministic => CRN-safe. Blackwell-nested: min(o,12)=min(min(o,20),12).
+        _oclip = self._config.get("obs_order_clip", None)
+        if _oclip is not None and agent != "retailer":
+            last_inc = min(float(last_inc), float(_oclip))
         obs = [float(self.inventory[agent]), float(self.backlog[agent]),
                float(self.unfulfilled_orders[agent]), float(last_inc)]
         return np.clip(np.array(obs, dtype=np.float32), -2000.0, 2000.0)

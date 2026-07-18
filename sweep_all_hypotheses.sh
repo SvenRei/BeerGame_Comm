@@ -219,6 +219,7 @@ for p in $PHASES; do
   case "$p" in
     all)      SEL="$SEL A B Bnull C D E Bext Dext" ;;
     core)     SEL="$SEL A B Bnull C D E" ;;
+    core2)    SEL="$SEL A2 B2 C2 D2 E2 F2" ;;                     # v1.3 content study (510 runs)
     extended) SEL="$SEL Bext Dext" ;;
     *)        SEL="$SEL $p" ;;
   esac
@@ -338,6 +339,57 @@ if want E; then
   emit "ar1r9_beta0_nocomm"    "$EFIX $NOCOMM agent.srdqn_beta=0.0"
   emit "ar1r9_beta05_upstream" "$EFIX $(COMM upstream_only) agent.srdqn_beta=0.5"
   emit "ar1r9_beta05_nocomm"   "$EFIX $NOCOMM agent.srdqn_beta=0.5"
+fi
+
+# ============================ v1.3 CONTENT STUDY (prereg v1.3; 34 arms x 15 = 510) ============
+# Names deliberately REUSE Study-1 arms where the config is identical (dp_nocomm, dp_rbroadcast,
+# ar1r9_nocomm, ar1r9_rbroadcast[+_raw,_learned], ar1r9_upstream, ar1r9_neighbor, ar1r{0,3,6}_
+# nocomm, ar1r0_rbroadcast): those cells ARE the built-in replication of Study 1.
+# ---- A2: DP crossover (P1'). oracle = per-episode true lambda, registered as a BOUND. ----
+if want A2; then
+  emit "dp_nocomm"            "$BEHAV $DP $NOCOMM"
+  emit "dp_rbroadcast"        "$BEHAV $DP $(COMM retailer_broadcast)"
+  emit "dp_rbroadcast_raw"    "$BEHAV $DP $(COMM retailer_broadcast) agent.msg_content=raw"
+  emit "dp_upstream_dhat"     "$BEHAV $DP $(COMM upstream_only)"
+  emit "dp_rbroadcast_true_lambda" "$BEHAV $DP $(COMM retailer_broadcast) agent.msg_content=true_lambda"
+fi
+# ---- B2: the rho0.9 content ladder @ retailer_broadcast (H-REP + ladder replication). ----
+if want B2; then
+  emit "ar1r9_nocomm"             "$BEHAV $(AR 0.9) $NOCOMM"
+  emit "ar1r9_rbroadcast"         "$BEHAV $(AR 0.9) $(COMM retailer_broadcast)"
+  emit "ar1r9_rbroadcast_raw"     "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw"
+  emit "ar1r9_rbroadcast_eps"     "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=eps"
+  emit "ar1r9_rbroadcast_condmean" "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=condmean"
+  emit "ar1r9_rbroadcast_learned" "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=learned"
+fi
+# ---- C2: content x topology (H-TOP; per-link EDI vs source access) + the informative placebo. ----
+if want C2; then   # H-SOURCE (secondary): source access vs per-link local sharing + informative placebo
+  emit "ar1r9_upstream_raw"    "$BEHAV $(AR 0.9) $(COMM upstream_only) agent.msg_content=raw"
+  emit "ar1r9_downstream_raw"  "$BEHAV $(AR 0.9) $(COMM downstream_only) agent.msg_content=raw"
+fi
+# ---- D2: the two-curve rho grid (P2' raw restoration + H2-dhat replication + D1(rho)). ----
+if want D2; then
+  for r in 0.0 0.3 0.6; do t="${RHOTAG[$r]}"
+    emit "${t}_nocomm"         "$BEHAV $(AR "$r") $NOCOMM"
+    emit "${t}_rbroadcast"     "$BEHAV $(AR "$r") $(COMM retailer_broadcast)"
+    emit "${t}_rbroadcast_raw" "$BEHAV $(AR "$r") $(COMM retailer_broadcast) agent.msg_content=raw"
+  done
+fi
+# ---- E2: the censoring manipulation (H-CENS). Each o_max level gets its OWN nocomm (MDP changes;
+#      the paired V differences the physical-capacity channel out to first order). ----
+if want E2; then   # P2: OBSERVATION-side order garbling (physics fixed; Blackwell-nested clips)
+  for c in 12 20; do
+    emit "ar1r9_clip${c}_nocomm"         "$BEHAV $(AR 0.9) $NOCOMM env.obs_order_clip=${c}"
+    emit "ar1r9_clip${c}_rbroadcast_raw" "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw env.obs_order_clip=${c}"
+  done
+fi
+# ---- G (PENDING): recurrent-QMIX sign-concordance set (editor Q1(a)); emitted once the QMIX
+#      trainer spike lands. Cells: dp {nocomm, rb_dhat, rb_raw}; ar1r9 {nocomm, rb_dhat, rb_raw};
+#      clip12 {nocomm, rb_raw} (+clip20 pair if resources). ----
+# ---- F2: the timeliness ladder (H-TIME): real-time feed vs batch reporting. ----
+if want F2; then
+  emit "ar1r9_rbroadcast_rawlag1" "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw_lag1"
+  emit "ar1r9_rbroadcast_rawlag2" "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw_lag2"
 fi
 
 NJOBS=$(wc -l < "$JOBS"); NCFG=$(cut -f1 "$JOBS" | sort -u | wc -l)
@@ -496,6 +548,61 @@ if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
       ck="$(latest_ck "ar1r9_${arm}" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
       echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$FAMROOT/ar1r9_${arm}' \
 --dump-ar1 0.9 --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+    done
+  done
+  # -- v1.3 cells -> $OUTROOT/v13/<cell> (costs + _ferr + _censor siblings ride along) --------
+  V13="$OUTROOT/v13"
+  for pair in "dp_nocomm dp_nocomm" "dp_rbroadcast dp_dhat" "dp_rbroadcast_raw dp_raw" \
+              "dp_upstream_dhat dp_dhat_up" "dp_rbroadcast_true_lambda dp_true_lambda"; do
+    arm="${pair% *}"; cell="${pair#* }"
+    for s in $SEEDS; do
+      ck="$(latest_ck "$arm" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
+      echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$V13/${cell}' \
+--dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+    done
+  done
+  for pair in "ar1r9_nocomm ar1r9_nocomm" "ar1r9_rbroadcast ar1r9_dhat" \
+              "ar1r9_rbroadcast_raw ar1r9_raw" "ar1r9_rbroadcast_eps ar1r9_eps" \
+              "ar1r9_rbroadcast_condmean ar1r9_condmean" "ar1r9_rbroadcast_learned ar1r9_learned" \
+              "ar1r9_upstream_raw top_up_raw" "ar1r9_downstream_raw top_down_raw" \
+              "ar1r9_clip12_nocomm clip12_nocomm" "ar1r9_clip12_rbroadcast_raw clip12_raw" \
+              "ar1r9_clip20_nocomm clip20_nocomm" "ar1r9_clip20_rbroadcast_raw clip20_raw" \
+              "ar1r9_rbroadcast_rawlag1 lag1" "ar1r9_rbroadcast_rawlag2 lag2"; do
+    arm="${pair% *}"; cell="${pair#* }"
+    for s in $SEEDS; do
+      ck="$(latest_ck "$arm" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
+      echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$V13/${cell}' \
+--dump-ar1 0.9 --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+    done
+  done
+  for r in 0.0 0.3 0.6; do t="${RHOTAG[$r]}"; rt="rho${r/0./}"
+    for pair in "${t}_nocomm ${rt}_nocomm" "${t}_rbroadcast ${rt}_dhat" \
+                "${t}_rbroadcast_raw ${rt}_raw"; do
+      arm="${pair% *}"; cell="${pair#* }"
+      for s in $SEEDS; do
+        ck="$(latest_ck "$arm" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
+        echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$V13/${cell}' \
+--dump-ar1 '$r' --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+      done
+    done
+  done
+  # -- v1.3 substitution curve on the INFORMATIVE signal (raw pairs, budget milestones) --------
+  for M in $MLIST; do
+    for pair in "dp_rbroadcast_raw dpraw_comm" "dp_nocomm dpraw_nocomm"; do
+      arm="${pair% *}"; grp="${pair#* }"
+      for s in $SEEDS; do
+        ck="$(latest_ck "$arm" "$s" "signal_checkpoint_budget${M}.pt")"; [[ -n "$ck" ]] || continue
+        echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$CURVROOT/${grp}_b${M}' \
+--dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+      done
+    done
+    for pair in "ar1r9_rbroadcast_raw ar1r9raw_comm" "ar1r9_nocomm ar1r9raw_nocomm"; do
+      arm="${pair% *}"; grp="${pair#* }"
+      for s in $SEEDS; do
+        ck="$(latest_ck "$arm" "$s" "signal_checkpoint_budget${M}.pt")"; [[ -n "$ck" ]] || continue
+        echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$CURVROOT/${grp}_b${M}' \
+--dump-ar1 0.9 --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
+      done
     done
   done
   echo "  $(wc -l < "$DJOBS") dump jobs, $NPROC parallel"
