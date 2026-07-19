@@ -45,23 +45,32 @@ REGISTRY = {
     "t-test (scipy), observation-consistent "
     "training (clipped aux targets); CTDE critic global, disclosed; clip levels validated by the "
     "outcome-blind clip-rate pilot (windows: >12 in [15,95]%, >20 in [3,80]%)",
-  "correction": "joint Holm over {P1,P2}, familywise alpha=.05, via statsmodels multipletests",
+  "correction": "joint Holm over the THREE-member primary family {P1, P2, C-NULL}, familywise "
+    "alpha=.05, via statsmodels multipletests. C-NULL (the dhat-redundancy equivalence) is "
+    "load-bearing for the headline claim and therefore carries the same FWER control as P1/P2 "
+    "(review fix A2; power cost negligible -- C-NULL is the best-powered member, sd~26 vs band~82).",
   "claim_scope": "P1/P2 are claims about the EXPECTED (seed-mean) value of sharing; V has high "
     "run-to-run dispersion (AR9_raw coefficient of variation ~0.9, so a nontrivial fraction of "
     "individual runs show V<=0). The supported statement is 'sharing lowers EXPECTED cost' with the "
     "dispersion reported (see v_distribution), NOT 'information always helps'."},
  "companion": {"C-NULL": "Schuirmann TOST (scipy) |V_AR.9(dhat)| within +/-2% of AR nocomm "
-   "cost (Cachon-Fisher band); dhat-null is the best-powered claim (sd~26 vs band~82)"},
+   "cost (Cachon-Fisher band); MEMBER of the joint-Holm primary family (see correction)"},
  "optimality_gap": "REGISTERED interpretation diagnostic (scripts/confirmatory_v2.optimality_gap): "
    "V=C(nocomm)-C(comm) is a difference of ACHIEVED costs and identifies information VALUE only "
    "where both learned policies are near-optimal; otherwise it also absorbs a learning-gap term. "
-   "The diagnostic reports each key arm's relative gap to the best available benchmark (DR-Poisson: "
-   "the per-lambda Oracle rung, a STRONG benchmark; AR(1) rho=.9: the static base-stock, a WEAK "
-   "reference in an autocorrelated regime where the optimal order-up-to level is state-dependent -- "
-   "disclosed). Interpretation rule, tau=0.30: a primary contrast is read as INFORMATION-VALUE only "
-   "if BOTH arms sit within tau of the near-optimal reference; otherwise V is reported as a LOWER "
-   "BOUND on information value contaminated by the learning gap. DIAGNOSTIC ONLY -- it never alters "
-   "the t-test decision, it bounds the decision's interpretation.",
+   "References, SYMMETRIC across the two P1 regimes (review fix B): DR-Poisson = the per-lambda "
+   "Oracle rung; AR(1) rho=.9 = AR_BestBS from scripts/baselines.py ar -- min(conditional, static) "
+   "base-stock, where the CONDITIONAL policy (Kahn/Lee lineage) orders up to the exact AR(1) "
+   "lead-time conditional mean plus a critical-fractile safety term on the exact cumulative "
+   "forecast-error variance, with the retailer's observed d_t shared with all echelons "
+   "(PRIVILEGED, like Oracle; a heuristic near-optimum, not the unknown exact optimum -- gaps may "
+   "be slightly overstated, disclosed). Validation on final-eval seeds: CondBS 3805 beats StaticBS "
+   "4847 at rho=.9 (-21%), confirming the conditioning mechanism. Interpretation rule at the "
+   "REGISTERED tau SENSITIVITY GRID {0.10, 0.20, 0.30} (review fix A3): a primary contrast is read "
+   "as INFORMATION-VALUE at tau only if BOTH arms sit within tau of their regime's reference; "
+   "otherwise V is a LOWER BOUND contaminated by the learning gap; the verdict is reported at all "
+   "three tau values. DIAGNOSTIC ONLY -- it never alters the t-test decision, it bounds the "
+   "decision's interpretation.",
  "v_distribution": "REGISTERED reporting: the seed-level distribution of every V (P(V>0), deciles, "
    "min/max) accompanies each primary, surfacing the run-to-run dispersion that a mean+CI hides. "
    "Reported honestly whether or not P(V>0)=1.",
@@ -70,6 +79,9 @@ REGISTRY = {
    "AR(1) LINEAR PREDICTOR and OBSERVED ONE-STEP RESIDUAL, not true conditional mean/innovation)",
    "H-TIME: raw>lag1 and lag1>lag2 one-sided", "H-SOURCE: upstream_raw>downstream_raw one-sided",
    "P2-dose: Gamma(12)>=Gamma(20) one-sided"],
+ "secondary_multiplicity": "The six frozen secondaries form ONE family with Holm FWER control "
+   "(statsmodels multipletests) applied within the family (review fix A1); raw AND Holm-adjusted "
+   "p-values are both reported, rejections read off the adjusted values at alpha=.05.",
  "secondaries_frozen_in_v1_analyzers": "geometry positives+placebo TOSTs, F_INCENTIVE matched-beta "
    "pairs, C1 positive control (per-echelon BAR) -- the v1.2-frozen analyzers re-run on fresh data",
  "benchmarks": "dp_true_lambda / ar1_condmean are PRIVILEGED PARAMETER BENCHMARKS, not perfect "
@@ -96,6 +108,9 @@ REGISTRY = {
    "matched MAPPO cell; non-converged cells are reported as such, never silently dropped"},
  "seed_spaces": {"train": "per-run RNG", "gate": "100000+", "final_eval": "500000+ (baselines "
    "regenerated on the same streams)"},
+ "two_sided_sensitivity": "Registered sensitivity (review fix A4): two-sided ttest_1samp "
+   "p-values are reported alongside every one-sided primary decision (directions were fixed by "
+   "Study-1 evidence per replication_framing; the two-sided values guard the directional choice).",
  "eval_terminology": "zeroed-message deltas are MESSAGE RELIANCE, never communication value; "
    "economic value is always C(pi_nocomm)-C(pi_comm), seed-paired"}
 

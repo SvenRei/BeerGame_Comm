@@ -107,7 +107,7 @@ def _vdist(v):
             "p90": float(np.percentile(v, 90)), "min": float(v.min()), "max": float(v.max())}
 
 
-def optimality_gap(root, seeds, refs_path=None, tau=0.30):
+def optimality_gap(root, seeds, refs_path=None, taus=(0.10, 0.20, 0.30), ar_refs_path=None):
     """REGISTERED interpretation diagnostic (not a gate; never changes the t-test decision).
     Reports each key arm's relative gap to the best available benchmark and classifies each
     primary contrast as INFORMATION-VALUE (both arms within tau of the near-optimal reference) or
@@ -117,6 +117,8 @@ def optimality_gap(root, seeds, refs_path=None, tau=0.30):
     lower bound on information value. Degrades gracefully (prints a disclosure) if refs absent."""
     if refs_path is None:
         refs_path = os.path.join("results", "baselines_regime_v2.json")
+    if ar_refs_path is None:
+        ar_refs_path = os.path.join("results", "baselines_ar_v2.json")
     if not os.path.exists(refs_path):
         return {"_note": f"benchmark refs not found at {refs_path}; interpretation rule NOT "
                          f"evaluated. V is reported as an achieved-cost difference (a lower bound "
@@ -129,7 +131,7 @@ def optimality_gap(root, seeds, refs_path=None, tau=0.30):
     mr = mean_refs(rungs)                                      # {rung: mean cost over its lambdas}
     # near-optimal Poisson benchmark: Oracle (best rung); tolerate alt names
     oracle = mr.get("Oracle", mr.get("oracle", mr.get("Oracle_poisson")))
-    out = {"tau": tau, "oracle_poisson": oracle, "arms": {}, "verdicts": {}}
+    out = {"taus": list(taus), "oracle_poisson": oracle, "arms": {}, "verdicts": {}}
 
     def armcost(cell):
         try:
@@ -143,17 +145,42 @@ def optimality_gap(root, seeds, refs_path=None, tau=0.30):
     for k, cell in {"dp_dhat": "v13/dp_dhat", "dp_raw": "v13/dp_raw"}.items():
         c = armcost(cell)
         out["arms"][k] = {"cost": c, "gap_to_oracle": gap(c)}
+    def _tau_verdicts(label, g1name, g1, g2name, g2):
+        if g1 is None or g2 is None:
+            return
+        out["verdicts"][label] = {}
+        for t in taus:
+            both = (g1 <= t) and (g2 <= t)
+            out["verdicts"][label][f"tau={t:.0%}"] = (
+                "INFORMATION-VALUE" if both else
+                f"LEARNING-GAP lower bound ({g1name} {g1:+.1%}, {g2name} {g2:+.1%})")
+
     gd, gr = out["arms"]["dp_dhat"]["gap_to_oracle"], out["arms"]["dp_raw"]["gap_to_oracle"]
-    if gd is not None and gr is not None:
-        both_near = (gd <= tau) and (gr <= tau)
-        out["verdicts"]["V_DP(dhat vs raw) [P1 DP conjunct]"] = (
-            "INFORMATION-VALUE (both DP arms within tau of Oracle)" if both_near
-            else f"LEARNING-GAP lower bound (dp_dhat gap={gd:+.1%}, dp_raw gap={gr:+.1%}; "
-                 f"one/both exceed tau={tau:.0%})")
-    out["ar_disclosure"] = ("AR(1) near-optimal benchmark unavailable: the static base-stock is a "
-                            "weak reference in an autocorrelated regime, so V_AR is reported as an "
-                            "achieved-cost difference and interpreted as a LOWER BOUND on "
-                            "information value (registered limitation).")
+    _tau_verdicts("V_DP(dhat vs raw) [P1 DP conjunct] vs Oracle", "dp_dhat", gd, "dp_raw", gr)
+
+    # AR side (symmetric rule): reference = AR_BestBS rung from scripts/baselines.py ar
+    if os.path.exists(ar_refs_path):
+        with open(ar_refs_path) as f:
+            ar = json.load(f).get("rungs", {})
+        best = ar.get("AR_BestBS", {}).get("0.9")
+        out["ar_bestbs_rho09"] = best
+        if best:
+            def argap(cell):
+                c = armcost(cell)
+                return c, (None if c is None else (c - best) / best)
+            c_raw, g_raw = argap("v13/ar1r9_raw")
+            c_dhat, g_dhat = argap("v13/ar1r9_dhat")
+            out["arms"]["ar1r9_raw"] = {"cost": c_raw, "gap_to_bestbs": g_raw}
+            out["arms"]["ar1r9_dhat"] = {"cost": c_dhat, "gap_to_bestbs": g_dhat}
+            _tau_verdicts("V_AR(raw vs dhat) [P1 AR conjunct] vs AR_BestBS",
+                          "ar_raw", g_raw, "ar_dhat", g_dhat)
+            out["ar_disclosure"] = ("AR reference = AR_BestBS (privileged conditional base-stock, "
+                                    "Kahn/Lee lineage; a heuristic near-optimum, not the unknown "
+                                    "exact optimum -- gaps may be slightly overstated).")
+    if "ar_disclosure" not in out:
+        out["ar_disclosure"] = ("AR(1) reference refs not found (run scripts/baselines.py ar): "
+                                "V_AR is reported as an achieved-cost difference and interpreted "
+                                "as a LOWER BOUND on information value.")
     return out
 
 
@@ -186,10 +213,19 @@ def primaries(root, seeds):
     p_p2 = p_greater(gamma)
     w_p2 = p_wilcoxon_greater(gamma)
 
-    # joint Holm over the two primaries (statsmodels multipletests, via compare_many)
-    cm = compare_many({"P1": p_p1, "P2": p_p2}, method="holm")
+    # A4 (registered sensitivity): two-sided p's alongside every one-sided decision
+    def _p2s(x):
+        x = np.asarray(x, float)
+        return 1.0 if x.size < 2 or x.std(ddof=1) == 0.0 else float(ttest_1samp(x, 0.0).pvalue)
+    two_sided = {"Delta_DP": _p2s(d_dp), "Delta_AR": _p2s(d_ar), "V_DP(dhat)": _p2s(v_dp_dhat),
+                 "V_AR(raw)": _p2s(v_ar_raw), "Gamma": _p2s(gamma)}
+
+    # A2: C-NULL folded into the primary family -> joint Holm over THREE members
+    # (statsmodels multipletests via compare_many). C-NULL is load-bearing for the headline
+    # ("dhat is redundant at rho=.9") and now carries the same FWER control as P1/P2.
+    cm = compare_many({"P1": p_p1, "P2": p_p2, "C-NULL": p_tost}, method="holm")
     holm = {k: {"raw": cm[k]["raw"], "adj": cm[k]["adjusted"], "reject": cm[k]["reject"]}
-            for k in ("P1", "P2")}
+            for k in ("P1", "P2", "C-NULL")}
 
     # frozen v13 secondaries (all library-based: t-tests + Schuirmann TOST)
     sec = {}
@@ -210,11 +246,16 @@ def primaries(root, seeds):
         sec["P2-dose G12>=G20"] = p_greater(gamma - gamma20)
     except SystemExit:
         sec["_note"] = "secondary cells incomplete (verify_manifest will fail-closed on the campaign)"
+    # A1: FWER control WITHIN the six-member secondary family (statsmodels Holm). Raw and
+    # adjusted p's are both reported; rejections are read off the adjusted values.
+    numeric = {k: v for k, v in sec.items() if isinstance(v, float) and v == v}
+    sec_holm = compare_many(numeric, method="holm") if len(numeric) >= 2 else {}
 
     return dict(d_dp=d_dp, d_ar=d_ar, gamma=gamma, v_dp_dhat=v_dp_dhat, v_ar_raw=v_ar_raw,
                 v_ar_dhat=v_ar_dhat, p_a=p_a, p_b=p_b, p_abs_dp=p_abs_dp, p_abs_ar=p_abs_ar,
                 p_tost=p_tost, band=band, p_p1=p_p1, p_p2=p_p2, w_p1=w_p1, w_p2=w_p2,
                 ci_dp=_ci(v_dp_dhat), ci_ar=_ci(v_ar_raw), ci_gamma=_ci(gamma), holm=holm, sec=sec,
+                sec_holm=sec_holm, two_sided=two_sided,
                 vdist={"V_DP(dhat)": _vdist(v_dp_dhat), "V_DP(raw)": _vdist(v_dp_raw),
                        "V_AR(raw)": _vdist(v_ar_raw), "V_AR(dhat)": _vdist(v_ar_dhat),
                        "Gamma": _vdist(gamma)})
@@ -233,9 +274,19 @@ def report(r):
           f"{'EQUIVALENT' if r['p_tost'] <= ALPHA_FAMILY else 'not shown'}")
     print(f"P2 Gamma = V_raw(clip12)-V_raw(inf)  mean={r['gamma'].mean():+8.1f}  t-p={r['p_p2']:.4f}  "
           f"BCa95=[{r['ci_gamma'][0]:+.1f},{r['ci_gamma'][1]:+.1f}]  [Wilcoxon p={r['w_p2']:.4f}]")
+    sh = r.get("sec_holm", {})
     for k, v in r.get("sec", {}).items():
-        print(f"  [secondary] {k}: {v if isinstance(v, str) else format(v, '.4f')}")
-    for name in ("P1", "P2"):
+        if isinstance(v, str):
+            print(f"  [secondary] {k}: {v}")
+        else:
+            h = sh.get(k)
+            extra = (f"  Holm-adj={h['adjusted']:.4f} -> "
+                     f"{'REJECT' if h['reject'] else 'n.r.'}") if h else ""
+            print(f"  [secondary] {k}: raw={v:.4f}{extra}")
+    ts = r.get("two_sided", {})
+    if ts:
+        print("  [sensitivity] two-sided p: " + "  ".join(f"{k}={v:.4f}" for k, v in ts.items()))
+    for name in ("P1", "P2", "C-NULL"):
         h = r["holm"][name]
         print(f"  Holm {name}: raw={h['raw']:.4f}  adj={h['adj']:.4f} -> "
               f"{'REJECT H0 (claim supported)' if h['reject'] else 'not rejected'}")
@@ -254,15 +305,19 @@ def report_optgap(g):
         print(f"  {g['_note']}")
         return
     orc = g.get("oracle_poisson")
-    print(f"  Poisson Oracle benchmark = {orc:.1f}  (tau = {g['tau']:.0%})" if orc else
-          "  Poisson Oracle benchmark unavailable in refs")
+    taus = g.get("taus", [])
+    print((f"  Poisson Oracle = {orc:.1f}" if orc else "  Poisson Oracle unavailable")
+          + (f"   AR_BestBS(rho=.9) = {g['ar_bestbs_rho09']:.1f}" if g.get("ar_bestbs_rho09") else "")
+          + f"   (tau grid: {', '.join(f'{t:.0%}' for t in taus)})")
     for k, d in g.get("arms", {}).items():
         cost_s = f"{d['cost']:.1f}" if d.get("cost") is not None else "NA"
-        gp = d.get("gap_to_oracle")
+        gp = d.get("gap_to_oracle", d.get("gap_to_bestbs"))
         gap_s = f"{gp:+.1%}" if gp is not None else "NA"
-        print(f"    {k:<10} cost={cost_s:>9}   gap_to_oracle={gap_s}")
-    for c, verdict in g.get("verdicts", {}).items():
-        print(f"    {c}: {verdict}")
+        print(f"    {k:<12} cost={cost_s:>9}   gap={gap_s}")
+    for c, per_tau in g.get("verdicts", {}).items():
+        print(f"    {c}:")
+        for t, v in per_tau.items():
+            print(f"        {t}: {v}")
     if g.get("ar_disclosure"):
         print(f"    {g['ar_disclosure']}")
 
@@ -308,9 +363,11 @@ def selftest():
             _mkcell(root, "v13/clip12_raw", seeds, gcell)
             r = primaries(root, seeds)
             gotA, gotB = r["holm"]["P1"]["reject"], r["holm"]["P2"]["reject"]
-            verdict = (gotA == expA) and (gotB == expB)
+            gotC = r["holm"]["C-NULL"]["reject"]                 # fixtures keep dhat null -> True
+            verdict = (gotA == expA) and (gotB == expB) and gotC
             ok_all &= verdict
-            print(f"  [{'PASS' if verdict else 'FAIL'}] {name}: P1={gotA} (exp {expA})  P2={gotB} (exp {expB})")
+            print(f"  [{'PASS' if verdict else 'FAIL'}] {name}: P1={gotA} (exp {expA})  "
+                  f"P2={gotB} (exp {expB})  C-NULL={gotC} (exp True)")
     print("SELFTEST:", "ALL SCENARIOS PASS" if ok_all else "FAILURES ABOVE")
     sys.exit(0 if ok_all else 1)
 

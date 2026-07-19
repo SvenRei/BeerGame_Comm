@@ -121,6 +121,9 @@ gen_refs() {   # gen_refs <logfile> [extra flags...]
   PYTHONUNBUFFERED=1 "$PYBIN" scripts/baselines.py regime \
     --lambdas 6 8 10 12 14 16 18 20 22 --select-episodes 80 --eval-episodes 200 \
     --bar-per-echelon "$@" > "$log" 2>&1
+  # AR(1) conditional base-stock reference (review fix B): symmetric gap benchmark for the AR conjunct
+  "$PYBIN" scripts/baselines.py ar --rhos 0.9 --eval-episodes 200 >> "$log" 2>&1 \
+    || note "WARN: AR refs generation failed (gap diagnostic will disclose absence)"
 }
 behavioral_refs_live() {
   [[ -f results/baselines_regime_v2.behavioral.json ]] && \

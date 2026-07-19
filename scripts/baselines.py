@@ -859,6 +859,131 @@ def regime_benchmark(lambdas=None, select_episodes=80, eval_episodes=200, env_cf
 
 # ==============================================================================
 # CLI
+
+
+# ==============================================================================
+# AR(1) benchmark rungs (v2.0 reviewer fix, Tier B): a state-dependent conditional
+# base-stock reference for the autocorrelated regime, so the optimality-gap rule
+# applies SYMMETRICALLY to both P1 conjuncts (DR-Poisson had Oracle; AR had nothing).
+#
+# ARCondBSPolicy (Kahn/Lee lineage): every echelon orders up to
+#     S_i(t) = tau_i*mu + phi(tau_i)*(d_t - mu) + z * sqrt(V(tau_i))
+# where d_t is the retailer's last observed consumer demand (PRIVILEGED: shared with
+# all echelons instantly -- this is a benchmark, like Oracle, not an attainable policy),
+# phi(H) = sum_{k=1..H} rho^k = rho(1-rho^H)/(1-rho) is the exact AR(1) conditional-mean
+# loading of cumulative lead-time demand on (d_t - mu), and
+# V(H) = sigma^2 * sum_{m=1..H} ((1-rho^m)/(1-rho))^2 is the exact variance of the
+# H-period cumulative forecast error (from d_{t+k}-E[.] = sum_i rho^i eps_{t+k-i}).
+# z = Phi^{-1}(b/(b+h)) (scipy). tau_i = DEFAULT_TAU (the repo's own lead structure).
+#
+# ARStaticBSPolicy: identical construction with conditioning OFF
+# (S_i = tau_i*mu + z*sqrt(tau_i)*sigma_st, sigma_st = sigma/sqrt(1-rho^2)): the natural
+# rho-blind counterpart. CondBS beating StaticBS on the same CRN streams is the internal
+# validity check of the conditioning mechanism.
+#
+# Gap-diagnostic reference rung: AR_BestBS = min(CondBS, StaticBS) per rho.
+# Caveat (disclosed): env demand is max(0, round(latent)); conditioning on OBSERVED d_t
+# rather than the latent truncates ~4% of the left tail at mu=12, sigma=3 -- a heuristic
+# near-optimum, not the (unknown) exact optimal policy.
+# ==============================================================================
+def _ar_phi(H, rho):
+    """sum_{k=1..H} rho^k (conditional-mean loading of H-period cumulative demand)."""
+    H = int(H)
+    return float(H) if abs(1.0 - rho) < 1e-12 else rho * (1.0 - rho ** H) / (1.0 - rho)
+
+
+def _ar_cumvar(H, rho, sigma):
+    """Exact Var of the H-period cumulative AR(1) forecast error given d_t."""
+    if abs(1.0 - rho) < 1e-12:
+        return float(sigma ** 2) * sum(m ** 2 for m in range(1, int(H) + 1))
+    return float(sigma ** 2) * sum(((1.0 - rho ** m) / (1.0 - rho)) ** 2
+                                   for m in range(1, int(H) + 1))
+
+
+class ARCondBSPolicy(Policy):
+    """Privileged conditional base-stock for AR(1) demand (see block comment above)."""
+    def __init__(self, mu, rho, sigma, h=0.5, b=1.0, tau=None):
+        self.mu, self.rho, self.sigma = float(mu), float(rho), float(sigma)
+        self.tau = _per_echelon(DEFAULT_TAU if tau is None else tau, "tau")
+        self.z = float(stats.norm.ppf(_critical_fractile(h, b)))
+        self._safety = [self.z * np.sqrt(_ar_cumvar(t, self.rho, self.sigma)) for t in self.tau]
+        self._phi = [_ar_phi(t, self.rho) for t in self.tau]
+
+    def act(self, obs, env):
+        d_t = float(obs[AGENTS[0]][3])                 # retailer's last consumer demand (privileged)
+        out = {}
+        for i, a in enumerate(AGENTS):
+            S = self.tau[i] * self.mu + self._phi[i] * (d_t - self.mu) + self._safety[i]
+            out[a] = _action(max(0.0, S - _ip(obs[a])), env.max_order)
+        return out
+
+
+class ARStaticBSPolicy(Policy):
+    """rho-blind static counterpart: same z, unconditional stationary lead-time stats."""
+    def __init__(self, mu, rho, sigma, h=0.5, b=1.0, tau=None):
+        self.tau = _per_echelon(DEFAULT_TAU if tau is None else tau, "tau")
+        z = float(stats.norm.ppf(_critical_fractile(h, b)))
+        sd_st = float(sigma) / np.sqrt(max(1e-9, 1.0 - rho ** 2))
+        self.S = [t * float(mu) + z * np.sqrt(t) * sd_st for t in self.tau]
+
+    def act(self, obs, env):
+        return {a: _action(max(0.0, self.S[i] - _ip(obs[a])), env.max_order)
+                for i, a in enumerate(AGENTS)}
+
+
+def ar_benchmark(rhos=(0.9,), eval_episodes=200, env_cfg=None, mu=12.0, sigma=3.0,
+                 out_path="results/baselines_ar_v2.json", verbose=True):
+    """Evaluate the AR rungs on the FINAL-EVAL seed space (CRN with eval_signal/qmix_dump)
+    and write the refs JSON that confirmatory_v2.optimality_gap reads. Analytic policies:
+    no selection step, hence no selection-seed leakage surface."""
+    import sys as _sys
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _root not in _sys.path:
+        _sys.path.insert(0, _root)
+    try:
+        from scripts.demand_families import make_demand_family_envs
+    except ImportError:
+        from demand_families import make_demand_family_envs
+    from envs.beer_game_env import BeerGameParallelEnv
+    AR1Env = make_demand_family_envs(BeerGameParallelEnv)[0]     # (AR1, NegBin, FamilyRandomized)
+    base = dict(ENV_BASE if env_cfg is None else env_cfg)
+    h, b = float(base.get("holding_cost", 0.5)), float(base.get("backorder_cost", 1.0))
+    rungs = {"AR_CondBS": {}, "AR_StaticBS": {}, "AR_BestBS": {}}
+    for rho in rhos:
+        env = AR1Env({**base, "demand_type": "poisson", "family": "ar1",
+                      "ar1_mu": mu, "ar1_rho": float(rho), "ar1_sigma": sigma})
+        cond = ARCondBSPolicy(mu, rho, sigma, h=h, b=b)
+        stat = ARStaticBSPolicy(mu, rho, sigma, h=h, b=b)
+        c_cond = float(np.mean([rollout(env, cond, EVAL_SEED_BASE + e)[0]
+                                for e in range(eval_episodes)]))
+        c_stat = float(np.mean([rollout(env, stat, EVAL_SEED_BASE + e)[0]
+                                for e in range(eval_episodes)]))
+        k = f"{float(rho):g}"
+        rungs["AR_CondBS"][k], rungs["AR_StaticBS"][k] = c_cond, c_stat
+        rungs["AR_BestBS"][k] = min(c_cond, c_stat)
+        if verbose:
+            print(f"  rho={rho:g}: AR_CondBS={c_cond:.1f}  AR_StaticBS={c_stat:.1f}  "
+                  f"BestBS={rungs['AR_BestBS'][k]:.1f}"
+                  + ("" if c_cond <= c_stat else "  [WARN] CondBS > StaticBS -- conditioning "
+                     "not paying; inspect phi/variance calibration"))
+    try:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump({"rungs": rungs,
+                       "meta": {"mu": mu, "sigma": sigma, "rhos": [float(r) for r in rhos],
+                                "tau": _per_echelon(DEFAULT_TAU, "tau"), "h": h, "b": b,
+                                "eval_seed_base": EVAL_SEED_BASE, "eval_episodes": eval_episodes,
+                                "policy": "privileged conditional base-stock (Kahn/Lee lineage); "
+                                          "reference = AR_BestBS = min(CondBS, StaticBS)"}},
+                      f, indent=2)
+        if verbose:
+            print(f"  -> wrote {out_path} (read by confirmatory_v2.optimality_gap)")
+    except OSError as e:
+        print(f"  (could not write {out_path}: {e})")
+    return rungs
+
+
+
 # ==============================================================================
 def main():
     ap = argparse.ArgumentParser(description="SIGNAL beer-game baselines (base-stock + Bayes/adaptive + Sterman).")
@@ -906,6 +1031,12 @@ def main():
     po.add_argument("--episodes", type=int, default=40)
 
     pe = sub.add_parser("eval", help="evaluate optimized base-stock + Sterman ON the env")
+    pa = sub.add_parser("ar", help="AR(1) conditional base-stock reference rungs (gap diagnostic)")
+    pa.add_argument("--rhos", nargs="+", type=float, default=[0.9])
+    pa.add_argument("--eval-episodes", type=int, default=200)
+    pa.add_argument("--mu", type=float, default=12.0)
+    pa.add_argument("--sigma", type=float, default=3.0)
+    pa.add_argument("--out", default="results/baselines_ar_v2.json")
     pe.add_argument("--regimes", nargs="+", default=["poisson", "black_swan", "extreme_chaos"])
     pe.add_argument("--seeds", type=int, default=20)
     pe.add_argument("--cs-levels", nargs=4, type=float, default=None,
@@ -939,6 +1070,9 @@ def main():
         print(f"Optimized serial base-stock (idealized, lam={args.lam}, L={args.L}, "
               f"h={args.h}, b={args.b}):")
         print(f"  S* = [{', '.join(f'{x:.0f}' for x in S)}]   mean episode cost = {c:.1f}")
+    elif args.cmd == "ar":
+        ar_benchmark(rhos=args.rhos, eval_episodes=args.eval_episodes, mu=args.mu,
+                     sigma=args.sigma, out_path=args.out)
     elif args.cmd == "optimize":
         print("=" * 70)
         print("Per-echelon base-stock optimized ON THE ENV")
