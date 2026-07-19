@@ -60,13 +60,21 @@ def primaries(root, seeds):
     arn = load_cell(root, "v13/ar1r9_nocomm", seeds)
     v_ar_raw = arn - load_cell(root, "v13/ar1r9_raw", seeds)
     v_ar_dhat = arn - load_cell(root, "v13/ar1r9_dhat", seeds)
+    band = 0.02 * float(arn.mean())                                # +/-2% equivalence band (Cachon-Fisher)
     d_dp = v_dp_dhat - v_dp_raw                                    # conjunct A (shared dpn cancels? no:
     #                                                                dpn cancels algebraically -- the
     #                                                                contrast is C_raw - C_dhat, still
     #                                                                seed-paired; kept in V-form for audit)
     d_ar = v_ar_raw - v_ar_dhat                                    # conjunct B
+    # Review 3.0 problem 1: the headline is about VALUE, not ranking. P1's intersection-union now
+    # requires BOTH ranking conjuncts AND both absolute anchors (the winning signal carries positive
+    # value in its regime): p_P1 = max over the four one-sided components.
     p_a, p_b = boot_t_p_onesided(d_dp), boot_t_p_onesided(d_ar)
-    p_p1 = max(p_a, p_b)                                           # intersection-union
+    p_abs_dp = boot_t_p_onesided(v_dp_dhat)                        # V_DP(dhat) > 0
+    p_abs_ar = boot_t_p_onesided(v_ar_raw)                         # V_AR(raw)  > 0
+    p_p1 = max(p_a, p_b, p_abs_dp, p_abs_ar)                       # intersection-union (4 components)
+    # Registered companion C-NULL: dhat is REDUNDANT at rho=.9 -- TOST |V_AR(dhat)| < band.
+    p_tost = max(boot_t_p_onesided(v_ar_dhat + band), boot_t_p_onesided(band - v_ar_dhat))
 
     g_noc = load_cell(root, "v13/clip12_nocomm", seeds)
     v_clip = g_noc - load_cell(root, "v13/clip12_raw", seeds)      # V_raw under c=12
@@ -80,15 +88,39 @@ def primaries(root, seeds):
         lvl = ALPHA_FAMILY / (2 - rank)
         reject = reject and (p <= lvl)
         holm[name] = (p, lvl, reject)
-    return dict(d_dp=d_dp, d_ar=d_ar, gamma=gamma, p_a=p_a, p_b=p_b, p_p1=p_p1, p_p2=p_p2, holm=holm)
+    # --- Code change 3: frozen v13 secondaries (H-REP / H-TIME / H-SOURCE / clip20 direction) ---
+    sec = {}
+    try:
+        v_eps = arn - load_cell(root, "v13/ar1r9_eps", seeds)
+        v_cm = arn - load_cell(root, "v13/ar1r9_condmean", seeds)
+        sec["H-REP raw~eps TOST"] = max(boot_t_p_onesided((v_ar_raw - v_eps) + band),
+                                        boot_t_p_onesided(band - (v_ar_raw - v_eps)))
+        sec["H-REP raw~linpred TOST"] = max(boot_t_p_onesided((v_ar_raw - v_cm) + band),
+                                            boot_t_p_onesided(band - (v_ar_raw - v_cm)))
+        l1 = arn - load_cell(root, "v13/lag1", seeds); l2 = arn - load_cell(root, "v13/lag2", seeds)
+        sec["H-TIME raw>lag1"] = boot_t_p_onesided(v_ar_raw - l1)
+        sec["H-TIME lag1>lag2"] = boot_t_p_onesided(l1 - l2)
+        up = arn - load_cell(root, "v13/top_up_raw", seeds); dn = arn - load_cell(root, "v13/top_down_raw", seeds)
+        sec["H-SOURCE up>down"] = boot_t_p_onesided(up - dn)
+        g20n = load_cell(root, "v13/clip20_nocomm", seeds)
+        sec["P2-dose G12>=G20"] = boot_t_p_onesided(gamma - ((g20n - load_cell(root, "v13/clip20_raw", seeds)) - v_ar_raw))
+    except SystemExit:
+        sec["_note"] = "secondary cells incomplete (verify_manifest will fail-closed on the campaign)"
+    return dict(d_dp=d_dp, d_ar=d_ar, gamma=gamma, p_a=p_a, p_b=p_b, p_abs_dp=p_abs_dp,
+                p_abs_ar=p_abs_ar, p_tost=p_tost, band=band, p_p1=p_p1, p_p2=p_p2, holm=holm, sec=sec)
 
 
 def report(r):
     print("== SIGNAL v2.0 CONFIRMATORY PRIMARIES (frozen; review 2.0 fix #8) ==")
     print(f"P1 conjunct A  Delta_DP(dhat-raw)  mean={r['d_dp'].mean():+8.1f}  p={r['p_a']:.4f}")
     print(f"P1 conjunct B  Delta_AR(raw-dhat)  mean={r['d_ar'].mean():+8.1f}  p={r['p_b']:.4f}")
-    print(f"P1 (IU, max-p)                                p={r['p_p1']:.4f}")
+    print(f"P1 abs anchors  V_DP(dhat)>0 p={r['p_abs_dp']:.4f}   V_AR(raw)>0 p={r['p_abs_ar']:.4f}")
+    print(f"P1 (IU over 4 components, max-p)              p={r['p_p1']:.4f}")
+    print(f"C-NULL dhat redundant @rho.9 (TOST +/-{r['band']:.0f}) p={r['p_tost']:.4f} -> "
+          f"{'EQUIVALENT' if r['p_tost'] <= 0.05 else 'not shown'}")
     print(f"P2 Gamma = V_raw(clip12)-V_raw(inf) mean={r['gamma'].mean():+8.1f}  p={r['p_p2']:.4f}")
+    for k, v in r.get("sec", {}).items():
+        print(f"  [secondary] {k}: {v if isinstance(v, str) else format(v, '.4f')}")
     for name, (p, lvl, rej) in r["holm"].items():
         print(f"  Holm {name}: p={p:.4f} vs {lvl:.4f} -> {'REJECT H0 (claim supported)' if rej else 'not rejected'}")
 
@@ -110,16 +142,19 @@ def selftest():
         ("P2 zero",          +150, +200, 0,    ("P1", True),  ("P2", False)),
         ("P2 negative",      +150, +200, -160, ("P1", True),  ("P2", False)),
         ("shared-baseline covariance", +150, +200, +180, ("P1", True), ("P2", True)),
+        ("ranking-only (abs anchor fails)", +150, +200, +180, ("P1", False), ("P2", True), "absfail"),
     ]
     ok_all = True
-    for name, eff_dp, eff_ar, eff_g, expA, expB in scen:
+    for row in scen:
+        name, eff_dp, eff_ar, eff_g, expA, expB = row[:6]
+        absfail = len(row) > 6
         with tempfile.TemporaryDirectory() as root:
             noise = lambda sc=60: RNG.normal(0, sc, n)
             base_shift = RNG.normal(0, 120, n) if "covariance" in name else 0.0  # seed-quality common shock
             dpn = 4000 + noise() + base_shift
             _mkcell(root, "v13/dp_nocomm", seeds, dpn)
-            _mkcell(root, "v13/dp_raw", seeds, dpn - 60 - noise(40))
-            _mkcell(root, "v13/dp_dhat", seeds, dpn - 60 - eff_dp - noise(40))
+            _mkcell(root, "v13/dp_raw", seeds, dpn + (260 if absfail else -60) - noise(40))
+            _mkcell(root, "v13/dp_dhat", seeds, dpn + (260 if absfail else -60) - eff_dp - noise(40))
             arn = 4100 + noise() + base_shift
             _mkcell(root, "v13/ar1r9_nocomm", seeds, arn)
             _mkcell(root, "v13/ar1r9_dhat", seeds, arn - 5 - noise(25))

@@ -184,7 +184,7 @@ if ! done_already S2_freeze; then
     conf/config.yaml conf/agent/signal.yaml sweep_all_hypotheses.sh plot_curves.py \
     test_new_rungs.py test_obs_clip.py \
     > results/FREEZE_MANIFEST_v1.3.txt 2>/dev/null
-  "$PYBIN" scripts/prereg.py 2>/dev/null | grep -i sha256 >> results/FREEZE_MANIFEST_v1.3.txt
+  "$PYBIN" scripts/prereg_v2.py 2>/dev/null | grep -i sha256 >> results/FREEZE_MANIFEST_v1.3.txt
   note "freeze manifest: $(wc -l < results/FREEZE_MANIFEST_v1.3.txt) lines"
   mark S2_freeze
 else say "S2 freeze: done"; fi

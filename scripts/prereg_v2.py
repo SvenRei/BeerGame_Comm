@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""prereg_v2.py -- the SIGNAL v2.0 registration (review 3.0 problem 3). Prints the canonical
+registry and its SHA-256; the hash printed by this file IS the preregistration anchor.
+Supersedes scripts/prereg.py (v1.x; retained for history). Frozen analysis = confirmatory_v2.py.
+"""
+import hashlib, json
+
+REGISTRY = {
+ "version": "2.0", "date": "2026-07-19",
+ "history_hashes": {"v1.1": "cfae5dee...58b8", "v1.2": "b9e9cf6e...cdc59"},
+ "campaign": {"phases": "full", "arms": 56, "jobs_at_n15": 840,
+   "seeds": "30..(30+n*-1); n* per SIGNAL_v13_power_analysis.md decision rule incl. fallback "
+            "(no qualifying n -> n*=25, shortfall reported); pilot/dev seeds >=50 excluded",
+   "manifest": "reports/FROZEN_CAMPAIGN_MANIFEST.tsv written once; scripts/verify_manifest.py "
+               "fail-closed over every registered cell before any analysis"},
+ "primaries": {
+  "P1_crossover": "IU over FOUR one-sided studentized bootstrap-t components: "
+    "[V_DP(dhat)-V_DP(raw)>0] AND [V_AR.9(raw)-V_AR.9(dhat)>0] AND [V_DP(dhat)>0] AND "
+    "[V_AR.9(raw)>0]; p_P1=max(component p); frozen in scripts/confirmatory_v2.py",
+  "P2_garbling": "Gamma=V_AR.9^raw(obs_order_clip=12)-V_AR.9^raw(inf)>0, observation-consistent "
+    "training (clipped aux targets); CTDE critic global, disclosed; clip levels validated by the "
+    "outcome-blind clip-rate pilot (windows: >12 in [15,95]%, >20 in [3,80]%)",
+  "correction": "joint Holm over {P1,P2}, familywise alpha=.05"},
+ "companion": {"C-NULL": "TOST |V_AR.9(dhat)| within +/-2% of AR nocomm cost (Cachon-Fisher band)"},
+ "secondaries_frozen_in_confirmatory_v2": [
+   "H-REP: raw~eps and raw~ar1_linear_predictor TOST at +/-2% (renamed per review: signals are the "
+   "AR(1) LINEAR PREDICTOR and OBSERVED ONE-STEP RESIDUAL, not true conditional mean/innovation)",
+   "H-TIME: raw>lag1 and lag1>lag2 one-sided", "H-SOURCE: upstream_raw>downstream_raw one-sided",
+   "P2-dose: Gamma(12)>=Gamma(20) one-sided"],
+ "secondaries_frozen_in_v1_analyzers": "geometry positives+placebo TOSTs, F_INCENTIVE matched-beta "
+   "pairs, C1 positive control (per-echelon BAR) -- the v1.2-frozen analyzers re-run on fresh data",
+ "benchmarks": "dp_true_lambda / ar1_condmean are PRIVILEGED PARAMETER BENCHMARKS, not perfect "
+   "disclosure and not attainable messages; reported as reference rungs only",
+ "exploratory_demotions": ["dhat_ip and learned rungs (no architecture-matched nocomm; option B)",
+   "QMIX dhat cells (endogenous message in replay)", "H3 forecast-error mechanism (target mismatch)",
+   "substitution curves (truncated-milestone contamination); truncated milestones excluded from "
+   "any descriptive plot", "learned-channel H-SEM (aux-regularized objective disclosed; "
+   "learned_aux_detach=true is the registered configuration, false only as the coupling ablation)"],
+ "qmix": {"scope": "sign concordance with MAPPO on P1 components and Gamma over raw+nocomm cells "
+   "only", "hypers": "qmix_lr=2.5e-4 qmix_buffer=1500 qmix_eps_anneal=5000 qmix_target_update=40 "
+   "(certification-adjusted after the 3000-ep pilot diverged post-ep2300)",
+   "convergence_gate": "PER RUN, predeclared: a cell enters concordance only if its best held-out "
+   "gate improved at least once at episode>=2000 AND final best gate cost < 1.25x the run minimum "
+   "of its matched MAPPO cell; non-converged cells are reported as such, never silently dropped"},
+ "seed_spaces": {"train": "per-run RNG", "gate": "100000+", "final_eval": "500000+ (baselines "
+   "regenerated on the same streams)"},
+ "eval_terminology": "zeroed-message deltas are MESSAGE RELIANCE, never communication value; "
+   "economic value is always C(pi_nocomm)-C(pi_comm), seed-paired"}
+
+blob = json.dumps(REGISTRY, sort_keys=True, separators=(",", ":")).encode()
+print(json.dumps(REGISTRY, indent=1, sort_keys=True))
+print("\nSHA256:", hashlib.sha256(blob).hexdigest())
