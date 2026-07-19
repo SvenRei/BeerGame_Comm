@@ -76,60 +76,35 @@ def mean_refs(rungs, lambdas=None):
 # ==============================================================================
 def bootstrap_ci(values, stat=np.mean, n_boot=10000, ci=0.95, seed=0, method="auto"):
     """Bootstrap CI of `stat` over the sample, resampling the seeds (the experimental unit).
-    method='auto' (default, registered): studentized bootstrap-t when stat is the mean, else BCa.
-    At n=15 a percentile 95% CI of a mean undercovers (~91% normal, ~89% skewed in calibration
-    sims), and BCa does not repair it (it shifts the interval; the deficit is width). The
-    bootstrap-t interval [theta - se*t*_(1-a), theta - se*t*_(a)] is second-order accurate for a
-    mean and restores near-nominal coverage. Every registered statistic here is a seed-mean, so
-    'auto' == bootstrap-t in practice. BCa/percentile remain available; any failure falls back to
-    percentile."""
+    v2.0 STATS HARDENING: all resampling delegates to scipy.stats.bootstrap (community-validated,
+    not hand-rolled). method 'auto'/'bca' -> BCa (bias-corrected-and-accelerated; second-order
+    accurate; restores near-nominal coverage of a mean at n>=15 where a plain percentile interval
+    undercovers). 'percentile'/'basic' pass through. Any BCa failure on degenerate/constant
+    resamples falls back to scipy's percentile interval. Returns (lo, hi)."""
+    from scipy.stats import bootstrap as _sp_bootstrap
     v = np.asarray(values, float)
+    v = v[~np.isnan(v)]
     n = v.size
     if n == 0:
         return (float("nan"), float("nan"))
     if n == 1:
-        s = float(stat(v))
-        return (s, s)
-    rng = np.random.default_rng(seed)
-    idx = rng.integers(0, n, size=(n_boot, n))
-    alpha = (1.0 - ci) / 2.0
-    is_mean = stat is np.mean
-    if method == "auto":
-        method = "student" if is_mean else "bca"
-    if method == "student" and is_mean:
-        theta = float(v.mean())
-        se = float(v.std(ddof=1) / np.sqrt(n))
-        if se > 1e-12:
-            bm = v[idx].mean(axis=1)                                  # resample means
-            bs = v[idx].std(axis=1, ddof=1) / np.sqrt(n)              # resample SEs
-            t = (bm - theta) / np.maximum(bs, 1e-12)                  # studentized pivots
-            t_lo, t_hi = np.percentile(t, [100.0 * alpha, 100.0 * (1.0 - alpha)])
-            return (theta - se * float(t_hi), theta - se * float(t_lo))
-        return (theta, theta)                                         # zero-variance sample
-    boots = np.array([float(stat(v[i])) for i in idx])
-    if method == "bca":
-        try:
-            from scipy.stats import norm
-            theta = float(stat(v))
-            if float(boots.max()) - float(boots.min()) > 1e-12:       # non-degenerate resamples
-                p0 = float(np.mean(boots < theta) + 0.5 * np.mean(boots == theta))
-                if 0.0 < p0 < 1.0:
-                    z0 = float(norm.ppf(p0))
-                    jack = np.array([float(stat(np.delete(v, i))) for i in range(n)])
-                    jm = jack.mean()
-                    denom = np.sum((jm - jack) ** 2) ** 1.5
-                    a = float(np.sum((jm - jack) ** 3) / (6.0 * denom)) if denom > 1e-12 else 0.0
-                    za, zb = norm.ppf(alpha), norm.ppf(1.0 - alpha)
-                    a1 = float(norm.cdf(z0 + (z0 + za) / max(1e-12, 1.0 - a * (z0 + za))))
-                    a2 = float(norm.cdf(z0 + (z0 + zb) / max(1e-12, 1.0 - a * (z0 + zb))))
-                    if 0.0 < a1 < a2 < 1.0:
-                        return (float(np.percentile(boots, 100.0 * a1)),
-                                float(np.percentile(boots, 100.0 * a2)))
-        except Exception:                                             # noqa: BLE001 -> percentile fallback
-            pass
-    lo = float(np.percentile(boots, 100.0 * alpha))
-    hi = float(np.percentile(boots, 100.0 * (1.0 - alpha)))
-    return (lo, hi)
+        z = float(stat(v))
+        return (z, z)
+    sp_method = {"auto": "BCa", "bca": "BCa", "student": "BCa",
+                 "percentile": "percentile", "basic": "basic"}.get(method, "BCa")
+    def _run(m, vectorized):
+        res = _sp_bootstrap((v,), stat, n_resamples=int(n_boot), confidence_level=float(ci),
+                            method=m, random_state=int(seed), vectorized=vectorized)
+        return float(res.confidence_interval.low), float(res.confidence_interval.high)
+    for m in (sp_method, "percentile"):                 # BCa first, scipy-percentile fallback
+        for vec in (True, False):                       # vectorized mean fast-path, then generic
+            try:
+                lo, hi = _run(m, vec)
+                if np.isfinite(lo) and np.isfinite(hi):
+                    return (lo, hi)
+            except Exception:
+                continue
+    return (float("nan"), float("nan"))
 
 
 def iqm(values):
@@ -194,34 +169,17 @@ def paired(a, b, alternative="two-sided"):
 
 
 def adjust_pvalues(pvals, method="holm"):
-    """Multiple-comparison correction over a family of tests. Returns
-    (adjusted_pvals, reject_at_0.05), order-preserving. method:
-      'holm' -- Holm-Bonferroni, controls the family-wise error rate (FWER); conservative.
-      'bh'   -- Benjamini-Hochberg, controls the false-discovery rate (FDR); more powerful.
-    Apply across the p-values of all paired comparisons reported in one study (e.g. one per comm
-    topology, demand family, or ablation), not per comparison in isolation."""
+    """Multiple-comparison correction over a family of tests. v2.0 STATS HARDENING: delegates to
+    statsmodels.stats.multitest.multipletests (community-validated). Returns
+    (adjusted_pvals, reject_at_0.05), order-preserving. method: 'holm' (Holm-Bonferroni, FWER) or
+    'bh' (Benjamini-Hochberg, FDR). Apply across all paired comparisons reported in one study."""
+    from statsmodels.stats.multitest import multipletests
     p = np.asarray(pvals, float)
-    n = p.size
-    if n == 0:
+    if p.size == 0:
         return np.array([]), np.array([], dtype=bool)
-    order = np.argsort(p)
-    sp = p[order]
-    adj_sorted = np.empty(n)
-    if method == "holm":
-        running = 0.0
-        for i in range(n):                               # ascending; multiplier (n-i), monotone
-            running = max(running, (n - i) * sp[i])
-            adj_sorted[i] = min(running, 1.0)
-    elif method == "bh":
-        running = 1.0
-        for i in range(n - 1, -1, -1):                   # descending; p*(n/(i+1)), monotone
-            running = min(running, sp[i] * n / (i + 1))
-            adj_sorted[i] = min(running, 1.0)
-    else:
-        raise ValueError("method must be 'holm' or 'bh'")
-    adj = np.empty(n)
-    adj[order] = adj_sorted
-    return adj, adj <= 0.05
+    sm = {"holm": "holm", "bh": "fdr_bh", "bonferroni": "bonferroni"}.get(method, "holm")
+    reject, adj, _, _ = multipletests(p, alpha=0.05, method=sm)
+    return np.asarray(adj, float), np.asarray(reject, bool)
 
 
 def compare_many(named_pvals, method="holm"):

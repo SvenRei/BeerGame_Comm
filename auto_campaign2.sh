@@ -55,7 +55,7 @@ if [[ ! -f .setup_done ]]; then
   [[ -d venv ]] || python3 -m venv venv
   venv/bin/pip install --upgrade -q pip
   venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-  venv/bin/pip install -q numpy scipy pandas matplotlib hydra-core omegaconf wandb pettingzoo gymnasium
+  venv/bin/pip install -q numpy scipy statsmodels scikit-learn pandas matplotlib hydra-core omegaconf wandb pettingzoo gymnasium
   venv/bin/python test_obs_clip.py >/dev/null 2>&1 \
     && WANDB_MODE=disabled venv/bin/python agents/train_signal.py agent=signal seed=99 total_episodes=0 \
          agent.algorithm=s0smoke >/dev/null 2>&1 \

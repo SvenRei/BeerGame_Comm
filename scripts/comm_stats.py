@@ -160,12 +160,13 @@ def substitution_curve(budget_dirs, lambdas=None, n_boot=10000):
     full = {s: bv for s, bv in per_seed.items() if len(bv) == len(budgets)}
     x = np.log2(np.asarray(budgets, float))
 
-    def _spear(y):                                   # tie-naive Spearman (budgets are distinct)
-        rx = np.argsort(np.argsort(x)).astype(float)
-        ry = np.argsort(np.argsort(y)).astype(float)
-        rx -= rx.mean(); ry -= ry.mean()
-        den = float(np.sqrt((rx ** 2).sum() * (ry ** 2).sum()))
-        return float((rx * ry).sum() / den) if den > 0 else 0.0
+    def _spear(y):                                   # Spearman via scipy (community-validated)
+        from scipy.stats import spearmanr
+        if np.asarray(y).size < 2:
+            return float("nan")
+        res = spearmanr(x, y)
+        r = getattr(res, "statistic", getattr(res, "correlation", float("nan")))
+        return float(r) if np.isfinite(r) else 0.0
 
     ys = [np.array([full[s][b] for b in budgets]) for s in sorted(full)]
     slopes = np.array([np.polyfit(x, y, 1)[0] for y in ys]) if ys else np.array([])

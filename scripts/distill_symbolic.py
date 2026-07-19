@@ -211,10 +211,16 @@ def fit_models(X, Y, backend, pysr_kwargs=None):
 
 
 def _r2(reg, Xi, Yi):
-    p = reg.predict(Xi)
-    ss = float(np.sum((Yi - p) ** 2))
-    tot = float(np.sum((Yi - Yi.mean()) ** 2))
-    return 1.0 - ss / tot if tot > 1e-9 else float("nan")
+    """Coefficient of determination via sklearn.metrics.r2_score (community-validated)."""
+    from sklearn.metrics import r2_score
+    Yi = np.asarray(Yi, float)
+    try:
+        pred = reg.predict(Xi)
+    except Exception:  # noqa: BLE001
+        return float("nan")
+    if Yi.size < 2:
+        return float("nan")
+    return float(r2_score(Yi, pred))
 
 
 def mean_costs(policy, envs, episodes, seed_base=EVAL_SEED_BASE):

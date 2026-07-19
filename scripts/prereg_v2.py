@@ -7,6 +7,14 @@ import hashlib, json
 
 REGISTRY = {
  "version": "2.0", "date": "2026-07-19",
+ "inference_stack": "ALL confirmatory inference delegates to community-validated libraries "
+   "(scipy>=1.10 stats; statsmodels>=0.14 multitest) -- NO hand-rolled estimators. One-sided "
+   "decisions = scipy.stats.ttest_1samp (paired-difference t-test, exact under normality, "
+   "CLT-robust at n=25, deterministic); equivalence = Schuirmann TOST via scipy.stats.ttest_1samp; "
+   "effect-size 95% CIs = scipy.stats.bootstrap BCa; multiplicity = statsmodels multipletests "
+   "(Holm); nonparametric robustness = scipy.stats.wilcoxon. The registered power analysis "
+   "(reports/power_v13.txt) already computes the one-sided t-test rejection rate, so the "
+   "confirmatory decision and the power calculation are the SAME test.",
  "history_hashes": {"v1.1": "cfae5dee...58b8", "v1.2": "b9e9cf6e...cdc59"},
  "campaign": {"phases": "full", "arms": 56, "jobs_at_n15": 840,
    "seeds": "30..54 FINAL: n*=25 by the registered FALLBACK CLAUSE -- the 2026-07-19 power run "
@@ -19,14 +27,18 @@ REGISTRY = {
    "manifest": "reports/FROZEN_CAMPAIGN_MANIFEST.tsv written once; scripts/verify_manifest.py "
                "fail-closed over every registered cell before any analysis"},
  "primaries": {
-  "P1_crossover": "IU over FOUR one-sided studentized bootstrap-t components: "
-    "[V_DP(dhat)-V_DP(raw)>0] AND [V_AR.9(raw)-V_AR.9(dhat)>0] AND [V_DP(dhat)>0] AND "
-    "[V_AR.9(raw)>0]; p_P1=max(component p); frozen in scripts/confirmatory_v2.py",
-  "P2_garbling": "Gamma=V_AR.9^raw(obs_order_clip=12)-V_AR.9^raw(inf)>0, observation-consistent "
+  "P1_crossover": "IU over FOUR one-sided PAIRED-DIFFERENCE t-tests (scipy.stats.ttest_1samp, "
+    "alternative=greater): [V_DP(dhat)-V_DP(raw)>0] AND [V_AR.9(raw)-V_AR.9(dhat)>0] AND "
+    "[V_DP(dhat)>0] AND [V_AR.9(raw)>0]; p_P1=max(component p). BCa bootstrap 95% CIs reported "
+    "for every V; Wilcoxon signed-rank reported as nonparametric robustness. Frozen in "
+    "scripts/confirmatory_v2.py (7-scenario fixture self-test).",
+  "P2_garbling": "Gamma=V_AR.9^raw(obs_order_clip=12)-V_AR.9^raw(inf)>0 by one-sided paired "
+    "t-test (scipy), observation-consistent "
     "training (clipped aux targets); CTDE critic global, disclosed; clip levels validated by the "
     "outcome-blind clip-rate pilot (windows: >12 in [15,95]%, >20 in [3,80]%)",
-  "correction": "joint Holm over {P1,P2}, familywise alpha=.05"},
- "companion": {"C-NULL": "TOST |V_AR.9(dhat)| within +/-2% of AR nocomm cost (Cachon-Fisher band)"},
+  "correction": "joint Holm over {P1,P2}, familywise alpha=.05, via statsmodels multipletests"},
+ "companion": {"C-NULL": "Schuirmann TOST (scipy) |V_AR.9(dhat)| within +/-2% of AR nocomm "
+   "cost (Cachon-Fisher band); dhat-null is the best-powered claim (sd~26 vs band~82)"},
  "secondaries_frozen_in_confirmatory_v2": [
    "H-REP: raw~eps and raw~ar1_linear_predictor TOST at +/-2% (renamed per review: signals are the "
    "AR(1) LINEAR PREDICTOR and OBSERVED ONE-STEP RESIDUAL, not true conditional mean/innovation)",
