@@ -11,6 +11,16 @@ No hand-rolled estimators remain. The paired t-test is exact under normality and
 n>=25; the power analysis (reports/power_v13.txt) already computes the one-sided t-test rejection
 rate, so the confirmatory decision and the registered power are the SAME test.
 
+Two REGISTERED interpretation elements accompany every primary (review hardening):
+  * V-distribution: the seed-level distribution of every V (P(V>0), deciles, range). V is a
+    difference of ACHIEVED costs; a positive mean with wide dispersion is reported as such, so the
+    supported claim is "sharing lowers EXPECTED cost with substantial run-to-run dispersion", not
+    "information always helps".
+  * Optimality-gap diagnostic: VOI-via-RL identifies information value only where both policies are
+    near-optimal. Each key arm's gap to the best available benchmark is reported, and each primary
+    contrast is classified INFORMATION-VALUE (both arms within tau of the near-optimal reference) or
+    LEARNING-GAP lower-bound. This does NOT alter the t-test decision; it bounds its interpretation.
+
 Structure (unchanged, library-backed):
   P1 (crossover, intersection-union over FOUR one-sided components):
      Delta_DP = V_DP(dhat)-V_DP(raw) > 0  AND  Delta_AR = V_AR.9(raw)-V_AR.9(dhat) > 0  AND
@@ -88,6 +98,65 @@ def _ci(x):
     return bootstrap_ci(np.asarray(x, float), n_boot=BOOT, ci=CI)     # scipy BCa
 
 
+def _vdist(v):
+    """Seed-level distribution of a V vector: P(V>0), deciles, and range (all descriptive; the
+    percentiles are numpy's own routine). Surfaces run-to-run dispersion the mean+CI hides."""
+    v = np.asarray(v, float)
+    return {"n": int(v.size), "mean": float(v.mean()), "p_pos": float(np.mean(v > 0.0)),
+            "p10": float(np.percentile(v, 10)), "p50": float(np.percentile(v, 50)),
+            "p90": float(np.percentile(v, 90)), "min": float(v.min()), "max": float(v.max())}
+
+
+def optimality_gap(root, seeds, refs_path=None, tau=0.30):
+    """REGISTERED interpretation diagnostic (not a gate; never changes the t-test decision).
+    Reports each key arm's relative gap to the best available benchmark and classifies each
+    primary contrast as INFORMATION-VALUE (both arms within tau of the near-optimal reference) or
+    a LEARNING-GAP lower bound. Poisson uses the per-lambda Oracle rung (a strong benchmark). The
+    AR(1) static base-stock is a weak reference in an autocorrelated regime (disclosed): AR gaps
+    are reported only where an AR benchmark exists, else flagged unavailable and V_AR is read as a
+    lower bound on information value. Degrades gracefully (prints a disclosure) if refs absent."""
+    if refs_path is None:
+        refs_path = os.path.join("results", "baselines_regime_v2.json")
+    if not os.path.exists(refs_path):
+        return {"_note": f"benchmark refs not found at {refs_path}; interpretation rule NOT "
+                         f"evaluated. V is reported as an achieved-cost difference (a lower bound "
+                         f"on information value if the learned policies are sub-optimal)."}
+    try:
+        from scripts.c1_stats import load_rungs, mean_refs
+    except Exception:  # noqa: BLE001
+        from c1_stats import load_rungs, mean_refs
+    rungs = load_rungs(refs_path)
+    mr = mean_refs(rungs)                                      # {rung: mean cost over its lambdas}
+    # near-optimal Poisson benchmark: Oracle (best rung); tolerate alt names
+    oracle = mr.get("Oracle", mr.get("oracle", mr.get("Oracle_poisson")))
+    out = {"tau": tau, "oracle_poisson": oracle, "arms": {}, "verdicts": {}}
+
+    def armcost(cell):
+        try:
+            return float(load_cell(root, cell, seeds).mean())
+        except SystemExit:
+            return None
+
+    def gap(c):
+        return None if (c is None or not oracle) else (c - oracle) / oracle
+
+    for k, cell in {"dp_dhat": "v13/dp_dhat", "dp_raw": "v13/dp_raw"}.items():
+        c = armcost(cell)
+        out["arms"][k] = {"cost": c, "gap_to_oracle": gap(c)}
+    gd, gr = out["arms"]["dp_dhat"]["gap_to_oracle"], out["arms"]["dp_raw"]["gap_to_oracle"]
+    if gd is not None and gr is not None:
+        both_near = (gd <= tau) and (gr <= tau)
+        out["verdicts"]["V_DP(dhat vs raw) [P1 DP conjunct]"] = (
+            "INFORMATION-VALUE (both DP arms within tau of Oracle)" if both_near
+            else f"LEARNING-GAP lower bound (dp_dhat gap={gd:+.1%}, dp_raw gap={gr:+.1%}; "
+                 f"one/both exceed tau={tau:.0%})")
+    out["ar_disclosure"] = ("AR(1) near-optimal benchmark unavailable: the static base-stock is a "
+                            "weak reference in an autocorrelated regime, so V_AR is reported as an "
+                            "achieved-cost difference and interpreted as a LOWER BOUND on "
+                            "information value (registered limitation).")
+    return out
+
+
 def primaries(root, seeds):
     dpn = load_cell(root, "v13/dp_nocomm", seeds)
     v_dp_dhat = dpn - load_cell(root, "v13/dp_dhat", seeds)        # V = C_nocomm - C_comm, seed-paired
@@ -145,7 +214,10 @@ def primaries(root, seeds):
     return dict(d_dp=d_dp, d_ar=d_ar, gamma=gamma, v_dp_dhat=v_dp_dhat, v_ar_raw=v_ar_raw,
                 v_ar_dhat=v_ar_dhat, p_a=p_a, p_b=p_b, p_abs_dp=p_abs_dp, p_abs_ar=p_abs_ar,
                 p_tost=p_tost, band=band, p_p1=p_p1, p_p2=p_p2, w_p1=w_p1, w_p2=w_p2,
-                ci_dp=_ci(v_dp_dhat), ci_ar=_ci(v_ar_raw), ci_gamma=_ci(gamma), holm=holm, sec=sec)
+                ci_dp=_ci(v_dp_dhat), ci_ar=_ci(v_ar_raw), ci_gamma=_ci(gamma), holm=holm, sec=sec,
+                vdist={"V_DP(dhat)": _vdist(v_dp_dhat), "V_DP(raw)": _vdist(v_dp_raw),
+                       "V_AR(raw)": _vdist(v_ar_raw), "V_AR(dhat)": _vdist(v_ar_dhat),
+                       "Gamma": _vdist(gamma)})
 
 
 def report(r):
@@ -167,6 +239,32 @@ def report(r):
         h = r["holm"][name]
         print(f"  Holm {name}: raw={h['raw']:.4f}  adj={h['adj']:.4f} -> "
               f"{'REJECT H0 (claim supported)' if h['reject'] else 'not rejected'}")
+    print("\n-- V-distribution (seed-level; V is an ACHIEVED-cost difference) --")
+    print(f"  {'V':<12}{'mean':>9}{'P(V>0)':>9}{'p10':>9}{'p50':>9}{'p90':>9}{'min':>9}{'max':>9}")
+    for k, d in r.get("vdist", {}).items():
+        print(f"  {k:<12}{d['mean']:>+9.1f}{d['p_pos']:>9.2f}{d['p10']:>+9.1f}{d['p50']:>+9.1f}"
+              f"{d['p90']:>+9.1f}{d['min']:>+9.1f}{d['max']:>+9.1f}")
+    print("  (a positive mean with low P(V>0) => the EXPECTED-cost reduction coexists with runs "
+          "where sharing does not help; the confirmatory claim is about the expectation.)")
+
+
+def report_optgap(g):
+    print("\n-- Optimality-gap diagnostic (interpretation bound; NOT a test) --")
+    if "_note" in g:
+        print(f"  {g['_note']}")
+        return
+    orc = g.get("oracle_poisson")
+    print(f"  Poisson Oracle benchmark = {orc:.1f}  (tau = {g['tau']:.0%})" if orc else
+          "  Poisson Oracle benchmark unavailable in refs")
+    for k, d in g.get("arms", {}).items():
+        cost_s = f"{d['cost']:.1f}" if d.get("cost") is not None else "NA"
+        gp = d.get("gap_to_oracle")
+        gap_s = f"{gp:+.1%}" if gp is not None else "NA"
+        print(f"    {k:<10} cost={cost_s:>9}   gap_to_oracle={gap_s}")
+    for c, verdict in g.get("verdicts", {}).items():
+        print(f"    {c}: {verdict}")
+    if g.get("ar_disclosure"):
+        print(f"    {g['ar_disclosure']}")
 
 
 def _mkcell(root, cell, seeds, vals):
@@ -221,9 +319,14 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="sweep_out")
     ap.add_argument("--seeds", default=" ".join(str(s) for s in range(30, 55)))  # n*=25 (fallback)
+    ap.add_argument("--refs", default=None,
+                    help="benchmark refs JSON (default results/baselines_regime_v2.json) for the "
+                         "optimality-gap diagnostic")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         selftest()
     else:
-        report(primaries(a.root, [int(s) for s in a.seeds.split()]))
+        seeds = [int(s) for s in a.seeds.split()]
+        report(primaries(a.root, seeds))
+        report_optgap(optimality_gap(a.root, seeds, refs_path=a.refs))
