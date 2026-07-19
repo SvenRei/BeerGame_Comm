@@ -1,0 +1,54 @@
+================================================================================================
+SIGNAL v1.3 POWER ANALYSIS (n only; margins substantive) | n_sim=20000 | alpha=0.05 (Holm member 0.025)
+================================================================================================
+
+[AR9_raw] observed: n=15 seeds  V mean=+293.4  sd=268.6  nocomm base=4087.7  (band 2% = 81.8)
+     n | pow@100%eff (a=0.05/0.025) | pow@ 50%eff (a=0.05/0.025) | pow@ 25%eff (a=0.05/0.025)
+    10 |          0.94/0.86           |          0.48/0.34           |          0.20/0.11          
+    15 |          0.99/0.98           |          0.64/0.51           |          0.26/0.17          
+    20 |          1.00/1.00           |          0.76/0.64           |          0.32/0.21          
+    25 |          1.00/1.00           |          0.84/0.75           |          0.37/0.25          
+
+[AR9_dhat] observed: n=15 seeds  V mean=-0.8  sd=26.0  nocomm base=4087.7  (band 2% = 81.8)
+     n | pow@100%eff (a=0.05/0.025) | pow@ 50%eff (a=0.05/0.025) | pow@ 25%eff (a=0.05/0.025)
+    10 |          0.04/0.02           |          0.05/0.02           |          0.05/0.02          
+    15 |          0.04/0.02           |          0.04/0.02           |          0.05/0.02          
+    20 |          0.04/0.02           |          0.04/0.02           |          0.05/0.03          
+    25 |          0.04/0.02           |          0.04/0.02           |          0.05/0.02          
+
+[DP_dhat] observed: n=15 seeds  V mean=+203.0  sd=104.5  nocomm base=3892.4  (band 2% = 77.8)
+     n | pow@100%eff (a=0.05/0.025) | pow@ 50%eff (a=0.05/0.025) | pow@ 25%eff (a=0.05/0.025)
+    10 |          1.00/1.00           |          0.88/0.78           |          0.41/0.28          
+    15 |          1.00/1.00           |          0.97/0.94           |          0.55/0.42          
+    20 |          1.00/1.00           |          0.99/0.98           |          0.67/0.54          
+    25 |          1.00/1.00           |          1.00/1.00           |          0.76/0.65          
+
+[P1 CONJUNCTION] both simple effects at Holm-alpha (independence => conservative):
+  n=10: 100%eff->0.87   50%eff->0.27   25%eff->0.03
+  n=15: 100%eff->0.98   50%eff->0.47   25%eff->0.07
+  n=20: 100%eff->1.00   50%eff->0.63   25%eff->0.11
+  n=25: 100%eff->1.00   50%eff->0.74   25%eff->0.17
+  NOTE: DP_dhat here proxies V(dp_dhat)-V(dp_raw) with the dp sharing effect; replace with a
+  direct dhat-vs-raw dp contrast when available (Study 1 has no dp_raw arm -- disclosed).
+
+[P2 GAMMA = V_raw(clip12) - V_raw(inf)] UNOBSERVED cell: sensitivity curves
+  effect grid = fractions of observed AR9_raw V (+293.4); sd proxy = AR9_raw sd x inflation
+     n | sd x1.0 | sd x1.5 | sd x2.0   (cells: pow@100/50/25% eff, Holm-alpha)
+    10 | 0.86/0.34/0.12 | 0.53/0.18/0.07 | 0.34/0.12/0.06
+    15 | 0.98/0.51/0.16 | 0.74/0.26/0.09 | 0.50/0.17/0.08
+    20 | 1.00/0.64/0.21 | 0.87/0.34/0.12 | 0.64/0.21/0.08
+    25 | 1.00/0.74/0.25 | 0.94/0.42/0.14 | 0.74/0.26/0.10
+
+[H-REP TOST proxy: raw_vs_dhat] contrast sd=261.4 (n=15); band=+/-81.8; true diff assumed 0; sd sensitivity x(1.0, 1.5, 2.0)
+     n | sd x1.0 | sd x1.5 | sd x2.0
+    10 |    0.00 |    0.00 |    0.00
+    15 |    0.00 |    0.00 |    0.00
+    20 |    0.01 |    0.00 |    0.00
+    25 |    0.04 |    0.00 |    0.00
+
+================================================================================================
+REGISTERED DECISION RULE (write the chosen n into prereg v1.3 BEFORE hashing):
+  n* = smallest n in [15, 20, 25] with (i) P1-conjunction power >= 0.9 at 50% effect,
+  (ii) Gamma power >= 0.9 at (50% effect, sd x1.5), (iii) TOST power >= 0.8 at sd x1.5.
+  If n* = 15 -> seeds 30-44. If n* = 20 -> seeds 30-49. If n* = 25 -> seeds 30-54.
+  Pilot seeds (>=50 used in development) are excluded from confirmatory analysis regardless.
