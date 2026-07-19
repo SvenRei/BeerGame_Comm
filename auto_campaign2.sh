@@ -19,7 +19,7 @@
 #      The gate's job was to protect budget before that was known. It is known.
 #      GATES=strict restores v1 halting behavior.
 #   3. REFS RUN IN PARALLEL. v1 generated behavioral refs, trained everything,
-#      then generated canonical refs -- two separate 1-3h single-core blocks
+#      (v1.2 note, kept for history) then generated canonical refs -- two 1-3h blocks
 #      with 47 cores idle for the second. Now both launch at once in the
 #      background; canonical finishes long before Phase D needs it.
 #   4. SOFT-FAIL ON ARMS. A handful of failed jobs no longer kills an 8-hour
@@ -44,7 +44,12 @@ cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" || exit 1
   echo "ERROR: run from the BeerGame_Comm repo root."; exit 1; }
 chmod +x setup_pod.sh sweep_all_hypotheses.sh 2>/dev/null
 
-INCLUDE_EXT="${INCLUDE_EXT:-1}"; GATES="${GATES:-advisory}"; SKIP_PILOT="${SKIP_PILOT:-0}"
+INCLUDE_EXT="${INCLUDE_EXT:-0}"; GATES="${GATES:-advisory}"; SKIP_PILOT="${SKIP_PILOT:-0}"
+# ---- v1.3 campaign identity ----------------------------------------------
+# Fresh-seed computational replication: seeds 30-44, DISJOINT from Study 1 (10-24) and from
+# pilot/debug seeds (>=50). Probe set = the six registered do(m) arms.
+export SEEDS="${SEEDS:-30 31 32 33 34 35 36 37 38 39 40 41 42 43 44}"
+export PROBE_ARMS="${PROBE_ARMS:-ar1r9_upstream ar1r9_rbroadcast ar1r9_rbroadcast_raw ar1r9_rbroadcast_learned ar1r9_rbroadcast_eps ar1r9_rbroadcast_condmean ar1r9_upstream_raw ar1r9_downstream_raw ar1r9_beta0_upstream ar1r9_beta05_upstream}"
 JOB_MB="${JOB_MB:-700}"; AUTO_STOP="${AUTO_STOP:-0}"
 ST=auto_state; mkdir -p "$ST" reports snapshots results
 export SIGNAL_CSVLOG=1        # publication learning curves: forced here, not left to the sweep default
@@ -133,7 +138,7 @@ snapshot() {
 if [[ "${1:-}" == "status" ]]; then
   echo "== SIGNAL campaign status =="
   for s in S1_setup S2_freeze S3_refs S4_calibrate S5_pilot S6_phaseA S7_gates \
-           S8_behavioral S9_canonical S10_extract S11_analysis S12_archive; do
+           S8_behavioral S9_qmix S10_extract S11_analysis S12_archive; do
     printf "  %-14s %s\n" "$s" "$([[ -f $ST/$s.ok ]] && echo DONE || echo pending)"
   done
   echo "  sentinels (finished arms): $(ls weights_signal/.done_* 2>/dev/null | wc -l)"
@@ -171,14 +176,16 @@ else say "S1 setup: done"; fi
 # ---- S2 freeze -----------------------------------------------------------
 if ! done_already S2_freeze; then
   say "S2 instrument freeze manifest"
-  sha256sum agents/signal_agent.py agents/train_signal.py agents/eval_signal.py \
+  sha256sum agents/signal_agent.py agents/train_common.py agents/train_signal.py agents/train_qmix.py \
+    agents/qmix_agent.py agents/eval_signal.py \
     agents/signal_csvlog.py agents/topologies.py envs/beer_game_env.py envs/demand_randomization.py \
     scripts/demand_families.py scripts/comm_stats.py scripts/c1_stats.py scripts/prereg.py \
-    scripts/baselines.py scripts/dp_optimum.py scripts/run_confirmatory_report.py \
+    scripts/baselines.py scripts/dp_optimum.py scripts/run_confirmatory_report.py scripts/qmix_dump.py \
     conf/config.yaml conf/agent/signal.yaml sweep_all_hypotheses.sh plot_curves.py \
-    > results/FREEZE_MANIFEST_v1.2.txt 2>/dev/null
-  "$PYBIN" scripts/prereg.py 2>/dev/null | grep -i sha256 >> results/FREEZE_MANIFEST_v1.2.txt
-  note "freeze manifest: $(wc -l < results/FREEZE_MANIFEST_v1.2.txt) lines"
+    test_new_rungs.py test_obs_clip.py \
+    > results/FREEZE_MANIFEST_v1.3.txt 2>/dev/null
+  "$PYBIN" scripts/prereg.py 2>/dev/null | grep -i sha256 >> results/FREEZE_MANIFEST_v1.3.txt
+  note "freeze manifest: $(wc -l < results/FREEZE_MANIFEST_v1.3.txt) lines"
   mark S2_freeze
 else say "S2 freeze: done"; fi
 
@@ -186,7 +193,7 @@ else say "S2 freeze: done"; fi
 BEH_PID=""; CAN_PID=""
 behavioral_refs_live                       # restore the live json from the backup if present
 if ! done_already S3_refs || ! refs_ok results/baselines_regime_v2.json; then
-  say "S3 refs: behavioral + canonical IN PARALLEL (single-core each, 30-120 min)"
+  say "S3 refs: behavioral only (v1.3 is behavioral-cost throughout; no canonical phases)"
   if refs_ok results/baselines_regime_v2.json && [[ ! -f results/baselines_regime_v2.behavioral.json ]]; then
     cp results/baselines_regime_v2.json results/baselines_regime_v2.behavioral.json
     note "behavioral refs: adopted valid hand-placed json (no regeneration)"
@@ -199,8 +206,7 @@ if ! done_already S3_refs || ! refs_ok results/baselines_regime_v2.json; then
       cp results/baselines_regime_v2.json results/baselines_regime_v2.behavioral.json ) &
     BEH_PID=$!
   fi
-  if refs_ok results/baselines_regime_v2_canonical.json; then note "canonical refs: reused"
-  else gen_refs reports/refs_canonical.log --penalty-at-retailer-only & CAN_PID=$!; fi
+  : # v1.3: canonical refs removed (no Phase D/Dext)
 
   if [[ -n "$BEH_PID" ]]; then
     echo "   waiting on behavioral refs (training cannot start without the ruler)..."
@@ -214,7 +220,7 @@ if ! done_already S3_refs || ! refs_ok results/baselines_regime_v2.json; then
 else say "S3 refs: reusing validated behavioral refs"
   [[ -f results/baselines_regime_v2.behavioral.json ]] || \
     cp results/baselines_regime_v2.json results/baselines_regime_v2.behavioral.json
-  refs_ok results/baselines_regime_v2_canonical.json || { gen_refs reports/refs_canonical.log --penalty-at-retailer-only & CAN_PID=$!; }
+  : # v1.3: canonical refs removed
 fi
 
 # ---- S4 NPROC (container-aware) ------------------------------------------
@@ -229,24 +235,48 @@ if (( NPROC > 64 )); then
   note "WARNING: suspicious NPROC=$NPROC (host leak?) -- set NPROC explicitly"
 fi
 note "NPROC=$NPROC"
-dr_out="$(DRYRUN=1 STAGE=train PHASES=core bash sweep_all_hypotheses.sh 2>&1)"
-grep -q "jobs=435" <<< "$dr_out" && note "manifest OK: 29 configs x 15 seeds = 435" \
-  || note "WARNING: DRYRUN did not report jobs=435 -- check SEEDS/PHASES overrides"
+dr_out="$(DRYRUN=1 STAGE=train PHASES=full bash sweep_all_hypotheses.sh 2>&1)"
+grep -q "jobs=840" <<< "$dr_out" && note "manifest OK: v2.0 combined campaign = 56 configs x 15 seeds = 840" \
+  || note "WARNING: DRYRUN did not report jobs=840 -- check SEEDS/PHASES overrides"
 
 # ---- S5 pilot (background, advisory) -------------------------------------
 if ! done_already S5_pilot && [[ "$SKIP_PILOT" != 1 ]]; then
-  say "S5 audibility pilot -> background (advisory only)"
-  ( "$PYBIN" agents/train_signal.py agent=signal agent.train_env=ar1 agent.ar1_rho=0.9 \
-      agent.heldout_mode=ar1 agent.comm_topology=upstream_only agent.msg_content=dhat \
-      seed=10 total_episodes=1500 agent.algorithm=pilot_aud_s10 > reports/pilot_train.log 2>&1
-    pc=$(ls -1dt weights_signal/run_signal_*_pilot_aud_s10/signal_checkpoint_best.pt 2>/dev/null | head -1)
-    [[ -n "$pc" ]] && "$PYBIN" agents/eval_signal.py --ckpt "$pc" --messages --episodes 40 \
-      > reports/pilot_audibility.txt 2>&1 ) &
-fi
-mark S5_pilot
+  say "S5 clip-rate pilot: predeclared clipping frequencies for c in {12,20} (outcome-blind)"
+  "$PYBIN" - <<'PY' > reports/clip_rate_pilot.txt 2>&1
+import sys, numpy as np
+sys.path.insert(0, ".")
+from envs.beer_game_env import BeerGameParallelEnv
+from scripts.demand_families import make_demand_family_envs
+AR1, _, _ = make_demand_family_envs(BeerGameParallelEnv)
+AG = ["retailer", "wholesaler", "distributor", "manufacturer"]
+above12 = above20 = tot = 0
+for seed in range(60, 90):                      # pilot seeds (outside 10-24 and 30-44)
+    env = AR1({"horizon": 50, "max_order": 100, "holding_cost": 0.5, "backorder_cost": 1.0,
+               "demand_type": "poisson", "family": "ar1", "ar1_mu": 12.0, "ar1_rho": 0.9,
+               "ar1_sigma": 3.0})
+    obs, _ = env.reset(seed=seed)
+    rng = np.random.RandomState(seed)
+    while True:
+        # order range 5-35 (mean ~20): realistic dispersion so BOTH windows can bind; the
+        # earlier 10-20 range mechanically zeroed the >20 rate (mock-harness catch, 2026-07-19).
+        obs, _, te, tr, _ = env.step({a: np.array([0.05 + 0.30 * rng.rand()]) for a in AG})
+        for a in AG[1:]:
+            o = float(obs[a][3]); tot += 1
+            above12 += (o > 12.0); above20 += (o > 20.0)
+        if any(tr.values()) or any(te.values()): break
+r12, r20 = above12 / tot, above20 / tot
+ok12, ok20 = 0.15 <= r12 <= 0.95, 0.03 <= r20 <= 0.80   # PREDECLARED windows (registration)
+print(f"upstream order-observations > 12: {100*r12:.1f}%  (window 15-95%) -> {'PASS' if ok12 else 'FAIL'}")
+print(f"upstream order-observations > 20: {100*r20:.1f}%  (window  3-80%) -> {'PASS' if ok20 else 'FAIL'}")
+print("VERDICT:", "clip levels {12,20} bind as registered" if (ok12 and ok20) else "RECONSIDER clip levels")
+PY
+  cat reports/clip_rate_pilot.txt
+  grep -q "VERDICT: clip levels" reports/clip_rate_pilot.txt && note "clip-rate pilot: $(tail -1 reports/clip_rate_pilot.txt)"
+  mark S5_pilot
+else say "S5 clip-rate pilot: skipped or done"; fi
 
 # ---- S6-S8 training ------------------------------------------------------
-train_phase "A" 165;                       mark S6_phaseA; snapshot
+train_phase "A2 B2" 165;                   mark S6_phaseA; snapshot
 
 # ---- S7 gates: EVALUATE + RECORD, never halt (unless GATES=strict) --------
 if ! done_already S7_gates; then
@@ -254,7 +284,7 @@ if ! done_already S7_gates; then
   behavioral_refs_live
   STAGE=dump bash sweep_all_hypotheses.sh > reports/dumpA_stage.log 2>&1
   mkdir -p results/signal_c1
-  for s in $(seq 10 24); do
+  for s in $(seq 30 44); do
     [[ -f "results/signal_c1/seed${s}.json" ]] && continue
     ck=$(ls -1dt weights_signal/run_signal_*_dp_nocomm_s${s}/signal_checkpoint_best.pt 2>/dev/null | head -1)
     [[ -n "$ck" ]] && "$PYBIN" agents/eval_signal.py --ckpt "$ck" --dump-c1 results/signal_c1 \
@@ -273,16 +303,16 @@ ci = next((v for k, v in c.items() if "gap" in k.lower() and "ci" in k.lower()
 if ci: print(f"- C1 Gap_Recovered CI=[{ci[0]:+.3f},{ci[1]:+.3f}] -> {'PASS' if ci[0] > 0 else 'FAIL'}")
 else:  print(f"- C1 gap_mean={c.get('gap_mean')} (CI key absent)")
 PY
-    "$PYBIN" - sweep_out/h2 <<'PY' 2>&1
+    "$PYBIN" - sweep_out/v13 <<'PY' 2>&1
 import sys
 sys.path.insert(0, ".")
 try:
     from scripts.comm_stats import load_cost_dir, value_of_sharing
-    comm, noc = load_cost_dir(f"{sys.argv[1]}/comm"), load_cost_dir(f"{sys.argv[1]}/nocomm")
-    if not (comm and noc): print("- futility: rho=0.9 dumps missing (not evaluable)")
+    comm, noc = load_cost_dir(f"{sys.argv[1]}/ar1r9_raw"), load_cost_dir(f"{sys.argv[1]}/ar1r9_nocomm")
+    if not (comm and noc): print("- replication: rho=0.9 raw dumps missing (not evaluable)")
     else:
         v = value_of_sharing(comm, noc, lambdas=[0.9])
-        print(f"- futility V(rho=0.9)={v['v_cost_mean']:+.1f} ({v['v_cost_pct']:+.2f}%) "
+        print(f"- discovery replication V_raw(rho=0.9)={v['v_cost_mean']:+.1f} ({v['v_cost_pct']:+.2f}%) "
               f"CI=[{v['v_cost_ci'][0]:.1f},{v['v_cost_ci'][1]:.1f}] n={v['n_seeds']} "
               f"TOST_p={v['tost_p']:.3g} equivalent={v['equivalent']}")
 except Exception as e: print(f"- futility: error ({e})")
@@ -302,44 +332,28 @@ PY
   mark S7_gates
 else say "S7 gates: done"; fi
 
-train_phase "B Bnull C E" 225
-[[ "$INCLUDE_EXT" == 1 ]] && train_phase "Bext" 60
+# Count note: 645 = 43 unique arms x 15 in THIS invocation (47 minus 4 in-set dups); 90 of these
+# are [skip]s of S6-trained arms. Campaign-unique total stays 56 arms / 840 jobs (DRYRUN guard).
+train_phase "A B Bnull C E Bext C2 D2 E2 F2" 645
 mark S8_behavioral; snapshot
 
-# ---- S9 canonical --------------------------------------------------------
-if ! done_already S9_canonical; then
-  say "S9 canonical block (refs were generated in parallel during training)"
-  [[ -n "$CAN_PID" ]] && { echo "   waiting on canonical refs..."; wait "$CAN_PID" 2>/dev/null; }
-  if ! refs_ok results/baselines_regime_v2_canonical.json; then
-    note "canonical refs missing/invalid -> regenerating synchronously (one retry)"
-    gen_refs reports/refs_canonical.log --penalty-at-retailer-only
-  fi
-  if refs_ok results/baselines_regime_v2_canonical.json; then
-    "$PYBIN" scripts/baselines.py validate-canonical --lambdas 6 10 14 18 22 \
-      > reports/validate_canonical.txt 2>&1
-    note "canonical refs OK; validate-canonical -> reports/validate_canonical.txt"
-    cp results/baselines_regime_v2_canonical.json results/baselines_regime_v2.json
-    train_phase "D" 45
-    [[ "$INCLUDE_EXT" == 1 ]] && train_phase "Dext" 45
-    behavioral_refs_live
-    cmp -s results/baselines_regime_v2.json results/baselines_regime_v2.behavioral.json \
-      && note "behavioral refs restored" || fatal "refs restore failed -- do not analyze"
-  else
-    note "WARNING: canonical refs unavailable -> phases D/Dext SKIPPED (reports/refs_canonical.log)"
-  fi
-  mark S9_canonical; snapshot
-else say "S9 canonical: done"; behavioral_refs_live; fi
+# ---- S9 QMIX robustness arm (Phase G: sign concordance) -------------------
+if ! done_already S9_qmix; then
+  say "S9 Phase-G QMIX arm: 8 arms x 15 seeds = 120 runs (runner strips SIGNAL_CSVLOG per job)"
+  train_phase "G2" 120
+  mark S9_qmix; snapshot
+else say "S9 QMIX arm: done"; fi
 
 # ---- S10 extraction ------------------------------------------------------
 if ! done_already S10_extract; then
-  say "S10 extraction: dump (~660 jobs) + probe (90)"
+  say "S10 extraction: dump (legacy + v13 + curve + qmix) + probe (10 arms x 15)"
   behavioral_refs_live
   STAGE=dump  bash sweep_all_hypotheses.sh > reports/dump_stage.log 2>&1
   STAGE=probe bash sweep_all_hypotheses.sh > reports/probe_stage.log 2>&1
-  for d in sweep_out/h2/comm sweep_out/h2/nocomm; do
+  for d in sweep_out/v13/ar1r9_raw sweep_out/v13/ar1r9_nocomm sweep_out/v13/dp_raw sweep_out/v13/dp_dhat; do
     n=$(ls "$d"/seed*.json 2>/dev/null | wc -l); (( n == 15 )) || note "WARN: $d has $n/15 seed files"
   done
-  note "fam dirs: $(ls -d sweep_out/fam/ar1r9_* 2>/dev/null | wc -l)/13  probe dirs: $(ls -d sweep_out/probes/iv_* 2>/dev/null | wc -l)/6"
+  note "v13 MAPPO cells: $(ls -d sweep_out/v13/* 2>/dev/null | grep -cv qmix)/28  qmix cells: $(ls -d sweep_out/v13/qmix_* 2>/dev/null | wc -l)/8  probe dirs: $(ls -d sweep_out/probes/iv_* 2>/dev/null | wc -l)/10"
   mark S10_extract
 else say "S10 extraction: done"; fi
 

@@ -23,6 +23,7 @@ env:
   horizon: 50
   # Absolute physical limit on units an agent can order per step.
   max_order: 100
+  obs_order_clip: null      # v1.3 P2 treatment: upstream agents OBSERVE min(order, c); physics untouched
   # Penalty per unit of overstock inventory per week.
   holding_cost: 0.5
   # Penalty per unit of starving backlog per week.

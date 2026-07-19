@@ -27,15 +27,12 @@
 #                                                                        no_neighbor}
 #   C      H5 content ladder   topology=retailer_broadcast, rho=0.9     content in {ip, dhat_ip,          60
 #                              (+ D1 data-vs-forecast: raw vs dhat)      learned, raw}
-#   D      H7 strategic        content=dhat_ip, topology=neighbor,      (beta,tau) in {(1,0),(0,0),(0,t*)}45
-#                              CANONICAL cost, dr_poisson
 #   E      F_INCENTIVE         content=dhat, topology=upstream_only,    beta in {0.0, 0.5} x               60
 #          V(beta) cheap-talk  rho=0.9, BEHAVIORAL cost, tau=0          {comm, nocomm-at-MATCHED-beta}
 #                              [beta=1.0 point REUSED from Phase A: ar1r9_upstream / ar1r9_nocomm]
 #   ---- core total = 435 ----
 #   Bext   H4 wider geometry   as B                                     topo in {skip, full,             60
 #                                                                        link_top_only, link_bottom_only}
-#   Dext   H7 x autocorrelation as D but rho=0.9 (canonical)            (beta,tau) as D                   45
 #   ---- extended total = +105 (540) ----
 #
 #   REUSE (do NOT retrain): H4's upstream point = Phase A's ar1r9_upstream; H4's nocomm baseline =
@@ -59,16 +56,11 @@
 #   arms TRAIN the {coop, selfish, contract} policies; measuring whether contract reaches the tau*-
 #   coordinated equilibrium needs that probe (build in parallel, does not block training).
 #
-# COST MODELS (two, do not mix in one invocation):
-#   A,B,Bnull,C,Bext  -> BEHAVIORAL  (env.penalty_at_retailer_only=false, the default).
-#   D,Dext            -> CANONICAL   (env.penalty_at_retailer_only=true; Clark-Scarf retailer-only penalty).
-#   The BAR/CEILING refs (results/baselines_regime_v2.json) must be regenerated per cost model:
-#     python scripts/baselines.py regime      (once with each cost model set).
-#   Refs affect only the LOGGED Gap_Recovered, not checkpoint SELECTION (raw held-out cost), so training
-#   is valid regardless -- but the reported gap needs the matching refs. RUN BEHAVIORAL AND CANONICAL
-#   PHASES AS SEPARATE INVOCATIONS with the json regenerated between them.
+# COST MODEL: BEHAVIORAL throughout (env.penalty_at_retailer_only=false, the default). v2.0 removed
+#   the canonical Clark-Scarf phases (D/Dext) and with them the dual-refs machinery; one
+#   baselines_regime_v2.json serves the whole campaign.
 #
-# tau* (canonical cost): tau* = p - b_private = backorder_cost(1.0) - 0.0 = 1.0. Under canonical cost
+# (v1.2 history) tau* (canonical cost): tau* = p - b_private = 1.0. Under canonical cost
 #   non-retailer stages carry NO backorder term (b_private=0), a more extreme boundary than the
 #   textbook b>0; confirm coordination still holds via
 #     python scripts/coordination_theory.py    # check_link(p=1.0, h=0.5, b_private=0.0)
@@ -96,10 +88,7 @@
 #   chmod +x sweep_all_hypotheses.sh
 #   DRYRUN=1 ./sweep_all_hypotheses.sh                       # print plan, run nothing
 #   NPROC=48 ./sweep_all_hypotheses.sh                       # BEHAVIORAL core (A B Bnull C) + ...
-#   PHASES="A B Bnull C" NPROC=48 ./sweep_all_hypotheses.sh  # behavioral phases (regenerate refs first)
-#   # ... regenerate baselines_regime_v2.json for CANONICAL cost, then:
-#   PHASES="D Dext" NPROC=48 ./sweep_all_hypotheses.sh       # canonical phases
-#   PHASES=all ./sweep_all_hypotheses.sh                     # everything (warns about mixed cost models)
+#   PHASES=full NPROC=54 ./sweep_all_hypotheses.sh           # v2.0 combined campaign (both studies)
 #   STAGE=dump    ./sweep_all_hypotheses.sh                  # per-seed producers (needs checkpoints)
 #   STAGE=probe   ./sweep_all_hypotheses.sh                  # do(m) intervention dumps (V-claiming arms)
 #   STAGE=analyze ./sweep_all_hypotheses.sh                  # registered statistics
@@ -110,7 +99,7 @@
 #   SEEDS[10..24 =15] EP[8000] PATIENCE[2000] HELDOUT_EPISODES[8] THREADS_PER_JOB[1]
 #   NPROC[min(physical cores, RAM/JOB_MB)] JOB_MB[700 = measured per-job RSS high-water]
 #   SHUFFLE[1 = randomize job order; result-invariant, CRN is by seed value] PIN[0 = taskset per slot]
-#   TAU_STAR[1.0] PHASES[core] STAGE[train|dump|probe|analyze|plot|calibrate|all] DRYRUN[0] PYTHON[python]
+#   PHASES[core] STAGE[train|dump|probe|analyze|plot|calibrate|all] DRYRUN[0] PYTHON[python]
 #   SIGNAL_CSVLOG[1 = write per-run metrics_heldout.csv / metrics_update.csv / run_meta.json into
 #                    each run_dir; the learning-curve artifact. Set 0 to skip. Pure observation.]
 #   OUTROOT[./sweep_out] MILESTONES[[1000,2000,4000,8000]] DUMP_EPISODES[200]
@@ -135,7 +124,6 @@ EP="${EP:-8000}"
 PATIENCE="${PATIENCE:-2000}"
 HELDOUT_EPISODES="${HELDOUT_EPISODES:-8}"
 THREADS_PER_JOB="${THREADS_PER_JOB:-1}"
-TAU_STAR="${TAU_STAR:-1.0}"                                        # CANONICAL-cost tau* = p - b_private = 1.0 (see header)
 PHASES="${PHASES:-core}"
 STAGE="${STAGE:-train}"                                            # train | dump | probe | analyze | all
 DUMP_EPISODES="${DUMP_EPISODES:-200}"                             # episodes/key for the per-seed producers
@@ -217,10 +205,14 @@ fi
 SEL=""
 for p in $PHASES; do
   case "$p" in
-    all)      SEL="$SEL A B Bnull C D E Bext Dext" ;;
-    core)     SEL="$SEL A B Bnull C D E" ;;
-    core2)    SEL="$SEL A2 B2 C2 D2 E2 F2" ;;                     # v1.3 content study (510 runs)
-    extended) SEL="$SEL Bext Dext" ;;
+    all)      SEL="$SEL A B Bnull C E Bext" ;;
+    core)     SEL="$SEL A B Bnull C E" ;;                      # v2.0: D removed (was 435 w/ D at v1.2 tag)
+    core2)    SEL="$SEL A2 B2 C2 D2 E2 F2 G2" ;;                  # v1.3 content study + QMIX arm (540 runs)
+    full)     SEL="$SEL A B Bnull C E Bext A2 B2 C2 D2 E2 F2 G2" ;;  # v2.0 COMBINED campaign: every
+    #         Study-1 + Study-2 hypothesis family, fresh data, one sweep. Canonical D/Dext are OUT
+    #         (descriptive H7 dropped per editor parsimony; reinstate only with the canonical-refs
+    #         machinery restored in the driver). emit() dedups the shared arm names automatically.
+    extended) SEL="$SEL Bext" ;;
     *)        SEL="$SEL $p" ;;
   esac
 done
@@ -299,21 +291,9 @@ if want C; then
   emit "ar1r9_rbroadcast_raw"     "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw"
 fi
 
-# ---- Phase D: strategic core (H7) -- CANONICAL cost, dr_poisson, dhat_ip, neighbor ----
-if want D; then
-  DFIX="$CANON $DP $(COMM neighbor) agent.msg_content=dhat_ip"
-  emit "cn_dp_coop"     "$DFIX agent.srdqn_beta=1.0 agent.tau=0.0"
-  emit "cn_dp_selfish"  "$DFIX agent.srdqn_beta=0.0 agent.tau=0.0"
-  emit "cn_dp_contract" "$DFIX agent.srdqn_beta=0.0 agent.tau=$TAU_STAR"
-fi
-
-# ---- Phase Dext: strategic x autocorrelation (H7) -- CANONICAL cost, rho0.9 ----
-if want Dext; then
-  DXFIX="$CANON $(AR 0.9) $(COMM neighbor) agent.msg_content=dhat_ip"
-  emit "cn_ar1r9_coop"     "$DXFIX agent.srdqn_beta=1.0 agent.tau=0.0"
-  emit "cn_ar1r9_selfish"  "$DXFIX agent.srdqn_beta=0.0 agent.tau=0.0"
-  emit "cn_ar1r9_contract" "$DXFIX agent.srdqn_beta=0.0 agent.tau=$TAU_STAR"
-fi
+# ---- Phases D/Dext (canonical-cost H7 tau*-contract axis): REMOVED in v2.0. H7 is out of the
+#      registered story (editor parsimony; descriptive-only). The v1.2 sweep with these phases is
+#      preserved at the v1.2 git tag; nothing here regenerates canonical-cost data. ----
 
 # ---- Phase E: incentive x communication (F_INCENTIVE) -- BEHAVIORAL, rho0.9, dhat, upstream ----
 # The Crawford-Sobel question in RL form: does the VALUE of the dhat channel survive as sender
@@ -383,9 +363,20 @@ if want E2; then   # P2: OBSERVATION-side order garbling (physics fixed; Blackwe
     emit "ar1r9_clip${c}_rbroadcast_raw" "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw env.obs_order_clip=${c}"
   done
 fi
-# ---- G (PENDING): recurrent-QMIX sign-concordance set (editor Q1(a)); emitted once the QMIX
-#      trainer spike lands. Cells: dp {nocomm, rb_dhat, rb_raw}; ar1r9 {nocomm, rb_dhat, rb_raw};
-#      clip12 {nocomm, rb_raw} (+clip20 pair if resources). ----
+# ---- G2: recurrent-QMIX sign-concordance arm (editor Q1(a)). SAME env/message/eval machinery,
+#      DIFFERENT learner: arms prefixed qmix_ are routed to agents/train_qmix.py by run_one.
+#      Registered flags frozen here: 41-point S-grid on [0,160] (4-unit resolution). ----
+QX="agent.qmix_n_actions=41 agent.qmix_s_max=160"
+if want G2; then
+  emit "qmix_dp_nocomm"       "$BEHAV $DP $NOCOMM $QX"
+  emit "qmix_dp_dhat"         "$BEHAV $DP $(COMM retailer_broadcast) agent.msg_content=dhat $QX"
+  emit "qmix_dp_raw"          "$BEHAV $DP $(COMM retailer_broadcast) agent.msg_content=raw $QX"
+  emit "qmix_ar1r9_nocomm"    "$BEHAV $(AR 0.9) $NOCOMM $QX"
+  emit "qmix_ar1r9_dhat"      "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=dhat $QX"
+  emit "qmix_ar1r9_raw"       "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw $QX"
+  emit "qmix_clip12_nocomm"   "$BEHAV $(AR 0.9) $NOCOMM env.obs_order_clip=12 $QX"
+  emit "qmix_clip12_raw"      "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw env.obs_order_clip=12 $QX"
+fi
 # ---- F2: the timeliness ladder (H-TIME): real-time feed vs batch reporting. ----
 if want F2; then
   emit "ar1r9_rbroadcast_rawlag1" "$BEHAV $(AR 0.9) $(COMM retailer_broadcast) agent.msg_content=raw_lag1"
@@ -397,21 +388,10 @@ NJOBS=$(wc -l < "$JOBS"); NCFG=$(cut -f1 "$JOBS" | sort -u | wc -l)
 echo "============================================================"
 echo " SIGNAL final sweep | stage=$STAGE | phases: [$SEL]"
 echo " configs=$NCFG x seeds=$(echo $SEEDS | wc -w) => jobs=$NJOBS | EP=$EP gate=$HE patience=$PATIENCE"
-echo " cores=$CORES NPROC=$NPROC threads/job=$THREADS_PER_JOB | tau*=$TAU_STAR | out=$OUTROOT"
+echo " cores=$CORES NPROC=$NPROC threads/job=$THREADS_PER_JOB | out=$OUTROOT"
 echo "============================================================"
 
-# cost-model guardrails
-if want D || want Dext; then
-  echo "!! CANONICAL-COST phases selected (D/Dext):"
-  echo "   - regenerate results/baselines_regime_v2.json with penalty_at_retailer_only=True first"
-  echo "     (python scripts/baselines.py regime); refs drive Gap_Recovered, not selection."
-  echo "   - tau* used = $TAU_STAR (= p - b_private, canonical). Confirm: python scripts/coordination_theory.py"
-fi
-if { want D || want Dext; } && { want A || want B || want Bnull || want Bext || want C; }; then
-  echo "WARNING: BEHAVIORAL and CANONICAL phases selected together. One baselines_regime_v2.json cannot"
-  echo "  match both cost models -> the logged Gap_Recovered for one group will be off (selection is fine)."
-  echo "  RECOMMENDED: run behavioral and canonical phases as SEPARATE invocations, regen refs between."
-fi
+# cost-model guardrails: removed in v2.0 (all phases behavioral; no canonical cost model)
 
 if [[ "$DRYRUN" == "1" ]]; then
   echo "-- unique configs --"; cut -f1 "$JOBS" | sort -u
@@ -450,7 +430,12 @@ run_one() {
   log="$LOGDIR/${full}.log"
   echo "[start] $full"
   # shellcheck disable=SC2086  -- $args / $pin are intentionally word-split
-  if $pin $PYTHON agents/train_signal.py agent=signal seed="$seed" total_episodes="$EP" \
+  local entry="agents/train_signal.py"                       # Phase-G routing: BY ARM NAME (no
+  if [[ "$algo" == qmix_* ]]; then                            #  checkpoint stamp -- frozen bytes)
+    entry="agents/train_qmix.py"
+    export SIGNAL_CSVLOG=0    # scalar logger is MAPPO-only; per-job env, other jobs unaffected
+  fi
+  if $pin $PYTHON "$entry" agent=signal seed="$seed" total_episodes="$EP" \
         agent.heldout_every="$HE" agent.heldout_episodes="$HELDOUT_EPISODES" agent.patience="$PATIENCE" \
         "agent.budget_milestones=$MILESTONES" \
         $args agent.algorithm="$full" > "$log" 2>&1; then
@@ -584,6 +569,21 @@ if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
         echo "$PYTHON agents/eval_signal.py --ckpt '$ck' --dump-comm '$V13/${cell}' \
 --dump-ar1 '$r' --ar1-mu $AR1_MU --ar1-sigma $AR1_SIGMA --dump-episodes $DUMP_EPISODES" >> "$DJOBS"
       done
+    done
+  done
+  # -- Phase-G QMIX cells -> v13/qmix_* via scripts/qmix_dump.py (SIGNALPolicy is MAPPO-only) ---
+  for pair in "qmix_dp_nocomm qmix_dp_nocomm --dp" "qmix_dp_dhat qmix_dp_dhat --dp" \
+              "qmix_dp_raw qmix_dp_raw --dp" \
+              "qmix_ar1r9_nocomm qmix_ar1_nocomm --ar1-rho 0.9" \
+              "qmix_ar1r9_dhat qmix_ar1_dhat --ar1-rho 0.9" \
+              "qmix_ar1r9_raw qmix_ar1_raw --ar1-rho 0.9" \
+              "qmix_clip12_nocomm qmix_clip12_nocomm --ar1-rho 0.9" \
+              "qmix_clip12_raw qmix_clip12_raw --ar1-rho 0.9"; do
+    set -- $pair; arm="$1"; cell="$2"; shift 2; mode="$*"
+    for s in $SEEDS; do
+      ck="$(latest_ck "$arm" "$s" signal_checkpoint_best.pt)"; [[ -n "$ck" ]] || continue
+      echo "$PYTHON scripts/qmix_dump.py --ckpt '$ck' --out '$V13/${cell}' $mode \
+--episodes $DUMP_EPISODES" >> "$DJOBS"
     done
   done
   # -- v1.3 substitution curve on the INFORMATIVE signal (raw pairs, budget milestones) --------
@@ -853,11 +853,7 @@ if [[ "$STAGE" == plot || "$STAGE" == all ]]; then
     plot_fig fig_e_incentive_ar1r9.pdf heldout_mean_cost \
       b0_comm "$(_ck ar1r9_beta0_upstream)" b0_nocomm "$(_ck ar1r9_beta0_nocomm)" \
       b05_comm "$(_ck ar1r9_beta05_upstream)" b05_nocomm "$(_ck ar1r9_beta05_nocomm)"
-    # D strategic (canonical): coop / selfish / contract.
-    plot_fig fig_d_strategic_dp.pdf   heldout_mean_cost \
-      coop "$(_ck cn_dp_coop)" selfish "$(_ck cn_dp_selfish)" contract "$(_ck cn_dp_contract)"
-    plot_fig fig_d_strategic_ar1r9.pdf heldout_mean_cost \
-      coop "$(_ck cn_ar1r9_coop)" selfish "$(_ck cn_ar1r9_selfish)" contract "$(_ck cn_ar1r9_contract)"
+    # (v2.0) D strategic figures removed with the canonical phases.
     # Mechanism curve (H3): upstream forecast error over training, comm vs no-comm at rho0.9.
     plot_fig fig_h3_ferr_ar1r9.pdf    forecast_error  comm "$(_ck ar1r9_upstream)" nocomm "$(_ck ar1r9_nocomm)"
     echo "  wrote $(ls "$PLOTROOT"/*.pdf 2>/dev/null | wc -l) figure(s) to $PLOTROOT"
