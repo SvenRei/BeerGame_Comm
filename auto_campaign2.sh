@@ -56,7 +56,10 @@ if [[ ! -f .setup_done ]]; then
   venv/bin/pip install --upgrade -q pip
   venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
   venv/bin/pip install -q numpy scipy pandas matplotlib hydra-core omegaconf wandb pettingzoo gymnasium
-  venv/bin/python test_obs_clip.py >/dev/null 2>&1 && touch .setup_done \
+  venv/bin/python test_obs_clip.py >/dev/null 2>&1 \
+    && WANDB_MODE=disabled venv/bin/python agents/train_signal.py agent=signal seed=99 total_episodes=0 \
+         agent.algorithm=s0smoke >/dev/null 2>&1 \
+    && touch .setup_done \
     || { echo "BOOTSTRAP SMOKE FAILED (test_obs_clip); aborting."; exit 1; }
   echo "== S0 bootstrap complete (sentinel .setup_done) =="
 fi
