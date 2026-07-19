@@ -93,11 +93,8 @@ heldout_oracle_ref: 2202.0 # CEILING fallback
 qmix_n_actions: 21        # discrete order-up-to grid points (G2 arms override to 41)
 qmix_s_max: 200.0         # S ceiling; grid = linspace(0, s_max, n_actions) (G2 -> 160)
 qmix_batch: 8             # episodes sampled per gradient step
-qmix_buffer: 500          # replay capacity (episodes)
-qmix_target_update: 20    # gradient steps between hard target syncs
 qmix_eps_start: 1.0       # epsilon-greedy schedule ...
 qmix_eps_end: 0.05
-qmix_eps_anneal: 4000     # ... annealed over TRAINING EPISODES (not updates)
 qmix_grad_steps: 4        # sampled minibatches per update() call (~ MAPPO k_epochs budget)
 qmix_embed: 32            # monotone mixer embedding width
 # (qmix_lr moved below with certification-adjusted value)
