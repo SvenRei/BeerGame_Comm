@@ -142,11 +142,11 @@ class QMIXTrainer:
         # SIGNAL-interface aliases so train_signal's payload-save works unchanged
         self.critic = self.mixer                                    # "critic" slot in the checkpoint == mixer
         self.params = list(self.actors.parameters()) + list(self.mixer.parameters())
-        self.opt = torch.optim.Adam(self.params, lr=float(cfg.get("lr", 5e-4)))
+        self.opt = torch.optim.Adam(self.params, lr=float(cfg.get("qmix_lr", 5e-4)))          # review fix #5: namespaced
         self.gamma = float(cfg.get("gamma", 0.99))
-        self.reward_scale = float(cfg.get("reward_scale", 100.0))   # scale team cost -> reward magnitude
+        self.reward_scale = float(cfg.get("qmix_reward_scale", 100.0))  # fix #5: namespaced (MAPPO reward_scale=1.0 must NOT leak in)
         self.aux_coef = float(cfg.get("aux_coef", 0.1))             # dhat grounding (same role as SIGNAL)
-        self.grad_clip = float(cfg.get("max_grad_norm", 10.0))
+        self.grad_clip = float(cfg.get("qmix_max_grad_norm", 10.0))     # fix #5: namespaced (MAPPO 0.5 would strangle TD gradients)
         self.batch_size = int(cfg.get("qmix_batch", 8))             # episodes sampled per update
         self.buf_cap = int(cfg.get("qmix_buffer", 500))             # replay capacity (episodes)
         self.target_every = int(cfg.get("qmix_target_update", 20))  # GRAD STEPS between hard target syncs

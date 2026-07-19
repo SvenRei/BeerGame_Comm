@@ -23,7 +23,7 @@ from envs.beer_game_env import BeerGameParallelEnv                   # noqa: E40
 from envs.demand_randomization import DemandRandomizedBeerGame       # noqa: E402
 from scripts.demand_families import make_demand_family_envs          # noqa: E402
 
-SEED_BASE = 100000                                                   # == eval_signal / baselines CRN base
+SEED_BASE = 500000  # FINAL-EVAL space (review 2.0 fix #1; == eval_signal/baselines)                                                   # == eval_signal / baselines CRN base
 DP_TEST_LAMBDAS = [6.0, 10.0, 14.0, 18.0, 22.0]                      # C1 test grid (scored post-hoc)
 
 

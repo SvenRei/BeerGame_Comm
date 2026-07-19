@@ -353,6 +353,7 @@ if ! done_already S10_extract; then
   for d in sweep_out/v13/ar1r9_raw sweep_out/v13/ar1r9_nocomm sweep_out/v13/dp_raw sweep_out/v13/dp_dhat; do
     n=$(ls "$d"/seed*.json 2>/dev/null | wc -l); (( n == 15 )) || note "WARN: $d has $n/15 seed files"
   done
+  "$PYBIN" scripts/verify_manifest.py --seeds "$SEEDS" || fatal "manifest incomplete (fail-closed; see list above)"
   note "v13 MAPPO cells: $(ls -d sweep_out/v13/* 2>/dev/null | grep -cv qmix)/28  qmix cells: $(ls -d sweep_out/v13/qmix_* 2>/dev/null | wc -l)/8  probe dirs: $(ls -d sweep_out/probes/iv_* 2>/dev/null | wc -l)/10"
   mark S10_extract
 else say "S10 extraction: done"; fi

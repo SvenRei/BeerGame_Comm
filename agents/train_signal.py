@@ -1,4 +1,3 @@
-
 import os
 import sys
 from collections import deque
@@ -21,7 +20,8 @@ from agents import signal_csvlog                                    # scientific
 
 # Held-out CRN seed base; must equal baselines.py SEED_BASE and eval_signal.py HELDOUT_SEED_BASE so
 # per-lambda costs are directly comparable to `python scripts/baselines.py regime`.
-SEED_BASE = 100000
+SEED_BASE = 100000   # GATE (checkpoint-selection) space ONLY. Final eval lives at 500000+
+#                      (eval_signal/baselines/qmix_dump) -- three disjoint seed spaces (fix #1).
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

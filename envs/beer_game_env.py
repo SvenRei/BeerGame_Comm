@@ -414,7 +414,14 @@ class BeerGameParallelEnv(ParallelEnv):
             infos[agent] = {"local_cost": local_costs[agent],
                             "supply_chain_cost": total_system_cost,
                             "training_targets": {             # nested to isolate training-only targets
-                                "demand": self._period_demand[agent],
+                                # Review 2.0 fix #2: under obs_order_clip the aux forecasting TARGET is
+                                # clipped identically to the observation for non-retailer agents, so the
+                                # decentralized representation receives NO privileged unclipped signal
+                                # (observation-consistent garbling; the CTDE critic remains global and
+                                # is disclosed as such in the registration).
+                                "demand": (min(float(self._period_demand[agent]), float(_tclip))
+                                           if (_tclip := self._config.get("obs_order_clip", None)) is not None
+                                           and agent != "retailer" else self._period_demand[agent]),
                                 "demand_met": self._period_demand_met[agent]
                             }
                      }

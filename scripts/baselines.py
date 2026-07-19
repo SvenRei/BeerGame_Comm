@@ -79,7 +79,8 @@ AGENTS = ["retailer", "wholesaler", "distributor", "manufacturer"]
 
 # Default env settings (mirror conf/config.yaml env:). Override here or via the env config.
 ENV_BASE = {"horizon": 50, "max_order": 100, "holding_cost": 0.5, "backorder_cost": 1.0}
-SEED_BASE = 100000          # held-out eval seed space (== the SIGNAL held-out eval seeds)
+SEED_BASE = 500000          # FINAL-EVAL seed space (review 2.0 fix #1; == eval_signal HELDOUT_SEED_BASE
+#                             = 500000, disjoint from the gate's 100000+). Regenerate the refs json.
 
 # Disjoint seed blocks (remove in-sample optimism): SELECT tunes baseline levels; EVAL reports
 # every rung. EVAL == SEED_BASE so baselines and the SIGNAL held-out eval (also SEED_BASE+e) are

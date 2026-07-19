@@ -119,7 +119,7 @@ ROOT="$(pwd)"
 # ------------------------------------------------------------ 1. config
 PYTHON="${PYTHON:-python}"
 [[ -x venv/bin/python ]] && PYTHON="venv/bin/python"
-SEEDS="${SEEDS:-10 11 12 13 14 15 16 17 18 19 20 21 22 23 24}"     # 15 seeds (H1 TOST power)
+SEEDS="${SEEDS:-30 31 32 33 34 35 36 37 38 39 40 41 42 43 44}"     # v2.0 confirmatory seeds (fix #7: default = registered set)
 EP="${EP:-8000}"
 PATIENCE="${PATIENCE:-2000}"
 HELDOUT_EPISODES="${HELDOUT_EPISODES:-8}"

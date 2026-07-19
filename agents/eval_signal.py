@@ -45,7 +45,7 @@ What it computes (each part names the question it answers):
 
 Two seed spaces (do not conflate):
   SEED_BASE=2000          -> standard-benchmark / message rollouts.
-  HELDOUT_SEED_BASE=1e5   -> C1 / dump rollouts; == baselines.py SEED_BASE, so SIGNAL and the
+  HELDOUT_SEED_BASE=5e5   -> C1 / dump rollouts; == baselines.py SEED_BASE, so SIGNAL and the
                              reference rungs are scored on the same demand draws (CRN).
 
 Usage:
@@ -76,7 +76,11 @@ from scripts.demand_families import make_demand_family_envs
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SCENARIOS = ["poisson", "black_swan", "extreme_chaos"]
 SEED_BASE = 2000
-HELDOUT_SEED_BASE = 100000          # matches baselines.py SEED_BASE (CRN with the BAR/CEILING)
+HELDOUT_SEED_BASE = 500000          # FINAL-EVAL seed space (review 2.0 fix #1): STRICTLY DISJOINT
+#                                     from the gate's 100000+ (train_signal SEED_BASE) so adaptive
+#                                     checkpoint selection can never touch confirmatory streams.
+#                                     == baselines.py SEED_BASE (CRN with BAR/CEILING); refs MUST be
+#                                     regenerated after this change (S3 does it on-pod).
 HELDOUT_LAMBDAS = [6.0, 10.0, 14.0, 18.0, 22.0]
 ENV_BASE = {"horizon": 50, "max_order": 100}   # fallback only: probes use resolve_env_base(ckpt)
 H_COST = 0.5     # fallback only: run_episode reads h from the live env (env.h); used only when an

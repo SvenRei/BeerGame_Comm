@@ -100,3 +100,8 @@ qmix_eps_end: 0.05
 qmix_eps_anneal: 4000     # ... annealed over TRAINING EPISODES (not updates)
 qmix_grad_steps: 4        # sampled minibatches per update() call (~ MAPPO k_epochs budget)
 qmix_embed: 32            # monotone mixer embedding width
+qmix_lr: 5.0e-4           # fix #5: QMIX-namespaced optimization; MAPPO lr/reward_scale/max_grad_norm
+qmix_reward_scale: 100.0  #   must never leak into the value-based learner (review 2.0 point 5)
+qmix_max_grad_norm: 10.0
+learned_aux_detach: true  # fix #6: aux forecast gradient stopped at the incoming-message edge for the
+                          #   learned rung; set false ONLY for the registered coupling-ablation arm

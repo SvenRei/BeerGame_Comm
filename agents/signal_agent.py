@@ -182,6 +182,7 @@ class SIGNALTrainer:
         self.eps = float(cfg.get("eps_clip", 0.2)); self.k_epochs = int(cfg.get("k_epochs", 4))
         self.ent_coef = float(cfg.get("entropy_coef", 0.0)); self.vf_coef = float(cfg.get("vf_coef", 0.5))
         self.aux_coef = float(cfg.get("aux_coef", 0.1))           # d_hat grounding (message interpretability)
+        self.learned_aux_detach = bool(cfg.get("learned_aux_detach", True))  # review fix #6 (see update())
         self.max_grad_norm = float(cfg.get("max_grad_norm", 0.5))
         # reward_scale divides the shaped reward, shrinking the critic's target/loss/gradient so it no
         # longer dominates the shared gradient clip and starves the (standardized-advantage) actor. The
@@ -391,8 +392,19 @@ class SIGNALTrainer:
                     surr = torch.min(ratio * A, torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * A)
                     ent = Normal(S_mu, S_std).entropy().mean()
                     ploss = ploss - surr.mean() - self.ent_coef * ent
-                    # d_hat grounding: keeps the demand message interpretable as a forecast (light aux loss)
-                    dhat = self.actors[i].demand_estimate(h)                            # [T,1]
+                    # d_hat grounding: keeps the demand message interpretable as a forecast (light aux
+                    # loss). Review 2.0 fix #6: for the LEARNED rung the aux gradient is stopped at the
+                    # incoming-message edge -- d_hat is read from a belief over the STORED (detached)
+                    # rollout messages, so demand prediction trains only the receiver's local
+                    # representation and can never shape the sender's channel. The policy loss keeps the
+                    # coupled in-graph h (DIAL unchanged). learned_aux_detach=false restores the old
+                    # coupling as the registered ablation arm.
+                    if self.content == "learned" and self.learned_aux_detach:
+                        h_aux, _ = self.actors[i].belief(d["obs"][:, i, :].unsqueeze(1),
+                                                         d["msg_in"][:, i, :].unsqueeze(1))
+                        dhat = self.actors[i].demand_estimate(h_aux.squeeze(1))         # [T,1]
+                    else:
+                        dhat = self.actors[i].demand_estimate(h)                        # [T,1]
                     aux = F.mse_loss(dhat, d["dtgt"][:, i].unsqueeze(-1))               # (named for observation only)
                     ploss = ploss + self.aux_coef * aux
                     if self.upd_obs is not None:   # OBSERVATION: PPO trust-region health (read-only)
