@@ -238,6 +238,12 @@ note "NPROC=$NPROC"
 dr_out="$(DRYRUN=1 STAGE=train PHASES=full bash sweep_all_hypotheses.sh 2>&1)"
 grep -q "jobs=840" <<< "$dr_out" && note "manifest OK: v2.0 combined campaign = 56 configs x 15 seeds = 840" \
   || note "WARNING: DRYRUN did not report jobs=840 -- check SEEDS/PHASES overrides"
+# Review 3.0 problem 11: IMMUTABLE campaign manifest, written once from the full-phase job list and
+# never overwritten (jobs.tsv is rewritten per sweep invocation; the verifier must not depend on it).
+if [[ ! -f reports/FROZEN_CAMPAIGN_MANIFEST.tsv ]]; then
+  cp sweep_out/jobs.tsv reports/FROZEN_CAMPAIGN_MANIFEST.tsv
+  note "frozen campaign manifest: $(wc -l < reports/FROZEN_CAMPAIGN_MANIFEST.tsv) arm x seed rows (immutable)"
+fi
 
 # ---- S5 pilot (background, advisory) -------------------------------------
 if ! done_already S5_pilot && [[ "$SKIP_PILOT" != 1 ]]; then
@@ -353,7 +359,8 @@ if ! done_already S10_extract; then
   for d in sweep_out/v13/ar1r9_raw sweep_out/v13/ar1r9_nocomm sweep_out/v13/dp_raw sweep_out/v13/dp_dhat; do
     n=$(ls "$d"/seed*.json 2>/dev/null | wc -l); (( n == 15 )) || note "WARN: $d has $n/15 seed files"
   done
-  "$PYBIN" scripts/verify_manifest.py --seeds "$SEEDS" || fatal "manifest incomplete (fail-closed; see list above)"
+  "$PYBIN" scripts/verify_manifest.py --seeds "$SEEDS" --jobs reports/FROZEN_CAMPAIGN_MANIFEST.tsv \
+    || fatal "manifest incomplete (fail-closed against the FROZEN manifest; see list above)"
   note "v13 MAPPO cells: $(ls -d sweep_out/v13/* 2>/dev/null | grep -cv qmix)/28  qmix cells: $(ls -d sweep_out/v13/qmix_* 2>/dev/null | wc -l)/8  probe dirs: $(ls -d sweep_out/probes/iv_* 2>/dev/null | wc -l)/10"
   mark S10_extract
 else say "S10 extraction: done"; fi
@@ -363,6 +370,8 @@ if ! done_already S11_analysis; then
   say "S11 statistics + figures (also regenerable offline from the archive)"
   behavioral_refs_live
   STAGE=analyze bash sweep_all_hypotheses.sh > reports/analyze_FULL.txt 2>&1
+  "$PYBIN" scripts/confirmatory_v2.py --root sweep_out --seeds "$SEEDS" \
+    | tee reports/CONFIRMATORY_PRIMARIES.txt || fatal "confirmatory primary analysis failed (fail-closed)"
   STAGE=plot    bash sweep_all_hypotheses.sh > reports/plot_stage.log 2>&1
   note "figures: $(ls sweep_out/figs/*.pdf 2>/dev/null | wc -l) PDFs"
   "$PYBIN" scripts/run_confirmatory_report.py --signal-dir results/signal_c1 \
