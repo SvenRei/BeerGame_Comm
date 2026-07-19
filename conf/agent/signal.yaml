@@ -82,3 +82,21 @@ heldout_every: 200        # eval cadence (episodes); 100 dense pilot, 400 sweep
 heldout_episodes: 8       # episodes per regime; 8 fast pilot, 20 clean
 heldout_fixed_ref: 4726.0  # BAR     fallback if results/baselines_regime_v2.json is absent
 heldout_oracle_ref: 2202.0 # CEILING fallback
+
+# ===================== QMIX (Phase-G robustness arm; agents/train_qmix.py) =====================
+# Declared so Hydra struct mode accepts the sweep's registered G2 overrides
+# (qmix_n_actions=41 qmix_s_max=160). Defaults below MUST equal the cfg.get()
+# defaults in agents/qmix_agent.py -- change them only in lockstep.
+# NOTE: qmix_seed is DELIBERATELY not declared: its code default derives from the
+# run's torch seed (per-seed exploration decoupling); a fixed value here would
+# silently re-couple exploration noise across all campaign seeds.
+qmix_n_actions: 21        # discrete order-up-to grid points (G2 arms override to 41)
+qmix_s_max: 200.0         # S ceiling; grid = linspace(0, s_max, n_actions) (G2 -> 160)
+qmix_batch: 8             # episodes sampled per gradient step
+qmix_buffer: 500          # replay capacity (episodes)
+qmix_target_update: 20    # gradient steps between hard target syncs
+qmix_eps_start: 1.0       # epsilon-greedy schedule ...
+qmix_eps_end: 0.05
+qmix_eps_anneal: 4000     # ... annealed over TRAINING EPISODES (not updates)
+qmix_grad_steps: 4        # sampled minibatches per update() call (~ MAPPO k_epochs budget)
+qmix_embed: 32            # monotone mixer embedding width

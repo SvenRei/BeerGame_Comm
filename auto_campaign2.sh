@@ -176,7 +176,7 @@ else say "S1 setup: done"; fi
 # ---- S2 freeze -----------------------------------------------------------
 if ! done_already S2_freeze; then
   say "S2 instrument freeze manifest"
-  sha256sum agents/signal_agent.py agents/train_common.py agents/train_signal.py agents/train_qmix.py \
+  sha256sum agents/signal_agent.py agents/train_signal.py agents/train_qmix.py \
     agents/qmix_agent.py agents/eval_signal.py \
     agents/signal_csvlog.py agents/topologies.py envs/beer_game_env.py envs/demand_randomization.py \
     scripts/demand_families.py scripts/comm_stats.py scripts/c1_stats.py scripts/prereg.py \
