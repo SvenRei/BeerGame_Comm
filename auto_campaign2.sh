@@ -63,7 +63,7 @@ fi
 # ---- v1.3 campaign identity ----------------------------------------------
 # Fresh-seed computational replication: seeds 30-44, DISJOINT from Study 1 (10-24) and from
 # pilot/debug seeds (>=50). Probe set = the six registered do(m) arms.
-export SEEDS="${SEEDS:-30 31 32 33 34 35 36 37 38 39 40 41 42 43 44}"
+export SEEDS="${SEEDS:-30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54}"   # n*=25 via the registered FALLBACK (power run 2026-07-19)
 export PROBE_ARMS="${PROBE_ARMS:-ar1r9_upstream ar1r9_rbroadcast ar1r9_rbroadcast_raw ar1r9_rbroadcast_learned ar1r9_rbroadcast_eps ar1r9_rbroadcast_condmean ar1r9_upstream_raw ar1r9_downstream_raw ar1r9_beta0_upstream ar1r9_beta05_upstream}"
 JOB_MB="${JOB_MB:-700}"; AUTO_STOP="${AUTO_STOP:-0}"
 ST=auto_state; mkdir -p "$ST" reports snapshots results
@@ -251,8 +251,8 @@ if (( NPROC > 64 )); then
 fi
 note "NPROC=$NPROC"
 dr_out="$(DRYRUN=1 STAGE=train PHASES=full bash sweep_all_hypotheses.sh 2>&1)"
-grep -q "jobs=840" <<< "$dr_out" && note "manifest OK: v2.0 combined campaign = 56 configs x 15 seeds = 840" \
-  || note "WARNING: DRYRUN did not report jobs=840 -- check SEEDS/PHASES overrides"
+grep -q "jobs=1400" <<< "$dr_out" && note "manifest OK: v2.0 combined campaign = 56 configs x 25 seeds = 1400 (n*=25 fallback)" \
+  || note "WARNING: DRYRUN did not report jobs=1400 -- check SEEDS/PHASES overrides"
 # Review 3.0 problem 11: IMMUTABLE campaign manifest, written once from the full-phase job list and
 # never overwritten (jobs.tsv is rewritten per sweep invocation; the verifier must not depend on it).
 if [[ ! -f reports/FROZEN_CAMPAIGN_MANIFEST.tsv ]]; then
@@ -297,7 +297,7 @@ PY
 else say "S5 clip-rate pilot: skipped or done"; fi
 
 # ---- S6-S8 training ------------------------------------------------------
-train_phase "A2 B2" 165;                   mark S6_phaseA; snapshot
+train_phase "A2 B2" 275;                   mark S6_phaseA; snapshot
 
 # ---- S7 gates: EVALUATE + RECORD, never halt (unless GATES=strict) --------
 if ! done_already S7_gates; then
@@ -355,13 +355,13 @@ else say "S7 gates: done"; fi
 
 # Count note: 645 = 43 unique arms x 15 in THIS invocation (47 minus 4 in-set dups); 90 of these
 # are [skip]s of S6-trained arms. Campaign-unique total stays 56 arms / 840 jobs (DRYRUN guard).
-train_phase "A B Bnull C E Bext C2 D2 E2 F2" 645
+train_phase "A B Bnull C E Bext C2 D2 E2 F2" 1075
 mark S8_behavioral; snapshot
 
 # ---- S9 QMIX robustness arm (Phase G: sign concordance) -------------------
 if ! done_already S9_qmix; then
-  say "S9 Phase-G QMIX arm: 8 arms x 15 seeds = 120 runs (runner strips SIGNAL_CSVLOG per job)"
-  train_phase "G2" 120
+  say "S9 Phase-G QMIX arm: 8 arms x 25 seeds = 200 runs (runner strips SIGNAL_CSVLOG per job)"
+  train_phase "G2" 200
   mark S9_qmix; snapshot
 else say "S9 QMIX arm: done"; fi
 

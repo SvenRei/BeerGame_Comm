@@ -9,8 +9,13 @@ REGISTRY = {
  "version": "2.0", "date": "2026-07-19",
  "history_hashes": {"v1.1": "cfae5dee...58b8", "v1.2": "b9e9cf6e...cdc59"},
  "campaign": {"phases": "full", "arms": 56, "jobs_at_n15": 840,
-   "seeds": "30..(30+n*-1); n* per SIGNAL_v13_power_analysis.md decision rule incl. fallback "
-            "(no qualifying n -> n*=25, shortfall reported); pilot/dev seeds >=50 excluded",
+   "seeds": "30..54 FINAL: n*=25 by the registered FALLBACK CLAUSE -- the 2026-07-19 power run "
+            "(reports/power_v13.txt; AR9_raw sd=268.6) met no target at any menu n under the 50%-effect "
+            "sensitivity (P1-conj 0.47/0.63/0.74, Gamma x1.5 0.26/0.34/0.42, H-REP proxy ~0); at the "
+            "OBSERVED effects n=25 gives P1-conj 1.00 and Gamma(x1.5) 0.94. H-REP planning proxy "
+            "(raw-vs-dhat sd=261) disclosed as strongly conservative: eps/linpred are affine "
+            "transforms of the SAME raw stream, so true contrast sd is far smaller; inconclusive "
+            "H-REP outcomes are reportable as such. Pilot/dev seeds >=50 excluded.",
    "manifest": "reports/FROZEN_CAMPAIGN_MANIFEST.tsv written once; scripts/verify_manifest.py "
                "fail-closed over every registered cell before any analysis"},
  "primaries": {

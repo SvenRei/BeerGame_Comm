@@ -175,7 +175,7 @@ def selftest():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="sweep_out")
-    ap.add_argument("--seeds", default=" ".join(str(s) for s in range(30, 45)))
+    ap.add_argument("--seeds", default=" ".join(str(s) for s in range(30, 55)))  # n*=25 (fallback)
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:

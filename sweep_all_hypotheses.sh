@@ -119,7 +119,7 @@ ROOT="$(pwd)"
 # ------------------------------------------------------------ 1. config
 PYTHON="${PYTHON:-python}"
 [[ -x venv/bin/python ]] && PYTHON="venv/bin/python"
-SEEDS="${SEEDS:-30 31 32 33 34 35 36 37 38 39 40 41 42 43 44}"     # v2.0 confirmatory seeds (fix #7: default = registered set)
+SEEDS="${SEEDS:-30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54}"     # v2.0 registered seeds: n*=25 (fallback clause; power run 2026-07-19)
 EP="${EP:-8000}"
 PATIENCE="${PATIENCE:-2000}"
 HELDOUT_EPISODES="${HELDOUT_EPISODES:-8}"
