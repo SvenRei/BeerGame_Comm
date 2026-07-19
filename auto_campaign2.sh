@@ -45,6 +45,21 @@ cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" || exit 1
 chmod +x setup_pod.sh sweep_all_hypotheses.sh 2>/dev/null
 
 INCLUDE_EXT="${INCLUDE_EXT:-0}"; GATES="${GATES:-advisory}"; SKIP_PILOT="${SKIP_PILOT:-0}"
+# ---- S0 self-bootstrap (idempotent; makes `git clone && bash auto_campaign2.sh` sufficient) ----
+export WANDB_MODE=disabled
+if [[ ! -f .setup_done ]]; then
+  echo "== S0 bootstrap: venv + CPU torch + deps (first run only) =="
+  if command -v apt-get >/dev/null 2>&1 && [[ "$(id -u)" == 0 ]]; then
+    apt-get update -qq && apt-get install -y -qq tmux python3-venv python3-pip >/dev/null 2>&1 || true
+  fi
+  [[ -d venv ]] || python3 -m venv venv
+  venv/bin/pip install --upgrade -q pip
+  venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+  venv/bin/pip install -q numpy scipy pandas matplotlib hydra-core omegaconf wandb pettingzoo gymnasium
+  venv/bin/python test_obs_clip.py >/dev/null 2>&1 && touch .setup_done \
+    || { echo "BOOTSTRAP SMOKE FAILED (test_obs_clip); aborting."; exit 1; }
+  echo "== S0 bootstrap complete (sentinel .setup_done) =="
+fi
 # ---- v1.3 campaign identity ----------------------------------------------
 # Fresh-seed computational replication: seeds 30-44, DISJOINT from Study 1 (10-24) and from
 # pilot/debug seeds (>=50). Probe set = the six registered do(m) arms.
@@ -374,6 +389,24 @@ if ! done_already S11_analysis; then
     | tee reports/CONFIRMATORY_PRIMARIES.txt || fatal "confirmatory primary analysis failed (fail-closed)"
   STAGE=plot    bash sweep_all_hypotheses.sh > reports/plot_stage.log 2>&1
   note "figures: $(ls sweep_out/figs/*.pdf 2>/dev/null | wc -l) PDFs"
+  { echo "# SIGNAL v2.0 -- FINAL RESULT SHEET  ($(date))"
+    echo "repo: $(git rev-parse --short HEAD 2>/dev/null)   prereg: $("$PYBIN" scripts/prereg_v2.py 2>/dev/null | grep SHA256)"
+    echo "manifest: $(wc -l < reports/FROZEN_CAMPAIGN_MANIFEST.tsv 2>/dev/null) arm x seed rows (frozen)"
+    echo; echo "## 1. Registered primaries + frozen secondaries (confirmatory_v2)"; echo '~~~'
+    cat reports/CONFIRMATORY_PRIMARIES.txt 2>/dev/null; echo '~~~'
+    echo; echo "## 2. Gates (C1 positive control, discovery replication)"; echo '~~~'
+    cat reports/GATE_VERDICTS.md 2>/dev/null; echo '~~~'
+    echo; echo "## 3. Clip-rate pilot (P2 treatment validity)"; echo '~~~'
+    cat reports/clip_rate_pilot.txt 2>/dev/null; echo '~~~'
+    echo; echo "## 4. Full registered family analyzers (geometry, incentives, ladder, C1 detail)"; echo '~~~'
+    cat reports/analyze_FULL.txt 2>/dev/null; echo '~~~'
+    echo; echo "## 5. Integrity"; echo '~~~'
+    echo "verify_manifest: PASSED (campaign would have aborted otherwise)"
+    [[ -s reports/FAILED_ARMS.txt ]] && { echo "first-attempt failures (all retried):"; cat reports/FAILED_ARMS.txt; } \
+      || echo "no arm ever failed, even on first attempt"
+    echo "figures: $(ls sweep_out/figs/*.pdf 2>/dev/null | wc -l) PDFs in sweep_out/figs"; echo '~~~'
+  } > reports/FINAL_RESULTS.md
+  note "ONE result sheet: reports/FINAL_RESULTS.md"
   "$PYBIN" scripts/run_confirmatory_report.py --signal-dir results/signal_c1 \
     --refs results/baselines_regime_v2.json \
     --comm sweep_out/h1pois/nocomm sweep_out/h1pois/comm sweep_out/h1pois/rbroadcast \
