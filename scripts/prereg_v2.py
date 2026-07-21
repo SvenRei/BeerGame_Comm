@@ -6,7 +6,20 @@ Supersedes scripts/prereg.py (v1.x; retained for history). Frozen analysis = con
 import hashlib, json
 
 REGISTRY = {
- "version": "2.0", "date": "2026-07-19",
+ "version": "2.1", "date": "2026-07-20",
+ "amendment_log": "v2.1 (2026-07-20, PRE-UNBLINDING): the v2.0 registry self-contradicted -- the "
+   "power-menu fallback line assigned seeds 30..54 while the same registry excluded seeds >=50 as "
+   "dev/pilot range (seed 50 was in fact used for the QMIX hyperparameter certification). The "
+   "fail-closed manifest verifier caught the contradiction at S10, BEFORE any confirmatory "
+   "analysis executed; no confirmatory statistic was ever computed on the conflicted set. "
+   "Resolution: confirmatory seeds = 25..49 (25 seeds; 25-29 virgin -- never used in any training, "
+   "tuning, pilot, or fixture; 30-49 already trained under the frozen instrument; 50-54 runs are "
+   "quarantined on disk as non-confirmatory extras and reported nowhere). The substantive "
+   "registered rule -- 25 fresh seeds disjoint from the Study-1 range 10-24 AND from all dev/pilot "
+   "seeds -- is satisfied by 25..49 and was violated by 30..54. The S7 advisory gate reads dated "
+   "2026-07-20 19:41 were computed on the 30..54 window pre-amendment and are recorded as "
+   "advisory history only; all gates recompute under 25..49. Sample size, hypotheses, tests, "
+   "thresholds, and analysis code are UNCHANGED by this amendment.",
  "inference_stack": "ALL confirmatory inference delegates to community-validated libraries "
    "(scipy>=1.10 stats; statsmodels>=0.14 multitest) -- NO hand-rolled estimators. One-sided "
    "decisions = scipy.stats.ttest_1samp (paired-difference t-test, exact under normality, "
@@ -26,7 +39,7 @@ REGISTRY = {
    "library-based decision; (iv) the optimality-gap and V-distribution honesty diagnostics. The "
    "abstract must not imply the crossover is a new finding.",
  "campaign": {"phases": "full", "arms": 56, "jobs_at_n15": 840,
-   "seeds": "30..54 FINAL: n*=25 by the registered FALLBACK CLAUSE -- the 2026-07-19 power run "
+   "seeds": "25..49 FINAL (AMENDMENT v2.1, pre-unblinding -- see amendment_log): n*=25 by the registered FALLBACK CLAUSE -- the 2026-07-19 power run "
             "(reports/power_v13.txt; AR9_raw sd=268.6) met no target at any menu n under the 50%-effect "
             "sensitivity (P1-conj 0.47/0.63/0.74, Gamma x1.5 0.26/0.34/0.42, H-REP proxy ~0); at the "
             "OBSERVED effects n=25 gives P1-conj 1.00 and Gamma(x1.5) 0.94. H-REP planning proxy "

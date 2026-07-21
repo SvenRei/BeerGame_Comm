@@ -375,7 +375,7 @@ def selftest():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="sweep_out")
-    ap.add_argument("--seeds", default=" ".join(str(s) for s in range(30, 55)))  # n*=25 (fallback)
+    ap.add_argument("--seeds", default=" ".join(str(s) for s in range(25, 50)))  # n*=25; amendment v2.1
     ap.add_argument("--refs", default=None,
                     help="benchmark refs JSON (default results/baselines_regime_v2.json) for the "
                          "optimality-gap diagnostic")

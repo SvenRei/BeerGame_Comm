@@ -66,7 +66,7 @@ fi
 # ---- v1.3 campaign identity ----------------------------------------------
 # Fresh-seed computational replication: seeds 30-44, DISJOINT from Study 1 (10-24) and from
 # pilot/debug seeds (>=50). Probe set = the six registered do(m) arms.
-export SEEDS="${SEEDS:-30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54}"   # n*=25 via the registered FALLBACK (power run 2026-07-19)
+export SEEDS="${SEEDS:-25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49}"   # n*=25; AMENDMENT v2.1: 25..49 (50-54 = dev/pilot range, quarantined; see prereg amendment_log)
 export PROBE_ARMS="${PROBE_ARMS:-ar1r9_upstream ar1r9_rbroadcast ar1r9_rbroadcast_raw ar1r9_rbroadcast_learned ar1r9_rbroadcast_eps ar1r9_rbroadcast_condmean ar1r9_upstream_raw ar1r9_downstream_raw ar1r9_beta0_upstream ar1r9_beta05_upstream}"
 JOB_MB="${JOB_MB:-700}"; AUTO_STOP="${AUTO_STOP:-0}"
 ST=auto_state; mkdir -p "$ST" reports snapshots results
@@ -378,7 +378,9 @@ if ! done_already S10_extract; then
   STAGE=dump  bash sweep_all_hypotheses.sh > reports/dump_stage.log 2>&1
   STAGE=probe bash sweep_all_hypotheses.sh > reports/probe_stage.log 2>&1
   for d in sweep_out/v13/ar1r9_raw sweep_out/v13/ar1r9_nocomm sweep_out/v13/dp_raw sweep_out/v13/dp_dhat; do
-    n=$(ls "$d"/seed*.json 2>/dev/null | wc -l); (( n == 15 )) || note "WARN: $d has $n/15 seed files"
+    # count exact per-seed dump files only (seedN.json); companion files (curves, bw, iv) are expected extras
+    n=$(ls "$d" 2>/dev/null | grep -cE '^seed[0-9]+\.json$'); want=$(wc -w <<< "$SEEDS")
+    (( n >= want )) || note "WARN: $d has $n/$want seed files"
   done
   "$PYBIN" scripts/verify_manifest.py --seeds "$SEEDS" --jobs reports/FROZEN_CAMPAIGN_MANIFEST.tsv \
     || fatal "manifest incomplete (fail-closed against the FROZEN manifest; see list above)"

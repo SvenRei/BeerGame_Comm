@@ -46,7 +46,11 @@ def main():
 
     # (c) seed-space hygiene
     for s in seeds:
-        if s < 30 or 10 <= s <= 24 or s >= 50:
+        # Amendment v2.1 (pre-unblinding): confirmatory seeds are 25..49. 10-24 = Study-1 prior
+        # campaign; >=50 = dev/pilot (incl. the seed-50 QMIX certification runs). The original
+        # 30..54 window self-contradicted the >=50 pilot exclusion -- caught fail-closed at S10
+        # BEFORE any confirmatory analysis ran; see the registry's amendment_log.
+        if s < 25 or s >= 50:
             problems.append(f"SEED-SPACE: confirmatory seed {s} overlaps prior/pilot ranges")
 
     # (a) training completeness against the emitted manifest
