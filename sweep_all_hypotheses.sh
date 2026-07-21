@@ -121,6 +121,11 @@ PYTHON="${PYTHON:-python}"
 [[ -x venv/bin/python ]] && PYTHON="venv/bin/python"
 SEEDS="${SEEDS:-25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49}"     # v2.1 amendment: confirmatory seeds 25..49 (50-54 quarantined as dev/pilot)
 NSEEDS=$(wc -w <<< "$SEEDS")
+# REGISTERED-SEED WHITELIST (n=25-vs-n=30 audit fix): every scripts/comm_stats.py loader --
+# including the inline ANALYZE block, `curve`, and `interventions` -- filters directory
+# discovery to exactly this vector, so quarantined dev/pilot seed files (50-54) physically
+# present in sweep_out can never contaminate a family/curve/intervention table again.
+export SIGNAL_SEEDS="$SEEDS"
 EP="${EP:-8000}"
 PATIENCE="${PATIENCE:-2000}"
 HELDOUT_EPISODES="${HELDOUT_EPISODES:-8}"
@@ -608,26 +613,34 @@ if [[ "$STAGE" == dump || "$STAGE" == all ]]; then
   done
   echo "  $(wc -l < "$DJOBS") dump jobs, $NPROC parallel"
   xargs -d '\n' -P "$NPROC" -I LINE bash -c 'eval "$1"' _ LINE < "$DJOBS" > "$OUTROOT/dump.log" 2>&1 || true
-  # merge per-rho AR1 subdirs -> rho-keyed per-seed files (the h2_slope format)
+  # merge per-rho AR1 subdirs -> rho-keyed per-seed files (the h2_slope format).
+  # The merge honours the registered whitelist (SIGNAL_SEEDS) so the merged dirs themselves
+  # can never carry quarantined dev/pilot seeds into downstream analysis.
   "$PYTHON" - "$H2ROOT" <<'PY'
 import sys, os, glob, json
 root = sys.argv[1]
+_wl = os.environ.get("SIGNAL_SEEDS", "").split()
+wl = {s for s in _wl} if _wl else None
 tags = {"0.0": "ar1r0", "0.3": "ar1r3", "0.6": "ar1r6", "0.9": "ar1r9"}
 for grp in ("comm", "nocomm"):
-    merged = {}
+    merged, dropped = {}, set()
     for r, t in tags.items():
         for p in glob.glob(os.path.join(root, f"{grp}_{t}", "seed*.json")):
             b = os.path.basename(p)
             if b.endswith(("_ferr.json", "_bw.json", "_censor.json", "_iv.json")):
                 continue
             s = b[4:-5]                                        # seed<N>.json -> N
+            if wl is not None and s not in wl:
+                dropped.add(s)
+                continue
             with open(p) as f:
                 merged.setdefault(s, {}).update(json.load(f))
     out = os.path.join(root, grp); os.makedirs(out, exist_ok=True)
     for s, kv in merged.items():
         with open(os.path.join(out, f"seed{s}.json"), "w") as f:
             json.dump(kv, f, indent=2)
-    print(f"  merged {grp}: {len(merged)} seeds -> {out}")
+    note = f" (dropped unregistered: {sorted(dropped, key=int)})" if dropped else ""
+    print(f"  merged {grp}: {len(merged)} seeds -> {out}{note}")
 PY
 fi
 
@@ -663,7 +676,12 @@ fi
 
 # ------------------------------------------------------------ 6. ANALYZE: registered H1/H2/H3 statistics
 if [[ "$STAGE" == analyze || "$STAGE" == all ]]; then
+  # Fail-closed whitelist during analysis: a dir that EXISTS but lacks a registered seed aborts
+  # (contamination surface); an absent dir stays a soft "skipped" (feature not run). Override
+  # with SIGNAL_SEEDS_STRICT=0 for exploratory partial reads only.
+  export SIGNAL_SEEDS_STRICT="${SIGNAL_SEEDS_STRICT:-1}"
   echo "== ANALYZE: H1 (TOST) + S1 + H2 (registered slope) + H3 + V(beta) =="
+  echo "   [seed whitelist: $SIGNAL_SEEDS | strict=$SIGNAL_SEEDS_STRICT]"
   "$PYTHON" - "$H2ROOT" "$H1ROOT" "$EROOT" "$FAMROOT" <<'PY'
 import sys, json
 sys.path.insert(0, ".")
@@ -777,8 +795,10 @@ try:
                   " CI=[%.1f,%.1f] TOST p=%.3g -> %s"
                   % (c3["v_cost_mean"], c3["v_cost_ci"][0], c3["v_cost_ci"][1], c3["tost_p"],
                      "EQUIVALENT" if c3["equivalent"] else "not equivalent"))
-        print("  (NOTE the C3 wording amendment: prereg v1.1 says upstream_only; the executed Phase-C")
-        print("   arms are retailer_broadcast -- reconcile by DATED amendment before unblinding.)")
+        print("  (C3 STATUS: EXPLORATORY. Prereg v1.1 wording specified upstream_only; the executed")
+        print("   Phase-C arms are retailer_broadcast, and NO dated pre-unblinding amendment covers")
+        print("   this mismatch (the v2.1 amendment addressed seeds only). Per the registration's own")
+        print("   rules the C3 bound is therefore reported as exploratory, not confirmatory.)")
 except Exception as e:
     print("  F_GEOMETRY/F_CONTENT: skipped (%s)" % e)
 print("  (H4 geometry / H5 content: same producers on the rho0.9 topology/content arms + "
@@ -793,7 +813,7 @@ PY
     done
     if [[ "$ok" == 1 && "${#cargs[@]}" -gt 0 ]]; then
       echo "-- SUBSTITUTION CURVE ($reg pair): V(training budget) --"
-      "$PYTHON" scripts/comm_stats.py curve "${cargs[@]}" || true
+      "$PYTHON" scripts/comm_stats.py curve --seeds "$SEEDS" "${cargs[@]}" || true
     else
       echo "  (curve $reg: milestone dumps incomplete -- STAGE=dump fills $CURVROOT/${reg}_*_b{$MILESTONES})"
     fi
@@ -803,7 +823,7 @@ PY
     d="$PROBEROOT/iv_${arm}"
     if compgen -G "$d/seed*_iv.json" > /dev/null 2>&1; then
       echo "-- INTERVENTIONS (cross-seed gate): $arm --"
-      "$PYTHON" scripts/comm_stats.py interventions --dir "$d" || true
+      "$PYTHON" scripts/comm_stats.py interventions --dir "$d" --seeds "$SEEDS" || true
     fi
   done
 fi

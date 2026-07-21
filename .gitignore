@@ -41,9 +41,10 @@ research_sceleton.md
 snapshots/
 ARCHIVE_HASH.txt
 test_pipeline_local.py
-
+auto_state/
 # Machine-specific local sweep configs
 sweep_*_local.yaml
+SIGNAL_campaign_2026-07-21_0751.tgz
 
 # IDEs
 .vscode/

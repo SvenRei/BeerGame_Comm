@@ -7,7 +7,7 @@ ladder**. It is an *instrument*, not the contribution — kept simple so that an
 attributable to the message channel, not to architectural cleverness. The name points at the object
 of measurement: the Lee–So–Tang **demand signal** shared between echelons.
 
-: SIGNAL v2.0, registered 2026-07-20, registry = scripts/prereg_v2.py, SHA-256 = e1e0f1bc539d3ca675ada8fbb9d8360f36afd69d5986c2b6692a7517f5669c2e, power evidence = reports/power_v13.txt, frozen tag = v2.0-launch
+: SIGNAL v2.1 (executed registration), amendment 2026-07-20 pre-unblinding, registry = scripts/prereg_v2.py, SHA-256 = 81d4178d589297073cac31f49bb9ecf0487e5a5d6b090e126597b7f091052f2d, confirmatory seeds = 25..49 (n*=25; seeds 50-54 quarantined as dev/pilot extras and excluded from every reported table), power evidence = reports/power_v13.txt, frozen tag = v2.0-launch. [Superseded: the v2.0 launch hash e1e0f1bc539d3ca675ada8fbb9d8360f36afd69d5986c2b6692a7517f5669c2e assigned confirmatory seeds 30..54 while excluding seeds >=50 -- an internal contradiction caught by the verifier and corrected by the dated v2.1 amendment before unblinding; see prereg_v2.py amendment_log.]
 
 The project answers two questions:
 

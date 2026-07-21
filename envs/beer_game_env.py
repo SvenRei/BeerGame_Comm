@@ -419,8 +419,17 @@ class BeerGameParallelEnv(ParallelEnv):
                                 # decentralized representation receives NO privileged unclipped signal
                                 # (observation-consistent garbling; the CTDE critic remains global and
                                 # is disclosed as such in the registration).
+                                # v1.4 EXPLORATORY switch `aux_target_clip`: defaults to obs_order_clip
+                                # (byte-identical behavior when unset). Setting it to a huge value (or
+                                # any level != obs_order_clip) decouples the aux TARGET from the OBS
+                                # garbling -- the clip12_raw_auxfull mechanism arm asking whether the
+                                # P2 learning failure runs through the censored self-supervised target
+                                # rather than the censored observation itself. NOT registered; any arm
+                                # using it must be labeled exploratory with a dated decision-log entry.
                                 "demand": (min(float(self._period_demand[agent]), float(_tclip))
-                                           if (_tclip := self._config.get("obs_order_clip", None)) is not None
+                                           if (_tclip := self._config.get(
+                                               "aux_target_clip",
+                                               self._config.get("obs_order_clip", None))) is not None
                                            and agent != "retailer" else self._period_demand[agent]),
                                 "demand_met": self._period_demand_met[agent]
                             }

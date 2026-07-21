@@ -67,6 +67,10 @@ fi
 # Fresh-seed computational replication: seeds 30-44, DISJOINT from Study 1 (10-24) and from
 # pilot/debug seeds (>=50). Probe set = the six registered do(m) arms.
 export SEEDS="${SEEDS:-25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49}"   # n*=25; AMENDMENT v2.1: 25..49 (50-54 = dev/pilot range, quarantined; see prereg amendment_log)
+# REGISTERED-SEED WHITELIST for scripts/comm_stats.py loaders: the S7 gate read imports
+# load_cost_dir directly, so without this export the replication gate silently absorbed the
+# quarantined seed files present in sweep_out/v13 (observed as n=25 -> n=30 between gate reads).
+export SIGNAL_SEEDS="$SEEDS"
 export PROBE_ARMS="${PROBE_ARMS:-ar1r9_upstream ar1r9_rbroadcast ar1r9_rbroadcast_raw ar1r9_rbroadcast_learned ar1r9_rbroadcast_eps ar1r9_rbroadcast_condmean ar1r9_upstream_raw ar1r9_downstream_raw ar1r9_beta0_upstream ar1r9_beta05_upstream}"
 JOB_MB="${JOB_MB:-700}"; AUTO_STOP="${AUTO_STOP:-0}"
 ST=auto_state; mkdir -p "$ST" reports snapshots results
