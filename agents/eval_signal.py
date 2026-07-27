@@ -186,12 +186,27 @@ class SIGNALPolicy:
             a.load_state_dict(sd)
             a.eval()
             self.actors.append(a)
+        # Phase-2: frozen certified forecaster embedded at train time (payload in the ckpt, A12).
+        self.forecaster = None
+        fc = ckpt.get("forecaster")
+        if cfg.get("forecast_mode") == "separate_frozen" or fc is not None:
+            if fc is None:
+                raise RuntimeError("checkpoint config says forecast_mode=separate_frozen but no "
+                                   "forecaster payload was saved -- refusing to evaluate a "
+                                   "different policy than was trained")
+            from agents.demand_forecaster import DemandForecaster
+            _f = DemandForecaster(hidden=int(fc["hidden"]),
+                                  initial_mean=float(fc["initial_mean"]))
+            _f.load_state_dict(fc["forecaster_state"])
+            _f.eval()
+            self.forecaster = _f.to(DEVICE)
         self.reset()
 
     def reset(self):
         self.h = [torch.zeros(1, 1, self.hidden, device=DEVICE) for _ in range(self.N)]
         self.m_buf = torch.zeros(self.N, self.msg_dim, device=DEVICE)
         self._dprev = None                          # v1.3: per-episode demand lags (cleared here)
+        self._fh = None                             # Phase-2: frozen-forecaster hidden (A4)
         self._o_last = None
         self._lam = None
         self._t = 0                                 # step counter for msg_override indexing
@@ -206,6 +221,13 @@ class SIGNALPolicy:
     @torch.no_grad()
     def act(self, obs):
         o_t = torch.tensor(np.stack([obs[a] for a in AGENTS]), dtype=torch.float32, device=DEVICE)  # [N,obs]
+        dhat_ext_all = None
+        if self.forecaster is not None:             # Phase-2 (mirrors SIGNALTrainer.collect exactly:
+            if self._o_last is None:                #  step-0 emits 0.0 like raw; t>=1 feeds o[:,3]=d_{t-1})
+                self._fh = self.forecaster.init_hidden(self.N).to(DEVICE)
+                dhat_ext_all = torch.zeros(self.N, 1, device=DEVICE)
+            else:
+                dhat_ext_all, self._fh = self.forecaster.step(o_t[:, 3:4], self._fh)
         if self._o_last is not None:                # v1.3 lag shift (mirrors SIGNALTrainer.collect)
             self._dprev = (torch.full((self.N, 2), self.actors[0].demand_mu, device=DEVICE)
                            if self._dprev is None else
@@ -231,10 +253,12 @@ class SIGNALPolicy:
             hi_list.append(hi)
             S_mu, S_std = self.actors[i].base_stock(o_t[i:i + 1], hi, incoming[i:i + 1])
             S[i] = S_mu if self.deterministic else torch.distributions.Normal(S_mu, S_std).sample()
-            dhat[i] = float(self.actors[i].demand_estimate(hi).reshape(-1)[0].item())
+            dhat[i] = (float(dhat_ext_all[i, 0].item()) if dhat_ext_all is not None
+                       else float(self.actors[i].demand_estimate(hi).reshape(-1)[0].item()))
             m_out[i] = self.actors[i].message(
                 o_t[i:i + 1], hi,
-                dprev=(None if self._dprev is None else self._dprev[i:i + 1]), lam=self._lam).reshape(-1)
+                dprev=(None if self._dprev is None else self._dprev[i:i + 1]), lam=self._lam,
+                dhat_ext=(None if dhat_ext_all is None else dhat_ext_all[i:i + 1])).reshape(-1)
 
         order, _ = order_from_S(S, o_t, self.max_order)
         frac = (order / self.max_order).clamp(0.0, 1.0)

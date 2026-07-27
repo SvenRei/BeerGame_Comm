@@ -265,6 +265,9 @@ def main(cfg: DictConfig):
                                 #                             canonical-cost (penalty_at_retailer_only) or
                                 #                             lead-time run is otherwise scored on the default
                                 #                             env against the wrong references.
+                                "forecaster": (trainer.forecaster_payload()          # Phase-2 (A12):
+                                               if hasattr(trainer, "forecaster_payload")  # None for all
+                                               else None),                                 # legacy arms
                                 "obs_dim": obs_dim, "state_dim": state_dim,
                                 "msg_content": A.get("msg_content"), "episode": ep,
                                 "seed": int(cfg.seed),      # top-level Hydra seed (not in the agent cfg); per-seed

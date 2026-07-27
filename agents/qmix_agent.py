@@ -150,6 +150,12 @@ class QMIXTrainer:
         self.batch_size = int(cfg.get("qmix_batch", 8))             # episodes sampled per update
         self.buf_cap = int(cfg.get("qmix_buffer", 500))             # replay capacity (episodes)
         self.target_every = int(cfg.get("qmix_target_update", 20))  # GRAD STEPS between hard target syncs
+        # Phase-3 repair (post-unblinding, C16 #4): Double-Q target selection. Default FALSE is
+        # byte-identical vanilla QMIX (golden-tested). True: the ONLINE net picks argmax_a, the
+        # TARGET net evaluates it -- removes max-operator overestimation bias, the leading
+        # documented Q-learning pathology consistent with the measured competence gap after the
+        # grid was exonerated (results/qmix_grid_benchmark.json: expressiveness_gap +18.8 of +2855).
+        self.double_q = bool(cfg.get("qmix_double_q", False))
         self.grad_steps = int(cfg.get("qmix_grad_steps", 4))        # sampled minibatches per update() call
         # epsilon schedule (linear anneal over updates)
         self.eps_start = float(cfg.get("qmix_eps_start", 1.0))
@@ -267,7 +273,11 @@ class QMIXTrainer:
             q_chosen.append(qi_taken)
             with torch.no_grad():
                 qti, _ = self.tgt_actors[i].q_sequence(obs[:, :, i, :], msg[:, :, i, :])
-                q_tgt_max.append(qti.max(dim=-1).values)            # [T,B] greedy (vanilla QMIX target)
+                if self.double_q:                                   # Double-Q: online selects,
+                    a_sel = qi.detach().argmax(dim=-1, keepdim=True)  # target evaluates
+                    q_tgt_max.append(torch.gather(qti, -1, a_sel).squeeze(-1))
+                else:
+                    q_tgt_max.append(qti.max(dim=-1).values)        # [T,B] greedy (vanilla QMIX target)
             if dhat_i is not None:                                  # dhat grounding (same as SIGNAL aux)
                 aux = aux + F.mse_loss(dhat_i.squeeze(-1), dtg[:, :, i])
         q_chosen = torch.stack(q_chosen, dim=-1)                    # [T,B,N]

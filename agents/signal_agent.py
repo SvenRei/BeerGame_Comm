@@ -88,7 +88,7 @@ class SIGNALActor(nn.Module):
         S_mu = F.softplus(self.head(torch.cat(feats, dim=-1)))
         return S_mu, self.log_std.exp().clamp(1e-2, 3.0)
 
-    def message(self, obs, h, dprev=None, lam=None):
+    def message(self, obs, h, dprev=None, lam=None, dhat_ext=None):
         """Semantic message ladder; every rung is a named supply-chain signal except "learned".
         The named messages ride at natural units (demand/inventory, ~O(10)) so they are commensurate
         with the raw-unit observations beside them in the receiver's GRU input and base-stock head.
@@ -126,9 +126,13 @@ class SIGNALActor(nn.Module):
                 return dprev[..., 0:1]
             return dprev[..., 1:2]                                 # raw_lag2: two periods late
         if self.content == "raw":      return obs[..., 3:4]
-        if self.content == "dhat":     return dh
+        # Phase-2 repair: dhat_ext (a frozen CERTIFIED forecast, spec A11) replaces the internal
+        # policy-GRU readout for the dhat rungs when provided; None (default) is byte-identical
+        # legacy behavior. The certified value arrives detached by construction (no_grad step()).
+        if self.content == "dhat":     return dh if dhat_ext is None else dhat_ext
         if self.content == "ip":       return IP
-        if self.content == "dhat_ip":  return torch.cat([dh, IP], dim=-1)
+        if self.content == "dhat_ip":  return torch.cat([dh if dhat_ext is None else dhat_ext,
+                                                         IP], dim=-1)
         # "learned" = gain * tanh(...): a bounded code rescaled to the O(10) scale of dhat/ip so it is
         # audible to the receiver (see msg_gain). tanh bounds it; the gain restores the magnitude.
         if self.content == "learned":  return self.msg_gain * torch.tanh(self.msg_head(torch.cat([obs, h], dim=-1)))
@@ -190,6 +194,30 @@ class SIGNALTrainer:
         self.reward_scale = float(cfg.get("reward_scale", 1.0))
         self.params = list(self.actors.parameters()) + list(self.critic.parameters())
         self.opt = torch.optim.Adam(self.params, lr=float(cfg.get("lr", 3e-4)))
+        # ---- Phase-2 repair (post-unblinding): frozen certified forecaster (spec A5-A8) -----
+        # forecast_mode "none" (default) leaves every legacy arm byte-identical. "separate_frozen"
+        # loads a CERTIFIED DemandForecaster (loader fail-closed on certification, A14) and routes
+        # the dhat/dhat_ip MESSAGE through it. The internal d_head stays in the network but is
+        # untrained (aux loss skipped, A7) and unused; the forecaster is frozen and lives OUTSIDE
+        # self.opt (built above from actors+critic only) -- gradient isolation by construction (A5/A6).
+        self.forecast_mode = str(cfg.get("forecast_mode", "none"))
+        self.forecaster, self._fc_src, self._fc_ckpt = None, None, None
+        if self.forecast_mode == "separate_frozen":
+            if self.content not in ("dhat", "dhat_ip"):
+                raise ValueError("forecast_mode=separate_frozen applies only to msg_content "
+                                 f"dhat/dhat_ip (got {self.content!r})")
+            if use_dhat_head:
+                raise ValueError("forecast_mode=separate_frozen requires use_dhat_head=false "
+                                 "(A18 clean mode; the A19 continuity mode is deliberately "
+                                 "unsupported in the repaired study)")
+            from agents.demand_forecaster import load_certified
+            self._fc_src = str(cfg.get("forecast_ckpt", "results/forecaster_ar1r9.pt"))
+            self.forecaster, self._fc_ckpt = load_certified(self._fc_src, require_pass=True)
+            self.forecaster.to(self.device)
+            for _p in self.forecaster.parameters():
+                _p.requires_grad_(False)
+        elif self.forecast_mode != "none":
+            raise ValueError(f"unknown forecast_mode {self.forecast_mode!r}")
         # --- economics layer (independent of the agent) ---
         self.srdqn_beta = float(cfg.get("srdqn_beta", 1.0))       # 1=cooperative, 0=self-interested
         tau = float(cfg.get("tau", 0.0))                          # coordinating transfer (0=no contract)
@@ -206,6 +234,20 @@ class SIGNALTrainer:
 
     # ---------------------------------------------------------------- rollout
     @torch.no_grad()
+    def forecaster_payload(self):
+        """Phase-2 (A12): certified-forecaster identity for the policy checkpoint -- state +
+        certification embedded so eval is self-contained (no dependence on the artifact path)."""
+        if self.forecaster is None:
+            return None
+        return {"forecaster_state": {k: v.detach().cpu().clone()
+                                     for k, v in self.forecaster.state_dict().items()},
+                "hidden": self.forecaster.hidden,
+                "initial_mean": self.forecaster.initial_mean,
+                "metrics": self._fc_ckpt.get("metrics"),
+                "certification": self._fc_ckpt.get("certification"),
+                "forecaster_version": self._fc_ckpt.get("forecaster_version", 1),
+                "source_path": self._fc_src}
+
     def collect(self, env, seed, deterministic=False):
         """Roll one episode. Messages are stored as received and detached: in the update they are
         fixed extended observations for the named contents (plain MAPPO, which keeps d_hat/ip semantics
@@ -216,6 +258,8 @@ class SIGNALTrainer:
         obs, _ = env.reset(seed=seed)
         h = [torch.zeros(1, 1, self.actors[i].hidden, device=dev) for i in range(self.N)]
         m_prev = torch.zeros(self.N, self.msg_dim, device=dev)
+        fh = (self.forecaster.init_hidden(self.N).to(dev)          # Phase-2: frozen-dhat hidden,
+              if self.forecaster is not None else None)            # separate from the policy GRU (A4)
         # v1.3: per-episode demand-lag state for the eps/raw_lag* rungs, LOCAL to this rollout --
         # it cannot survive an episode boundary because it does not exist outside this call.
         lam_ctx = getattr(env, "_dr_lambda", None)                 # DP: this episode's true lambda
@@ -225,6 +269,15 @@ class SIGNALTrainer:
         R_MSG, R_DHAT, R_H = ([], [], []) if self.roll_obs is not None else (None, None, None)  # obs-only sink
         while True:
             o = torch.tensor(np.stack([obs[a] for a in AGENTS]), dtype=torch.float32, device=dev)  # [N,obs]
+            dhat_ext_all = None
+            if self.forecaster is not None:
+                # Phase-2 frozen certified dhat. Step-0 emits 0.0 -- the SAME convention as the raw
+                # rung (the primary comparator), so the raw-vs-certified-dhat contrast is timing-
+                # matched from t=0. From t>=1, o[:,3] holds d_{t-1}: dhat_t = f(d_0..d_{t-1}).
+                if o_last is None:
+                    dhat_ext_all = torch.zeros(self.N, 1, device=dev)
+                else:
+                    dhat_ext_all, fh = self.forecaster.step(o[:, 3:4], fh)
             if o_last is not None:                                 # v1.3 lag shift: skip the reset 0-fill,
                 dprev = (torch.full((self.N, 2), self.actors[0].demand_mu, device=dev)  # mu-pad first,
                          if dprev is None else torch.cat([o_last[:, 3:4], dprev[:, 0:1]], dim=1))
@@ -244,7 +297,8 @@ class SIGNALTrainer:
                 S[i] = Si
                 m_out[i] = self.actors[i].message(
                     o[i:i + 1], hi,
-                    dprev=(None if dprev is None else dprev[i:i + 1]), lam=lam_ctx).reshape(-1)
+                    dprev=(None if dprev is None else dprev[i:i + 1]), lam=lam_ctx,
+                    dhat_ext=(None if dhat_ext_all is None else dhat_ext_all[i:i + 1])).reshape(-1)
                 if self.roll_obs is not None:                                 # read-only: forecast + belief on hand
                     _h_step.append(hi.reshape(-1))
                     _d_step.append(self.actors[i].demand_estimate(hi).reshape(-1))
@@ -399,14 +453,20 @@ class SIGNALTrainer:
                     # representation and can never shape the sender's channel. The policy loss keeps the
                     # coupled in-graph h (DIAL unchanged). learned_aux_detach=false restores the old
                     # coupling as the registered ablation arm.
-                    if self.content == "learned" and self.learned_aux_detach:
+                    if self.forecast_mode == "separate_frozen":
+                        # Phase-2 (A7): the forecast is frozen+certified; there is nothing to ground.
+                        # The internal d_head deliberately receives no training signal in this mode.
+                        aux = torch.zeros((), device=self.device)
+                    elif self.content == "learned" and self.learned_aux_detach:
                         h_aux, _ = self.actors[i].belief(d["obs"][:, i, :].unsqueeze(1),
                                                          d["msg_in"][:, i, :].unsqueeze(1))
                         dhat = self.actors[i].demand_estimate(h_aux.squeeze(1))         # [T,1]
+                        aux = F.mse_loss(dhat, d["dtgt"][:, i].unsqueeze(-1))           # (named for observation only)
+                        ploss = ploss + self.aux_coef * aux
                     else:
                         dhat = self.actors[i].demand_estimate(h)                        # [T,1]
-                    aux = F.mse_loss(dhat, d["dtgt"][:, i].unsqueeze(-1))               # (named for observation only)
-                    ploss = ploss + self.aux_coef * aux
+                        aux = F.mse_loss(dhat, d["dtgt"][:, i].unsqueeze(-1))           # (named for observation only)
+                        ploss = ploss + self.aux_coef * aux
                     if self.upd_obs is not None:   # OBSERVATION: PPO trust-region health (read-only)
                         with torch.no_grad():
                             ob = self.upd_obs
