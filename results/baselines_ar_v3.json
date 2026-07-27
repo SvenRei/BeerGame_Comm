@@ -1,0 +1,31 @@
+{
+  "rungs": {
+    "AR_CondBS": {
+      "0.9": 3747.625
+    },
+    "AR_StaticBS": {
+      "0.9": 4988.635
+    },
+    "AR_BestBS": {
+      "0.9": 3747.625
+    }
+  },
+  "meta": {
+    "mu": 12.0,
+    "sigma": 3.0,
+    "rhos": [
+      0.9
+    ],
+    "tau": [
+      5.0,
+      5.0,
+      5.0,
+      4.0
+    ],
+    "h": 0.5,
+    "b": 1.0,
+    "eval_seed_base": 500000,
+    "eval_episodes": 200,
+    "policy": "privileged conditional base-stock (Kahn/Lee lineage); reference = AR_BestBS = min(CondBS, StaticBS)"
+  }
+}

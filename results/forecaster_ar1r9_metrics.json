@@ -1,0 +1,61 @@
+{
+  "metrics": {
+    "mse": 9.161323510792046,
+    "rmse": 3.026767832324119,
+    "mae": 2.4089245845063205,
+    "bias": -0.017769846401247038,
+    "pred_sd": 5.615722897374958,
+    "target_sd": 6.34757288977478,
+    "corr": 0.879013740445624,
+    "calib_slope": 0.9935682174062271,
+    "calib_intercept": 0.09702243921093891,
+    "bench_mse": 8.747548391688348,
+    "bench_rmse": 2.9576254650797735,
+    "bench_pred_sd": 5.625476086308263,
+    "const_mse": 40.29168159100375,
+    "mse_ratio_vs_bench": 1.0473018382495438,
+    "mse_ratio_vs_const": 0.2273750597899485,
+    "n": 5880,
+    "linear_predictor_mse": 8.74840306122449
+  },
+  "certification": {
+    "pass": true,
+    "checks": {
+      "mse_ratio": true,
+      "bias": true,
+      "calibration": true,
+      "correlation": true,
+      "variance": true
+    },
+    "gate": {
+      "max_mse_ratio": 1.1,
+      "max_abs_bias": 0.5,
+      "calibration_slope_low": 0.8,
+      "calibration_slope_high": 1.2,
+      "min_correlation": 0.8,
+      "min_std_fraction": 0.5
+    }
+  },
+  "meta": {
+    "rho": 0.9,
+    "mu": 12.0,
+    "sigma": 3.0,
+    "hidden": 32,
+    "lr": 0.001,
+    "grad_clip": 5.0,
+    "seed_bases": {
+      "train": 700000,
+      "val": 710000,
+      "bench": 720000,
+      "test": 730000
+    },
+    "best_val_mse": 9.551488876342773,
+    "env_base": {
+      "horizon": 50,
+      "max_order": 100,
+      "holding_cost": 0.5,
+      "backorder_cost": 1.0
+    },
+    "label": "POST-UNBLINDING REPAIR: dedicated forecaster, policy-independent"
+  }
+}

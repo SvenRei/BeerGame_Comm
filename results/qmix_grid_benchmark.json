@@ -1,0 +1,57 @@
+{
+  "meta": {
+    "rho": 0.9,
+    "mu": 12.0,
+    "sigma": 3.0,
+    "h": 0.5,
+    "b": 1.0,
+    "episodes": 200,
+    "seed_base": 500000,
+    "note": "expressiveness_gap = GridCondBS - continuous CondBS: the floor any grid-confined policy pays. Executed G2 grid = (41, 160)."
+  },
+  "continuous": {
+    "CondBS": 3747.625,
+    "StaticBS": 4988.635
+  },
+  "grids": {
+    "n21_smax200": {
+      "n_actions": 21,
+      "s_max": 200.0,
+      "spacing": 10.0,
+      "GridCondBS": 3784.1525,
+      "GridStaticBS": 5095.5475,
+      "expressiveness_gap": 36.527500000000146
+    },
+    "n41_smax160": {
+      "n_actions": 41,
+      "s_max": 160.0,
+      "spacing": 4.0,
+      "GridCondBS": 3766.435,
+      "GridStaticBS": 5031.94,
+      "expressiveness_gap": 18.809999999999945
+    },
+    "n81_smax120": {
+      "n_actions": 81,
+      "s_max": 120.0,
+      "spacing": 1.5,
+      "GridCondBS": 3721.1475,
+      "GridStaticBS": 5041.8675,
+      "expressiveness_gap": -26.477499999999964
+    },
+    "n161_smax120": {
+      "n_actions": 161,
+      "s_max": 120.0,
+      "spacing": 0.75,
+      "GridCondBS": 3718.7525,
+      "GridStaticBS": 4988.635,
+      "expressiveness_gap": -28.872499999999945
+    }
+  },
+  "split_executed_grid": {
+    "measured_qmix_nocomm": 6603.0,
+    "grid_floor_GridCondBS": 3766.435,
+    "expressiveness_gap": 18.809999999999945,
+    "residual_learning_gap": 2836.565,
+    "read": "Of the total gap to the continuous frontier, expressiveness_gap is the grid's share and residual_learning_gap is QMIX training's share."
+  }
+}

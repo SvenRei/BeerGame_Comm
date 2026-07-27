@@ -1,0 +1,172 @@
+{
+  "study": "SIGNAL/QMIX post-unblinding repair study (Phases 3-4)",
+  "frozen_utc": "2026-07-21T16:47:56.139542Z",
+  "seeds": {
+    "dev": [
+      60,
+      61,
+      62,
+      63,
+      64
+    ],
+    "confirmatory": [
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94
+    ],
+    "forbidden_overlap": {
+      "registered": [
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49
+      ],
+      "quarantined": [
+        50,
+        51,
+        52,
+        53,
+        54
+      ],
+      "forecaster_stream_bases": [
+        700000,
+        710000,
+        720000,
+        730000
+      ],
+      "eval_bases": [
+        500000
+      ]
+    }
+  },
+  "signal_arms": {
+    "r4_nocomm": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=false",
+    "r4_raw": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=false",
+    "r4_dhatc": "$BEHAV $AR09 $RB agent.msg_content=dhat agent.use_dhat_head=false agent.forecast_mode=separate_frozen agent.forecast_ckpt=results/forecaster_ar1r9.pt",
+    "r4_arpred": "$BEHAV $AR09 $RB agent.msg_content=condmean agent.use_dhat_head=false",
+    "r4_learned": "$BEHAV $AR09 $RB agent.msg_content=learned agent.use_dhat_head=false",
+    "r4_ip": "$BEHAV $AR09 $RB agent.msg_content=ip agent.use_dhat_head=false",
+    "r4_nocomm_c20": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=false env.obs_order_clip=20",
+    "r4_raw_c20": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=false env.obs_order_clip=20",
+    "r4_nocomm_c12": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=false env.obs_order_clip=12",
+    "r4_raw_c12": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=false env.obs_order_clip=12"
+  },
+  "qmix_arms": {
+    "qr_base": "$BEHAV $AR09 agent.use_comm=false $G2GRID",
+    "qr_doubleq": "$BEHAV $AR09 agent.use_comm=false $G2GRID agent.qmix_double_q=true",
+    "qr_replay": "$BEHAV $AR09 agent.use_comm=false $G2GRID agent.qmix_buffer=200",
+    "qr_eps": "$BEHAV $AR09 agent.use_comm=false $G2GRID agent.qmix_eps_anneal=2500"
+  },
+  "macros": {
+    "$BEHAV": "env.penalty_at_retailer_only=false",
+    "$AR09": "agent.train_env=ar1 agent.ar1_rho=0.9 agent.heldout_mode=ar1",
+    "$RB": "agent.use_comm=true agent.comm_topology=retailer_broadcast",
+    "$G2GRID": "agent.qmix_n_actions=41 agent.qmix_s_max=160"
+  },
+  "gates_predeclared": {
+    "qmix_dev_absolute": {
+      "rule": "variant dev-mean nocomm cost <= 1.20 * GridCondBS(41,160)",
+      "grid_ref_source": "results/qmix_grid_benchmark.json",
+      "consequence_if_none_pass": "V1 concordance reported UNADJUDICABLE: comparison algorithm failed its predeclared competence gate"
+    },
+    "qmix_dev_relative": {
+      "rule": "variant dev-mean <= 0.85 * qr_base dev-mean to earn confirmatory seeds (best such variant only)"
+    },
+    "signal_dev": {
+      "rule": "all 4 arms complete 5/5 dev seeds without failure AND r4_raw dev-mean cost < r4_nocomm dev-mean cost (direction sanity); no numeric threshold -- dev seeds tune nothing here"
+    },
+    "p2_prime": {
+      "rule": "REGISTERED (pilot-learned direction, prereg_v3): Gamma = V(c12) - V(inf) < 0, one-sided paired t; dose ordering V(inf) > V(c20) > V(c12); mechanism diagnostic: capture(c12) ~ 0 (M2). V(w) = C(r4_nocomm_w) - C(r4_raw_w), matched worlds.",
+      "worlds": {
+        "inf": [
+          "r4_nocomm",
+          "r4_raw"
+        ],
+        "c20": [
+          "r4_nocomm_c20",
+          "r4_raw_c20"
+        ],
+        "c12": [
+          "r4_nocomm_c12",
+          "r4_raw_c12"
+        ]
+      }
+    },
+    "transfer_2x2": {
+      "rule": "REGISTERED secondaries: C(raw_tinf, eval c12) - C(raw_tc12, eval c12) > 0 AND C(raw_tc12, eval inf) - C(raw_tinf, eval inf) > 0 (training-env dominance), one-sided paired t over training seeds; eval via make_env_override + --env-json."
+    },
+    "primary_family_v3": {
+      "rule": "Joint Holm alpha=.05 over {P1' [V_inf(raw)>0], P2' [Gamma<0], C-NULL' [|V_inf(dhatc)| TOST within +/-2% of nocomm cost]}; secondaries family {H-REP' [raw~arpred TOST], dose x2, transfer x2, ladder cells} Holm-internal. Authoritative text: scripts/prereg_v3.py (self-hashed).",
+      "band": "2% of mean C(r4_nocomm), Cachon-Fisher materiality"
+    }
+  },
+  "training_budget": {
+    "total_episodes": 8000,
+    "patience": 2000,
+    "heldout_episodes": 8,
+    "heldout_every": 200,
+    "budget_milestones": "[1000,2000,4000,8000]"
+  },
+  "labels": [
+    "POST-UNBLINDING TARGETED FOLLOW-UP",
+    "not part of the v2.1 registration",
+    "original campaign immutable"
+  ],
+  "amendment_A1": {
+    "when_utc": "2026-07-26T20:05:33.260994+00:00",
+    "what": [
+      "confirmatory seeds 70-89 -> 70-94 (n=25, honoring the registered n*=25 power fallback of prereg_v2.1)",
+      "arms added for the v3 journal-run scope: r4_learned, r4_ip (content ladder), r4_{nocomm,raw}_{c20,c12} (P2'/transfer)"
+    ],
+    "status_at_amendment": "PRE-EXECUTION: no dev or confirmatory training had run under this manifest (chain-validation smokes only, ep-stamped 30, excluded by the sentinel stamp); amendment therefore precedes all data.",
+    "out_of_scope_requiring_further_amendment": [
+      "D-DP (DP-certified forecaster + dp cells)",
+      "D-RHO",
+      "D-GEO",
+      "D-BETA"
+    ]
+  }
+}
