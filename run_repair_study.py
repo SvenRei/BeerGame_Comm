@@ -89,10 +89,27 @@ done = sys.argv[1]
 cmd = sys.argv[2:]
 os.environ["WANDB_MODE"] = "disabled"
 os.environ["PYTHONUNBUFFERED"] = "1"
+# v3 curve capture. SIGNAL: scalar CSV logger ON (pure observation, byte-neutral to training;
+# without it metrics_heldout.csv / metrics_update.csv never exist and no training curve is
+# recoverable post-run). QMIX: train_qmix REFUSES the csv logger by design (it reads
+# MAPPO-specific internals) -> keep it unset and rely on the per-job training log below,
+# which preserves the printed gate series (one line per heldout_every episodes) for every run.
 if any("train_qmix.py" in c for c in cmd):
-    os.environ["SIGNAL_CSVLOG"] = "0"
+    os.environ.pop("SIGNAL_CSVLOG", None)
+else:
+    os.environ["SIGNAL_CSVLOG"] = "1"
 ep = next((c.split("=", 1)[1] for c in cmd if c.startswith("total_episodes=")), "?")
-r = subprocess.run(cmd)
+tag = os.path.basename(done).replace(".done_", "")
+tlog = os.path.join(os.path.dirname(done), f".trainlog_{tag}.txt")
+os.makedirs(os.path.dirname(done), exist_ok=True)
+with open(tlog, "a", buffering=1) as lf:
+    lf.write("\n$ " + " ".join(cmd) + "\n")
+    r = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
+if r.returncode != 0:
+    try:
+        print(open(tlog).read()[-2000:])       # surface the failure tail to the pool log
+    except OSError:
+        pass
 if r.returncode == 0:
     open(done, "w").write(str(ep))
 sys.exit(r.returncode)
@@ -451,7 +468,16 @@ def stage_analyze(a, m):
         L.append(f"| {arm} | {np.mean(c):.1f} | {np.mean(v):+.1f} | [{lo:+.1f},{hi:+.1f}] | "
                  f"{st['wilcoxon_p']:.3g} | {float(np.mean(v > 0)):.2f} |")
     band = 0.02 * float(np.mean(noc))
-    L += ["", f"v_distribution band note: TOST band = 2% of mean C(nocomm) = {band:.1f}.", ""]
+
+    def vdist(name, v):
+        q = np.percentile(v, [0, 10, 50, 90, 100])
+        return (f"v_distribution({name}): P(>0)={float(np.mean(v > 0)):.2f}  "
+                f"min/p10/med/p90/max = {q[0]:+.1f}/{q[1]:+.1f}/{q[2]:+.1f}/"
+                f"{q[3]:+.1f}/{q[4]:+.1f}  (n={len(v)})")
+    L += ["", f"TOST band = 2% of mean C(nocomm) = {band:.1f}."]
+    if "r4_raw" in vals:
+        L.append(vdist("P1' V_inf(raw)", noc - vals["r4_raw"]))
+    L.append("")
 
     # ---------------- 2. frontier / optimality-gap diagnostic ------------------------------
     refp = os.path.join(ROOT, "results", "baselines_ar_v3.json")
@@ -491,6 +517,7 @@ def stage_analyze(a, m):
         p_p2 = float(sps.ttest_1samp(G, 0, alternative="less").pvalue) if infer else None
         L.append(f"- **Gamma = V_c12 - V_inf = {np.mean(G):+.1f} [{lo:+.1f},{hi:+.1f}]"
                  + (f"; one-sided p(<0) = {p_p2:.3g}**" if infer else " (n<3: no inference)**"))
+        L.append("- " + vdist("P2' Gamma", G))
         if "c20" in V:
             for lab, d in (("dose_a: V_inf-V_c20", V["inf"] - V["c20"]),
                            ("dose_b: V_c20-V_c12", V["c20"] - V["c12"])):
