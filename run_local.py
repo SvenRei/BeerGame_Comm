@@ -104,11 +104,11 @@ DELIVERY_SHA = {
     "conf/agent/signal.yaml": "59ba08faf34e44a2",
     "agents/qmix_agent.py": "ff621c114939382c",
     "scripts/qmix_grid_benchmark.py": "798313a7e88e9b58",
-    "run_repair_study.py": "27bda84c2936cd6a",
+    "run_repair_study.py": "9b85524414cfab8e",
     "tests/test_phase34.py": "a456f8632cc7a499",
     "reports/REPAIR_SEED_MANIFEST.json": "dce0c876ba0dffd4",
     "reports/DHAT_QMIX_REPAIR_PLAN.md": "30f09997ff022d6a",
-    "reports/PHASE34_IMPLEMENTATION_GUIDE.md": "4bf6db41485a2bbf",
+    "reports/PHASE34_IMPLEMENTATION_GUIDE.md": "805e344f5229a5e6",
     "results/qmix_grid_benchmark.json": "cd942e36639a396d",
     "results/forecaster_ar1r9.pt": "1b840cb2698405ce",
     "results/forecaster_ar1r9_metrics.json": "9ebd3a03683f4671",
@@ -119,7 +119,7 @@ DELIVERY_SHA = {
     "reports/PAPER_SKELETON_v3.md": "14ca8055547c32e4",
     "reports/RESEARCH_SKELETON_v3.md": "ada25d37b91a0665",
     "reports/research_sceleton_v3.md": "fd018b8120242d4d",
-
+    "reports/POD_SETUP_GUIDE_v3.md": "9b9464f47a98102d"
 }
 REQUIRED_API = {  # semantic layer: symbols siblings import (catches version skew after edits)
     "scripts/comm_stats.py": ["parse_seed_spec", "load_cost_dir", "value_of_sharing"],

@@ -153,6 +153,7 @@ nothing).
 | signal-confirm | 4 arms × confirmatory seeds | signal gate pass (or `--force`) | sentinel |
 | dump | CRN eval of every confirmatory cell → `repair_out/v1/<cell>/seed<S>.json` (+`_ferr`,`_censor` sidecars; loader reads only `seed<S>.json` = `{"0.9": mean_team_cost}`) | ckpts exist | per seed file |
 | analyze | `reports/REPAIR_STUDY.md` | every `seed<S>.json` present (fail-closed) | idempotent |
+| curves | figure set → `repair_out/figures/*.pdf` (13 specs; parses QMIX trainlogs first, since train_qmix has no CSV logger); `--curve-seeds dev\|confirm\|all` | curve CSVs exist | idempotent |
 
 Flags: `--jobs N` (default cores−1), `--ep/--he` (budget override → smoke), `--arms ...`,
 `--seeds-limit K`, `--gate-episodes` (default 100), `--dump-episodes` (default 200),

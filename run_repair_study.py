@@ -21,9 +21,11 @@ manifest and evaluated mechanically; confirmatory stages refuse to run unless th
 passed (override consciously with --force).
 """
 import os
+import re
 import sys
 import json
 import glob
+import shutil
 import argparse
 import subprocess
 from datetime import datetime
@@ -111,6 +113,34 @@ if r.returncode != 0:
     except OSError:
         pass
 if r.returncode == 0:
+    # COMPLETION INVARIANT (added after a local incident: 4 jobs silently truncated yet
+    # reported ok). rc==0 is NOT sufficient. The job's own trainlog must prove one of:
+    #   (a) legitimate early stop  -- trainer prints "EARLY STOP at ep";
+    #   (b) the final budget milestone was crossed -- "budget milestone <requested>" (SIGNAL
+    #       prints milestones unconditionally; gate prints are improvement-only);
+    #   (c) QMIX: last unconditional gate print "ep N:" reached requested - heldout_every;
+    #   (d) smoke regime: requested below the first milestone (unverifiable, accepted).
+    import re as _re
+    txt = ""
+    try:
+        txt = open(tlog, errors="ignore").read()
+    except OSError:
+        pass
+    req = int(ep) if str(ep).isdigit() else 0
+    is_qmix = any("train_qmix.py" in c for c in cmd)
+    okk = "EARLY STOP at ep" in txt
+    if not okk and is_qmix:
+        gates = [int(g) for g in _re.findall(r"ep (\d+): held-out", txt)]
+        he = next((int(c.split("=", 1)[1]) for c in cmd
+                   if c.startswith("agent.heldout_every=")), 200)
+        okk = bool(gates) and max(gates) >= req - he
+    if not okk and not is_qmix:
+        okk = (f"budget milestone {req}:" in txt) or req < 1000
+    if not okk:
+        print(f"[wrapper] COMPLETION INVARIANT VIOLATED for {tag}: rc=0 but the trainlog "
+              f"shows neither EARLY STOP nor the ep-{req} milestone. Truncated/killed run "
+              f"-- NOT stamping the sentinel. Tail:\n" + txt[-1500:])
+        sys.exit(3)
     open(done, "w").write(str(ep))
 sys.exit(r.returncode)
 """
@@ -292,6 +322,151 @@ def stage_transfer(a, m):
     ok, fail, _ = pool_run(jobs, a.jobs, "transfer",
                            os.path.join(OUT, "logs", "transfer.log"))
     return fail == 0
+
+
+# ---- figure set: (filename, metric, csv kind, arm keys, y-label) ---------------------------
+FIGSPEC = [
+    ("fig1_learning_inf",      "heldout_mean_cost", "heldout",
+     ["r4_nocomm", "r4_raw", "r4_dhatc", "r4_arpred", "r4_learned", "r4_ip"],
+     "Held-out team cost"),
+    ("fig2_learning_p2",       "heldout_mean_cost", "heldout",
+     ["r4_nocomm", "r4_raw", "r4_nocomm_c20", "r4_raw_c20", "r4_nocomm_c12", "r4_raw_c12"],
+     "Held-out team cost (censoring worlds)"),
+    ("fig3_gap_recovered",     "gap_recovered", "heldout",
+     ["r4_nocomm", "r4_raw", "r4_dhatc", "r4_arpred"], "Gap recovered"),
+    ("fig4_msg_std",           "msg_std", "heldout",
+     ["r4_raw", "r4_dhatc", "r4_arpred", "r4_learned"], "Message SD"),
+    ("fig5_forecast_error",    "forecast_error", "heldout",
+     ["r4_raw", "r4_dhatc", "r4_arpred"], "One-step forecast error"),
+    ("fig6_positive_listening", "positive_listening", "heldout",
+     ["r4_raw", "r4_dhatc", "r4_arpred", "r4_learned"], "Positive listening"),
+    ("fig7_cost_retailer",     "cost_retailer", "heldout",
+     ["r4_nocomm", "r4_raw"], "Retailer cost"),
+    ("fig8_cost_manufacturer", "cost_manufacturer", "heldout",
+     ["r4_nocomm", "r4_raw"], "Manufacturer cost"),
+    ("fig9_S_mean",            "heldout_S_mean", "heldout",
+     ["r4_nocomm", "r4_raw", "r4_dhatc"], "Order-up-to level S"),
+    ("fig10_policy_loss",      "policy_loss", "update",
+     ["r4_nocomm", "r4_raw", "r4_dhatc"], "Policy loss"),
+    ("fig11_approx_kl",        "approx_kl", "update",
+     ["r4_nocomm", "r4_raw", "r4_dhatc"], "Approx KL"),
+    ("fig12_explained_var",    "explained_variance", "update",
+     ["r4_nocomm", "r4_raw", "r4_dhatc"], "Critic explained variance"),
+]
+
+
+def _qmix_trainlogs_to_csv(outdir):
+    """train_qmix REFUSES the scalar CSV logger (it reads MAPPO internals), so QMIX curve data
+    lives only in the per-job trainlog gate prints. Parse them into plot_curves-readable CSVs."""
+    os.makedirs(outdir, exist_ok=True)
+    pat = re.compile(r"ep (\d+): held-out mean cost ([0-9.]+)\s+Gap_Recovered ([-0-9.]+)")
+    n = 0
+    for tl in glob.glob(os.path.join(ROOT, "weights_signal", ".trainlog_q*.txt")):
+        tag = os.path.basename(tl)[len(".trainlog_"):-len(".txt")]
+        rows = pat.findall(open(tl, errors="ignore").read())
+        if not rows:
+            continue
+        d = os.path.join(outdir, f"run_{tag}")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "metrics_heldout.csv"), "w") as f:
+            f.write("episode,heldout_mean_cost,gap_recovered\n")
+            for ep, c, g in rows:
+                f.write(f"{ep},{c},{g}\n")
+        n += 1
+    return n
+
+
+def _stage_signal_curves(m, seeds):
+    """Resolve EXACTLY ONE run dir per (arm, seed) -- the newest -- and stage its CSVs.
+
+    Reruns leave the previous run_signal_* directory in place (each run mints a fresh hash),
+    so globbing `run_signal_*_<arm>_s<seed>` matches BOTH the superseded attempt and its
+    replacement. plot_curves then averages a truncated run with a complete one and labels it
+    n=2 -- silently wrong curves. Observed in the field, hence this resolver.
+    Under the wrapper's completion invariant a truncated run never stamps its sentinel, so it
+    is always the *older* directory once the job is redone: newest-wins is the correct rule.
+    """
+    dst_root = os.path.join(OUT, "curves", "signal")
+    os.makedirs(dst_root, exist_ok=True)
+    W = os.path.join(ROOT, "weights_signal")
+    staged, superseded = 0, []
+    for arm in m["signal_arms"]:
+        for sd in seeds:
+            suffix = f"_{arm}_s{sd}"
+            cands = [d for d in glob.glob(os.path.join(W, f"run_signal_*{suffix}"))
+                     if os.path.basename(d).endswith(suffix) and os.path.isdir(d)]
+            if not cands:
+                continue
+            def _mt(d):
+                f = os.path.join(d, "metrics_heldout.csv")
+                return os.path.getmtime(f if os.path.exists(f) else d)
+            newest = max(cands, key=_mt)
+            if len(cands) > 1:
+                superseded.append(f"{arm}_s{sd}(+{len(cands) - 1})")
+            present = [n for n in ("metrics_heldout.csv", "metrics_update.csv")
+                       if os.path.exists(os.path.join(newest, n))]
+            if not present:                      # run predates csvlog / died before first row
+                continue
+            dst = os.path.join(dst_root, f"run_{arm}_s{sd}")
+            os.makedirs(dst, exist_ok=True)
+            for name in present:
+                shutil.copyfile(os.path.join(newest, name), os.path.join(dst, name))
+            staged += 1
+    if superseded:
+        say(f"  NOTE superseded run dirs ignored (newest wins): {', '.join(superseded)}")
+    return dst_root, staged
+
+
+def stage_curves(a, m):
+    """Generate the standard figure set from captured curve data (SIGNAL CSVs + parsed QMIX
+    trainlogs). Seed scope: --curve-seeds dev|confirm|all (default confirm)."""
+    figdir = os.path.join(OUT, "figures")
+    os.makedirs(figdir, exist_ok=True)
+    qdir = os.path.join(OUT, "curves", "qmix")
+    nq = _qmix_trainlogs_to_csv(qdir)
+    say(f"  parsed {nq} QMIX trainlog(s) -> {qdir}")
+    seeds = {"dev": m["seeds"]["dev"], "confirm": m["seeds"]["confirmatory"],
+             "all": list(m["seeds"]["dev"]) + list(m["seeds"]["confirmatory"])}[a.curve_seeds]
+    W, n_staged = _stage_signal_curves(m, seeds)
+    say(f"  staged {n_staged} SIGNAL run(s) ({a.curve_seeds} seeds) -> {W}")
+    made, skipped = 0, []
+    for name, metric, kind, arms, ylab in FIGSPEC:
+        csvname = "metrics_update.csv" if kind == "update" else "metrics_heldout.csv"
+        args = []
+        for arm in arms:
+            if arm not in m["signal_arms"]:
+                continue
+            pat = os.path.join(W, f"run_{arm}_s*", csvname)
+            if glob.glob(pat):
+                args += ["--arm", arm.replace("r4_", ""), pat]
+        if len(args) < 4:                       # fewer than 2 arms with data
+            skipped.append(name)
+            continue
+        out = os.path.join(figdir, f"{name}.pdf")
+        r = subprocess.run([PY, "plot_curves.py", *args, "--metric", metric,
+                            "--out", out, "--ylabel", ylab,
+                            "--title", f"v3 {metric} ({a.curve_seeds} seeds)"],
+                           cwd=ROOT, capture_output=True, text=True)
+        if r.returncode == 0:
+            made += 1
+        else:
+            skipped.append(f"{name}({r.stderr.strip().splitlines()[-1:] or ''})")
+    # QMIX figure from the parsed logs
+    qargs = []
+    for arm in list(m["qmix_arms"]) + ["qrw_nocomm", "qrw_raw"]:
+        pat = os.path.join(qdir, f"run_{arm}_s*", "metrics_heldout.csv")
+        if glob.glob(pat):
+            qargs += ["--arm", arm, pat]
+    if len(qargs) >= 4:
+        r = subprocess.run([PY, "plot_curves.py", *qargs, "--metric", "heldout_mean_cost",
+                            "--out", os.path.join(figdir, "fig13_qmix_learning.pdf"),
+                            "--ylabel", "Held-out team cost",
+                            "--title", "v3 QMIX variants"], cwd=ROOT, capture_output=True)
+        made += (r.returncode == 0)
+    say(f"  figures written: {made} -> {figdir}")
+    if skipped:
+        say(f"  skipped (insufficient data): {', '.join(str(x) for x in skipped)}")
+    return made > 0
 
 
 def stage_qmix_dev(a, m):
@@ -661,7 +836,7 @@ STAGES = {"check": stage_check, "plan": stage_plan, "refs": stage_refs,
           "qmix-confirm": stage_qmix_confirm,
           "signal-dev": stage_signal_dev, "signal-gate": stage_signal_gate,
           "signal-confirm": stage_signal_confirm,
-          "dump": stage_dump, "analyze": stage_analyze}
+          "dump": stage_dump, "analyze": stage_analyze, "curves": stage_curves}
 
 
 def main():
@@ -674,6 +849,8 @@ def main():
     ap.add_argument("--seeds-limit", type=int, default=None)
     ap.add_argument("--gate-episodes", type=int, default=100)
     ap.add_argument("--dump-episodes", type=int, default=200)
+    ap.add_argument("--curve-seeds", choices=["dev", "confirm", "all"], default="confirm",
+                    help="seed scope for the figure set (default: confirmatory)")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--force-arm", default=None)
     ap.add_argument("--strict-gates", action="store_true",
