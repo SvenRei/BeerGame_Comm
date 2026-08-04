@@ -1,7 +1,7 @@
 {
   "registration": {
     "title": "SIGNAL v3 -- single confirmatory campaign (the journal run)",
-    "date_utc": "2026-07-26T20:11:19.166555+00:00",
+    "date_utc": "2026-07-30T17:01:45.674054+00:00",
     "lineage_disclosure": "PILOT -> PREREGISTER -> CONFIRM. This registration is written AFTER an extensive registered pilot program: v1.1 (cfae5dee...58b8), v1.2 (b9e9cf6e...cdc59), and the executed v2.1 campaign (81d4178d...052d, seeds 25-49, n*=25 fallback). Every prediction below is therefore INFORMED by pilot outcomes and is stated as a risky directional prediction on FRESH seeds; the pilot results (including the falsified v2.1 P2 direction and the dhat forecast-head defect) are disclosed in full in the paper. No cell of this campaign had produced dev or confirmatory data at registration time (chain-validation smokes at total_episodes=30 excluded mechanically by ep-stamped sentinels).",
     "instrument": "Frozen v3 codebase (git tag v3.0; hash recorded in reports/V3_RUN_RECORD.md and repair_out/run_meta.json). Post-unblinding repair layer: dhat messages come from a CERTIFIED frozen forecaster (results/forecaster_ar1r9.pt: MSE ratio 1.047 vs empirical conditional benchmark, bias -0.018, pred SD 5.616/5.625, corr .879, slope .994; gate thresholds ratio<=1.10, |bias|<=0.5, slope in [0.8,1.2], corr>=0.8, SD>=50% bench); loader fail-closed on certification; gradient isolation structural (outside the optimizer); legacy arms golden-equivalence tested byte-identical.",
     "design": {
@@ -45,16 +45,16 @@
       },
       "eval": "CRN final-eval seed base 500000 (shared with all baselines/references)",
       "arms_signal": {
-        "r4_nocomm": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=false",
-        "r4_raw": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=false",
-        "r4_dhatc": "$BEHAV $AR09 $RB agent.msg_content=dhat agent.use_dhat_head=false agent.forecast_mode=separate_frozen agent.forecast_ckpt=results/forecaster_ar1r9.pt",
-        "r4_arpred": "$BEHAV $AR09 $RB agent.msg_content=condmean agent.use_dhat_head=false",
-        "r4_learned": "$BEHAV $AR09 $RB agent.msg_content=learned agent.use_dhat_head=false",
-        "r4_ip": "$BEHAV $AR09 $RB agent.msg_content=ip agent.use_dhat_head=false",
-        "r4_nocomm_c20": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=false env.obs_order_clip=20",
-        "r4_raw_c20": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=false env.obs_order_clip=20",
-        "r4_nocomm_c12": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=false env.obs_order_clip=12",
-        "r4_raw_c12": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=false env.obs_order_clip=12"
+        "r4_nocomm": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=true",
+        "r4_raw": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=true",
+        "r4_dhatc": "$BEHAV $AR09 $RB agent.msg_content=dhat agent.use_dhat_head=true agent.forecast_mode=separate_frozen agent.forecast_ckpt=results/forecaster_ar1r9.pt",
+        "r4_arpred": "$BEHAV $AR09 $RB agent.msg_content=condmean agent.use_dhat_head=true",
+        "r4_learned": "$BEHAV $AR09 $RB agent.msg_content=learned agent.use_dhat_head=true agent.obs_scale=25 agent.learned_msg_gain=30",
+        "r4_ip": "$BEHAV $AR09 $RB agent.msg_content=ip agent.use_dhat_head=true",
+        "r4_nocomm_c20": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=true env.obs_order_clip=20",
+        "r4_raw_c20": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=true env.obs_order_clip=20",
+        "r4_nocomm_c12": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=true env.obs_order_clip=12",
+        "r4_raw_c12": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=true env.obs_order_clip=12"
       },
       "arms_qmix": {
         "qr_base": "$BEHAV $AR09 agent.use_comm=false $G2GRID",
@@ -129,6 +129,6 @@
     "analysis_binding": "All decisions computed by run_repair_study.py analyze from repair_out/v1 and repair_out/transfer dumps: scipy.stats.ttest_1samp (one-sided), scripts.c1_stats.tost (Schuirmann), scripts.c1_stats.bootstrap_ci (BCa, percentile fallback), scripts.c1_stats.compare_many (Holm). Missing cells fail closed. The report (reports/REPAIR_STUDY.md) embeds git hash + this registration's hash.",
     "amendment_policy": "Scope extensions (D-DP, D-RHO, D-GEO, D-BETA) require a written amendment to this document, re-hashed, BEFORE any such cell trains. Post-unblinding changes of any registered rule are prohibited; deviations are reported as deviations."
   },
-  "sha256": "2ac8be23cb2c6813da35d93fadf62f9a8f62d61cddac3ebb19a1fa7a5d88ee45",
+  "sha256": "4a3a112b207dc1f01c36733eb779352d0268a586d50b4697ac5622a1d6023f08",
   "hash_scope": "sha256 over the registration dict EXCLUDING date_utc"
 }

@@ -10,6 +10,11 @@ msg_content: dhat         # raw | dhat | ip | dhat_ip | learned   (the semantic 
                           # incoming demand, the classical POS-data rung -- Cachon-Fisher 2000 / prereg D1)
 learned_msg_dim: 3        # message width when msg_content=learned (interpretability control)
 learned_msg_gain: 10.0    # gain on the tanh learned message so it rides at the same O(10) scale as dhat/ip
+obs_scale: 100.0         # v3.3: divisor for the learned msg_head's obs input. obs are natural
+                         # units (inventory/pipeline 50-100) while the GRU state h is tanh-bounded
+                         # O(1); feeding both raw saturated the output tanh (|tanh|=1.000,
+                         # gradient ~0.003 -> dead channel). 100 = max_order. Affects the
+                         # 'learned' rung ONLY; every other rung is a detached obs readout.
                           # (bounded but AUDIBLE; without it the learned rung is scale-handicapped -> H5 invalid)
 comm_topology: neighbor   # neighbor | skip | full | retailer_broadcast | no_neighbor
 
@@ -67,6 +72,29 @@ max_grad_norm: 0.5
 lr: 3.0e-4
 reward_scale: 1.0         # divides the shaped reward; >1 (e.g. 100) shrinks the critic gradient so the
                           # shared gradient clip stops starving the actor and S can move
+head_type: gaussian       # v5: "categorical" = order-up-to level sampled from a fixed S-grid
+                          # (log-prob of the EXECUTED decision; the working reference's design).
+                          # "gaussian" = registered instrument, byte-identical.
+act_bins: 41              # S-grid size -- the SAME G2 grid QMIX acts on (n=41, s_max=160):
+act_smax: 160.0           # one shared action set across both learners.
+entropy_start: 0.05       # v5 cold start explores (reference regime), annealing to entropy_end
+entropy_end: 0.005        # over entropy_anneal_frac * total_episodes. categorical head only.
+entropy_anneal_frac: 0.5
+obs_norm: false           # v3.4: scale obs+msg by obs_scale at every actor input and the global
+                          # state by state_scale at the critic (parity with the WORKING reference
+                          # implementation, which does obs/100 everywhere). Default off = registered.
+state_scale: 100.0        # critic global-state divisor when obs_norm=true
+split_optimizer: false    # v3.4: separate critic Adam (lr_critic) + separate grad clips. With the
+                          # joint setup, 100% of updates were clipped and the 0.5 budget was spent
+                          # on a critic-dominated norm. Default off = registered.
+lr_critic: 1.0e-3         # reference uses 3.3x the actor lr for the critic
+baseline_mode: none       # A1: 'condbs' subtracts a frozen AR CondBS rollout on the SAME CRN
+                          # demand stream from the training reward (action-independent control
+                          # variate; unbiased). Gate/eval/reported costs are untouched. Requires
+                          # train_env=ar1 (fail-closed otherwise). Default none = registered legacy.
+min_train_episodes: 0     # A3: early stop may not fire before this episode (0 = legacy, off).
+                          # Non-ignited seeds hit patience at best_ep+patience; the floor buys
+                          # late ignition a chance without touching the improvement rule itself.
 log_std_init: -0.5        # initial exploration std on S = exp(log_std_init); raise (e.g. 1.0 => std ~2.7)
 
 # ===================== training loop =====================

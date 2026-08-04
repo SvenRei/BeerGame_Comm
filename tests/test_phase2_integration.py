@@ -197,15 +197,20 @@ def test_misconfig_failclosed():
     _make_test_forecaster(fpath)
     for extra in ({"forecast_mode": "separate_frozen", "forecast_ckpt": fpath,
                    "msg_content": "raw"},
-                  {"forecast_mode": "separate_frozen", "forecast_ckpt": fpath,
-                   "use_dhat_head": True},
                   {"forecast_mode": "typo_mode"}):
         try:
             _trainer(extra.pop("msg_content", "dhat"), extra=extra)
             raise AssertionError(f"trainer accepted bad config {extra}")
         except ValueError:
             pass
-    print("T12 misconfiguration fail-closed (raw+frozen, dhat_head+frozen, typo mode): PASS")
+    print("T12 misconfiguration fail-closed (raw+frozen, typo mode): PASS")
+    # v3.2: dhat_head + frozen is NO LONGER a misconfiguration -- it is A19 continuity mode.
+    tr, _ = _trainer("dhat", extra={"forecast_mode": "separate_frozen",
+                                    "forecast_ckpt": fpath, "use_dhat_head": True})
+    assert tr.forecaster is not None, "A19: certified forecaster must load"
+    assert all(not p.requires_grad for p in tr.forecaster.parameters()), "A19: forecaster frozen"
+    assert tr.actors[0].use_dhat_head, "A19: actuation head must remain active"
+    print("T12b A19 continuity mode accepted (frozen message + capturable actuation): PASS")
 
 
 if __name__ == "__main__":

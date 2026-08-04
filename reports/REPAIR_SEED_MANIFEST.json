@@ -83,16 +83,16 @@
     }
   },
   "signal_arms": {
-    "r4_nocomm": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=false",
-    "r4_raw": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=false",
-    "r4_dhatc": "$BEHAV $AR09 $RB agent.msg_content=dhat agent.use_dhat_head=false agent.forecast_mode=separate_frozen agent.forecast_ckpt=results/forecaster_ar1r9.pt",
-    "r4_arpred": "$BEHAV $AR09 $RB agent.msg_content=condmean agent.use_dhat_head=false",
-    "r4_learned": "$BEHAV $AR09 $RB agent.msg_content=learned agent.use_dhat_head=false",
-    "r4_ip": "$BEHAV $AR09 $RB agent.msg_content=ip agent.use_dhat_head=false",
-    "r4_nocomm_c20": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=false env.obs_order_clip=20",
-    "r4_raw_c20": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=false env.obs_order_clip=20",
-    "r4_nocomm_c12": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=false env.obs_order_clip=12",
-    "r4_raw_c12": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=false env.obs_order_clip=12"
+    "r4_nocomm": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=true",
+    "r4_raw": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=true",
+    "r4_dhatc": "$BEHAV $AR09 $RB agent.msg_content=dhat agent.use_dhat_head=true agent.forecast_mode=separate_frozen agent.forecast_ckpt=results/forecaster_ar1r9.pt",
+    "r4_arpred": "$BEHAV $AR09 $RB agent.msg_content=condmean agent.use_dhat_head=true",
+    "r4_learned": "$BEHAV $AR09 $RB agent.msg_content=learned agent.use_dhat_head=true agent.obs_scale=25 agent.learned_msg_gain=30",
+    "r4_ip": "$BEHAV $AR09 $RB agent.msg_content=ip agent.use_dhat_head=true",
+    "r4_nocomm_c20": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=true env.obs_order_clip=20",
+    "r4_raw_c20": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=true env.obs_order_clip=20",
+    "r4_nocomm_c12": "$BEHAV $AR09 agent.use_comm=false agent.use_dhat_head=true env.obs_order_clip=12",
+    "r4_raw_c12": "$BEHAV $AR09 $RB agent.msg_content=raw agent.use_dhat_head=true env.obs_order_clip=12"
   },
   "qmix_arms": {
     "qr_base": "$BEHAV $AR09 agent.use_comm=false $G2GRID",
@@ -168,5 +168,37 @@
       "D-GEO",
       "D-BETA"
     ]
+  },
+  "amendment_A2": {
+    "when_utc": "2026-07-28T11:43:59.000737+00:00",
+    "what": "ALL 10 SIGNAL arms gain agent.s_init=75 (was yaml default 5).",
+    "why": "DEFECT FOUND PRE-DATA by a full-budget local dev run. conf/agent/signal.yaml sets s_init=5 with the documented rationale 'small; d_hat now supplies the demand-scaled level' -- i.e. the base-stock head's level came from dhat_coef(5) x dhat_init(14) = 70 via the d_head path. A18 sets use_dhat_head=false on every v3 arm (correctly: that path is the captured-forecast defect), which removed the level term and left S_init ~ 7.8. With inventory position ~44, order = clip(S-IP,0,100) = 0: agents order NOTHING from step one, the chain starves, episode cost sits at ~18,000 vs the ~3,750 AR_CondBS frontier, critic explained_variance ~ 0, and PPO must climb the head bias from 5 to ~70 by gradient descent (observed: raw best 17,830 @ ep3400 then EARLY STOP; dhatc best 18,211 @ ep600 then EARLY STOP).",
+    "value_rationale": "s_init=75 reproduces the PILOT's effective initialization exactly: v2 arms ran use_dhat_head=true, giving head bias s_init(5) + dhat_coef(5) x dhat_init(14) = 75 => S_init ~ 74. This is instrument continuity, not a new tuning choice: the registered v2.1 campaign that produced SIGNAL-raw = 3745.8 started from this level.",
+    "evidence": {
+      "s_init=5  -> S_init": 7.83,
+      "s_init=75 -> S_init": 74.0,
+      "gate cost @ep100 with s_init=5 (from ep200)": 18377.1,
+      "gate cost @ep100 with s_init=75": 2677.3,
+      "Gap_Recovered": {
+        "s_init=5": -8.57,
+        "s_init=75": 0.812
+      }
+    },
+    "status_at_amendment": "PRE-EXECUTION for the confirmatory campaign: no seed in 70-94 has produced data under this manifest. Local dev-seed (60) runs that exposed the defect are diagnostic, disclosed, and discarded.",
+    "scope": "SIGNAL arms only. QMIX selects S from a fixed discrete grid (41 levels, s_max 160) and never had a head-bias init, so the QMIX program is unaffected."
+  },
+  "amendment_A3": {
+    "when_utc": "2026-07-28T19:39:39.684772+00:00",
+    "what": "SUPERSEDES A2. All 10 SIGNAL arms: use_dhat_head=TRUE, s_init back to the yaml default 5, and the dhatc arm keeps forecast_mode=separate_frozen (A19 CONTINUITY MODE, enabled in code v3.2; T12b asserts acceptance, T12 still fail-closes raw+frozen and typo modes).",
+    "why": "Full-budget dev-seed measurement at rho=0.9 (seed 60, identical protocol) showed the v3.0 A18 design does not reproduce the registered pilot:\n  A18 clean (no d_hat in S head): nocomm 4965.3 raw 5062.6 V=-97   (+35% vs frontier)\n  d_hat in S head, DETACHED     : nocomm 4875.2 raw 4833.8 V=+41   (no learning; both arms best@ep200, early stop ep2200)\n  d_hat in S head WITH gradient : nocomm 4788.6 raw 3976.1 V=+813  (+6.1% vs frontier)\n  registered pilot (n=25)       : nocomm 4207.8 raw 3745.8 V=+462\nDiagnosis: the critic explains ~0 variance, so the low-dimensional policy gradient through the d_hat scalar is the learner's PRINCIPAL channel for adapting the order-up-to level. A18 and the detach variant both sever it, leaving a static base-stock frozen near initialization and V ~ 0 BY CONSTRUCTION (identical frozen actuation across arms leaves nothing for a message to change).",
+    "reframing_of_the_defect": "The internal d_hat is a POLICY PARAMETERIZATION (a learned level scalar), not a forecast -- which is exactly why the audit found pred SD 0.50 vs bench 5.52. The defect was therefore never in the actuation; it was BROADCASTING that internal scalar as if it were a demand forecast. The repair belongs in the MESSAGE: msg_content=dhat + forecast_mode=separate_frozen now broadcasts the CERTIFIED FROZEN forecast (ratio 1.047, bias -0.018, SD 5.616/5.625) while the policy retains its internal scalar. Contribution C3 (pretrain->certify->freeze) is unchanged and arguably strengthened: the mechanism is demonstrated and repaired at its true site rather than amputated.",
+    "design_gain": "Actuation is now IDENTICAL across all arms (every arm carries the same internal level scalar), so message content is the only manipulated variable -- a cleaner control than the pilot had.",
+    "status_at_amendment": "PRE-EXECUTION: no seed in 70-94 has produced data. Dev-seed (60) diagnostics are disclosed and discarded.",
+    "validation_required_before_launch": "dev seed 60, arms r4_nocomm/r4_raw/r4_dhatc/r4_arpred, eval at rho=0.9: raw expected ~3900-4200, V positive."
+  },
+  "amendment_A4": {
+    "what": "r4_learned: obs_scale 100->25, learned_msg_gain 10->30",
+    "why": "msg_head conditioning: mid-episode |tanh| 0.06-0.40 (mute) -> 0.395-0.624 (responsive). Mechanistic, not V-selected; V gain +45 is inside seed noise. entropy_coef/lr/k_epochs/gae_lambda/reward_scale all KEPT at registered values: no sweep setting beat baseline beyond noise.",
+    "scope": "learned rung only"
   }
 }

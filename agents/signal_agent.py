@@ -35,7 +35,7 @@ def order_from_S(S, obs, max_order):
 class SIGNALActor(nn.Module):
     def __init__(self, obs_dim, msg_dim, hidden, content, learned_msg_dim=3, s_init=50.0,
                  log_std_init=-0.5, use_dhat_head=False, dhat_coef=5.0, dhat_init=0.0,
-                 learned_msg_gain=10.0):
+                 learned_msg_gain=10.0, obs_scale=100.0, head_type="gaussian", act_bins=41, act_smax=160.0):
         super().__init__()
         self.content = content
         self.msg_dim = msg_dim
@@ -73,18 +73,65 @@ class SIGNALActor(nn.Module):
         #     train only via the DIAL path in SIGNALTrainer.update() (_coupled_forward).
         self.msg_head = (nn.Linear(obs_dim + hidden, learned_msg_dim)
                          if content == "learned" else None)
+        # v3.3: scale for the learned msg_head input. obs are UNNORMALIZED (inventory/pipeline
+        # reach 50-100 mid-episode) while h is tanh-bounded O(1); feeding both raw saturated
+        # the output tanh. max_order (100) is the natural obs scale.
+        self.obs_scale = float(obs_scale)
+        # v3.4 conditioning parity (reference: SvenRei/BeerGame agents/rl/mappo.py scales obs/100
+        # at EVERY network input). in_norm=True divides obs AND messages by obs_scale wherever
+        # they enter a network (belief GRU, base-stock head; msg_head already scales). Messages
+        # are in demand units, so they use the same divisor -- scaling obs alone would make the
+        # channel 100x louder than the state and bias the comm treatment. Default OFF = bitwise
+        # registered instrument; the trainer sets this from cfg.
+        self.in_norm = False
+        # v5 ACTION HEAD REDESIGN (head_type="categorical"). The registered Gaussian-over-S head
+        # is the one structural divergence left from the WORKING reference implementation
+        # (SvenRei/BeerGame mappo.py), whose own comment records why it was retired there: "The
+        # old Normal policy sampled unbounded continuous actions while the env clipped them."
+        # The categorical head samples an ORDER-UP-TO LEVEL from a fixed grid -- the log-prob is
+        # of the exactly-executed decision -- and the grid (41 levels, s_max 160) is the SAME
+        # G2 grid QMIX acts on, unifying the two learners' action sets. Orthogonal init with
+        # gain 0.01 => near-uniform start (cold start, real exploration; the reference's proven
+        # regime). Head input: [obs/scale, h, msg/scale] -- no d_hat term; the level adaptation
+        # no longer rides a scalar side-channel. Default "gaussian" = registered, byte-identical.
+        self.head_type = str(head_type)
+        if self.head_type == "categorical":
+            self.register_buffer("s_grid", torch.linspace(0.0, float(act_smax), int(act_bins)))
+            self.s_logits_head = nn.Linear(obs_dim + hidden + msg_dim, int(act_bins))
+            nn.init.orthogonal_(self.s_logits_head.weight, gain=0.01)
+            nn.init.constant_(self.s_logits_head.bias, 0.0)
         self.msg_gain = (nn.Parameter(torch.tensor(float(learned_msg_gain)))
                          if content == "learned" else None)
 
+    def _nrm(self, x):
+        return x / self.obs_scale if self.in_norm else x
+
     def belief(self, obs_seq, msg_seq, h0=None):
         """obs_seq [T,B,obs], msg_seq [T,B,msg] -> (h_seq [T,B,hidden], hN [1,B,hidden])."""
-        return self.gru(torch.cat([obs_seq, msg_seq], dim=-1), h0)
+        return self.gru(torch.cat([self._nrm(obs_seq), self._nrm(msg_seq)], dim=-1), h0)
 
     def demand_estimate(self, h):                                   # belief -> nonneg demand forecast
         return F.softplus(self.d_head(h))
 
+    def s_logits(self, obs, h, msg):
+        """v5 categorical head: logits over the S-grid. Same inputs as base_stock minus d_hat."""
+        return self.s_logits_head(torch.cat([self._nrm(obs), h, self._nrm(msg)], dim=-1))
+
     def base_stock(self, obs, h, msg):                             # -> (S_mu>=0, S_std)
-        feats = [obs, h, msg] + ([self.demand_estimate(h)] if self.use_dhat_head else [])
+        # v3.2 (A19 continuity mode). d_hat enters the S head WITH gradient, exactly as in the
+        # registered pilot. Measured at rho=.9, seed 60, identical protocol:
+        #     A18 clean (no d_hat in S head) : raw 5062.6  V = -97   (35% above frontier)
+        #     detached d_hat in S head       : raw 4833.8  V = +42   (no learning; best @ep200)
+        #     d_hat in S head WITH gradient  : raw 3976.1  V = +813  (6% above frontier)
+        # The policy gradient through this scalar is the learner's principal channel (the critic
+        # explains ~0 variance, so the low-dimensional d_hat path carries the level adaptation).
+        # It is a POLICY PARAMETERIZATION, not a forecast -- which is precisely why broadcasting
+        # it as "a demand forecast" was the real defect (pred SD 0.50 vs bench 5.52). The repair
+        # is therefore in the MESSAGE, not the actuation: msg_content=dhat + forecast_mode=
+        # separate_frozen broadcasts the CERTIFIED FROZEN forecast while the policy keeps its
+        # internal level scalar. See message(): dhat_ext takes precedence over the internal d_hat.
+        feats = ([self._nrm(obs), h, self._nrm(msg)]
+                 + ([self.demand_estimate(h)] if self.use_dhat_head else []))
         S_mu = F.softplus(self.head(torch.cat(feats, dim=-1)))
         return S_mu, self.log_std.exp().clamp(1e-2, 3.0)
 
@@ -135,7 +182,17 @@ class SIGNALActor(nn.Module):
                                                          IP], dim=-1)
         # "learned" = gain * tanh(...): a bounded code rescaled to the O(10) scale of dhat/ip so it is
         # audible to the receiver (see msg_gain). tanh bounds it; the gain restores the magnitude.
-        if self.content == "learned":  return self.msg_gain * torch.tanh(self.msg_head(torch.cat([obs, h], dim=-1)))
+        if self.content == "learned":
+            # v3.3 SATURATION FIX. msg_head consumed UNNORMALIZED obs, so pre-tanh was ~|3.5| at
+            # init and |>6| mid-episode => |tanh| = 1.000 with gradient ~0.003: the channel was a
+            # saturated near-constant from step one and could not learn. Measured on the v3.2 run:
+            # retailer ch0 sat=1.00 with corr(demand)=0.003, and r4_learned reached only V=+228 vs
+            # raw's +625. Dividing obs by max_order makes it commensurate with the tanh-bounded GRU
+            # state h, keeping the head in its responsive (gradient-carrying) region. The emitted
+            # message scale is UNCHANGED (msg_gain * tanh, still O(10)); only the head's INPUT
+            # conditioning changes.
+            z = torch.cat([obs / self.obs_scale, h], dim=-1)
+            return self.msg_gain * torch.tanh(self.msg_head(z))
         raise ValueError(self.content)
 
 
@@ -175,7 +232,11 @@ class SIGNALTrainer:
             SIGNALActor(obs_dim, self.msg_dim, H, self.content, cfg.get("learned_msg_dim", 3),
                         s_init=s_init, log_std_init=log_std_init, use_dhat_head=use_dhat_head,
                         dhat_coef=dhat_coef, dhat_init=dhat_init,
-                        learned_msg_gain=float(cfg.get("learned_msg_gain", 10.0)))
+                        learned_msg_gain=float(cfg.get("learned_msg_gain", 10.0)),
+                        obs_scale=float(cfg.get("obs_scale", 100.0)),
+                        head_type=str(cfg.get("head_type", "gaussian")),
+                        act_bins=int(cfg.get("act_bins", 41)),
+                        act_smax=float(cfg.get("act_smax", 160.0)))
             for _ in range(n_agents)]).to(self.device)
         self.critic = SIGNALCritic(state_dim, H, n_agents).to(self.device)
         for _a in self.actors:                                     # v1.3 demand context (see SIGNALActor)
@@ -192,8 +253,39 @@ class SIGNALTrainer:
         # longer dominates the shared gradient clip and starves the (standardized-advantage) actor. The
         # gate scores raw env cost, so results stay comparable across reward_scale values (1.0 = off).
         self.reward_scale = float(cfg.get("reward_scale", 1.0))
-        self.params = list(self.actors.parameters()) + list(self.critic.parameters())
-        self.opt = torch.optim.Adam(self.params, lr=float(cfg.get("lr", 3e-4)))
+        # A1 control-variate baseline (default OFF = registered legacy). When "condbs", collect()
+        # rolls a FROZEN analytic AR conditional base-stock policy on a CRN TWIN env (same seed =>
+        # same demand path) and update() adds that rollout's shaped cost back into the reward:
+        #   r'_t = r_t + shaped_baseline_cost_t   (i.e. r_t minus the baseline's shaped REWARD).
+        # The subtracted term depends only on the exogenous demand path, never on the learner's
+        # actions, so E[grad] is unchanged (additive action-independent baseline) while the
+        # demand-path variance component cancels. Wired by train_signal via set_baseline().
+        self.baseline_mode = str(cfg.get("baseline_mode", "none"))
+        self._base_env = None
+        self._base_pol = None
+        self._crn_checked = False
+        # v3.4 conditioning parity (both flags default OFF = registered instrument, bitwise):
+        #   obs_norm        -- obs+msg scaled by obs_scale at every actor input; global state
+        #                      scaled by state_scale at the critic (reference does /100).
+        #   split_optimizer -- separate critic Adam at lr_critic (reference: 1e-3, 3.3x actor)
+        #                      with SEPARATE grad clips. Measured with the joint setup: 100% of
+        #                      updates clipped, pre-clip norm ~4e3 dominated by ~1.5e6 critic
+        #                      loss -- the actor step was a rescaling of critic gradient.
+        self.obs_norm = bool(cfg.get("obs_norm", False))
+        self.state_scale = float(cfg.get("state_scale", 100.0))
+        self.split_optimizer = bool(cfg.get("split_optimizer", False))
+        for _a in self.actors:
+            _a.in_norm = self.obs_norm
+        self.actor_params = list(self.actors.parameters())
+        self.critic_params = list(self.critic.parameters())
+        self.params = self.actor_params + self.critic_params
+        if self.split_optimizer:
+            self.opt = torch.optim.Adam(self.actor_params, lr=float(cfg.get("lr", 3e-4)))
+            self.critic_opt = torch.optim.Adam(self.critic_params,
+                                               lr=float(cfg.get("lr_critic", 1e-3)))
+        else:
+            self.opt = torch.optim.Adam(self.params, lr=float(cfg.get("lr", 3e-4)))
+            self.critic_opt = None
         # ---- Phase-2 repair (post-unblinding): frozen certified forecaster (spec A5-A8) -----
         # forecast_mode "none" (default) leaves every legacy arm byte-identical. "separate_frozen"
         # loads a CERTIFIED DemandForecaster (loader fail-closed on certification, A14) and routes
@@ -206,10 +298,17 @@ class SIGNALTrainer:
             if self.content not in ("dhat", "dhat_ip"):
                 raise ValueError("forecast_mode=separate_frozen applies only to msg_content "
                                  f"dhat/dhat_ip (got {self.content!r})")
-            if use_dhat_head:
-                raise ValueError("forecast_mode=separate_frozen requires use_dhat_head=false "
-                                 "(A18 clean mode; the A19 continuity mode is deliberately "
-                                 "unsupported in the repaired study)")
+            # A19 CONTINUITY MODE (enabled in v3.2; was fail-closed under A18).
+            # use_dhat_head governs the ACTUATION (internal level scalar -> S). forecast_mode
+            # governs the MESSAGE (certified frozen forecast -> channel). These are independent
+            # by construction: message() returns dhat_ext when supplied, base_stock() always
+            # uses the internal demand_estimate(h). A18 conflated them and, by forcing
+            # use_dhat_head=false, removed the learner's principal gradient channel -- measured
+            # V collapse from +813 to -97 at rho=.9. Under A19 the actuation matches the
+            # registered pilot on EVERY arm (identical across arms => a clean control) and the
+            # only manipulated variable is message content.
+            if use_dhat_head and str(cfg.get("forecast_mode")) == "separate_frozen":
+                pass
             from agents.demand_forecaster import load_certified
             self._fc_src = str(cfg.get("forecast_ckpt", "results/forecaster_ar1r9.pt"))
             self.forecaster, self._fc_ckpt = load_certified(self._fc_src, require_pass=True)
@@ -248,6 +347,40 @@ class SIGNALTrainer:
                 "forecaster_version": self._fc_ckpt.get("forecaster_version", 1),
                 "source_path": self._fc_src}
 
+    def set_baseline(self, env, policy):
+        """A1: attach the CRN twin env + frozen analytic policy (built by train_signal)."""
+        self._base_env, self._base_pol = env, policy
+
+    def _baseline_costs(self, seed, ref_demand):
+        """A1: per-step per-agent local costs of the frozen CondBS policy on the SAME CRN demand
+        stream (twin env reset to the identical seed). numpy/env only -- consumes NO torch RNG, so
+        the learner's trajectory is bitwise unchanged by enabling the baseline. On the first call
+        the retailer demand streams of learner and twin are compared and a mismatch fails LOUDLY
+        (a broken CRN pairing would silently bias nothing but cancel nothing)."""
+        env, pol = self._base_env, self._base_pol
+        obs, _ = env.reset(seed=seed)
+        pol.reset()
+        costs, dem = [], []
+        while env.agents:
+            dem.append(float(obs[AGENTS[0]][3]))
+            acts = pol.act(obs, env)
+            obs, _, terms, truncs, info = env.step(acts)
+            costs.append([float(info[a]["local_cost"]) for a in AGENTS])
+            if any(terms.values()) or any(truncs.values()):
+                break
+        bc = torch.tensor(costs, dtype=torch.float32, device=self.device)      # [T,N]
+        if not self._crn_checked:
+            T = min(len(dem), int(ref_demand.numel()))
+            diff = float((torch.tensor(dem[:T]) - ref_demand[:T].cpu()).abs().max())
+            if diff > 1e-5 or bc.shape[0] != ref_demand.numel():
+                raise RuntimeError(
+                    f"A1 CRN twin mismatch: max |demand diff| = {diff:.3g}, "
+                    f"baseline T={bc.shape[0]} vs learner T={ref_demand.numel()}. "
+                    "The twin env is not replaying the learner's demand stream -- refusing to "
+                    "train with a broken control variate.")
+            self._crn_checked = True
+        return bc
+
     def collect(self, env, seed, deterministic=False):
         """Roll one episode. Messages are stored as received and detached: in the update they are
         fixed extended observations for the named contents (plain MAPPO, which keeps d_hat/ip semantics
@@ -266,6 +399,7 @@ class SIGNALTrainer:
         lam_ctx = float(lam_ctx) if lam_ctx is not None else None
         dprev, o_last = None, None                                 # [N,2] own-demand lags; previous obs
         O, MIN, GS, SA, LP, C, DT, DN = ([] for _ in range(8))
+        SIDX = []                                                        # v5 categorical only
         R_MSG, R_DHAT, R_H = ([], [], []) if self.roll_obs is not None else (None, None, None)  # obs-only sink
         while True:
             o = torch.tensor(np.stack([obs[a] for a in AGENTS]), dtype=torch.float32, device=dev)  # [N,obs]
@@ -285,15 +419,24 @@ class SIGNALTrainer:
             incoming = self.adj @ m_prev                                       # [N,msg] (delivered next step)
             S = torch.zeros(self.N, 1, device=dev)
             logp = torch.zeros(self.N, device=dev)
+            sidx = torch.zeros(self.N, dtype=torch.long, device=dev)     # v5 categorical only
             m_out = torch.zeros(self.N, self.msg_dim, device=dev)
             _h_step = [] if self.roll_obs is not None else None
             _d_step = [] if self.roll_obs is not None else None
             for i in range(self.N):
                 h_seq, h[i] = self.actors[i].belief(o[i].view(1, 1, -1), incoming[i].view(1, 1, -1), h[i])
                 hi = h_seq[-1]                                                 # [1,hidden]
-                S_mu, S_std = self.actors[i].base_stock(o[i:i + 1], hi, incoming[i:i + 1])
-                Si = S_mu if deterministic else Normal(S_mu, S_std).sample()
-                logp[i] = Normal(S_mu, S_std).log_prob(Si).sum()
+                if self.actors[i].head_type == "categorical":
+                    lg = self.actors[i].s_logits(o[i:i + 1], hi, incoming[i:i + 1])
+                    dist = torch.distributions.Categorical(logits=lg)
+                    idx = lg.argmax(-1) if deterministic else dist.sample()
+                    Si = self.actors[i].s_grid[idx].view(1, 1)
+                    logp[i] = dist.log_prob(idx).sum()
+                    sidx[i] = idx.reshape(())
+                else:
+                    S_mu, S_std = self.actors[i].base_stock(o[i:i + 1], hi, incoming[i:i + 1])
+                    Si = S_mu if deterministic else Normal(S_mu, S_std).sample()
+                    logp[i] = Normal(S_mu, S_std).log_prob(Si).sum()
                 S[i] = Si
                 m_out[i] = self.actors[i].message(
                     o[i:i + 1], hi,
@@ -316,6 +459,7 @@ class SIGNALTrainer:
             done = bool(any(terms.values()) or any(truncs.values()))
             O.append(o); MIN.append(incoming.detach()); GS.append(gstate)
             SA.append(S.detach()); LP.append(logp.detach()); C.append(cost); DT.append(dtgt)
+            SIDX.append(sidx)
             DN.append(torch.tensor(1.0 if done else 0.0, device=dev))
             m_prev = m_out.detach()                                            # ONE-STEP message delay
             obs = nobs
@@ -325,11 +469,23 @@ class SIGNALTrainer:
             self.roll_obs.append({"msg_out": torch.stack(R_MSG).cpu().numpy(),   # [T,N,msg]
                                   "dhat":    torch.stack(R_DHAT).cpu().numpy(),   # [T,N]
                                   "h":       torch.stack(R_H).cpu().numpy()})     # [T,N,hidden]
-        return dict(obs=torch.stack(O), msg_in=torch.stack(MIN), gstate=torch.stack(GS),
-                    S=torch.stack(SA), logp=torch.stack(LP), cost=torch.stack(C),
-                    dtgt=torch.stack(DT), done=torch.stack(DN))                # all [T, N, *] or [T,*]
+        ep = dict(obs=torch.stack(O), msg_in=torch.stack(MIN), gstate=torch.stack(GS),
+                  S=torch.stack(SA), logp=torch.stack(LP), cost=torch.stack(C),
+                  dtgt=torch.stack(DT), done=torch.stack(DN))                  # all [T, N, *] or [T,*]
+        if self.actors[0].head_type == "categorical":
+            ep_sidx = torch.stack(SIDX)                                   # [T, N] long
+        if (self.baseline_mode == "condbs" and self._base_pol is not None and not deterministic):
+            # A1: runs AFTER the learner's episode (no torch RNG consumed -> trajectory unchanged).
+            ep["base_cost"] = self._baseline_costs(seed, ep["obs"][:, 0, 3])
+        if self.actors[0].head_type == "categorical":
+            ep["S_idx"] = ep_sidx
+        return ep
 
     # ------------------------------------------------------------------- GAE
+    def _cin(self, gs):
+        """v3.4: critic input scaling (reference scales state/100)."""
+        return gs / self.state_scale if self.obs_norm else gs
+
     def _gae(self, rew, V, done):
         # Truncation vs termination: episodes end by time-limit truncation (env terminations are always
         # False), but `done` marks the final step, so the last step is treated as terminal with no value
@@ -397,10 +553,17 @@ class SIGNALTrainer:
             transfer = self.tau_vec * back                        # paid BY each stage for its backorders
             credit = torch.zeros_like(transfer); credit[..., :-1] = transfer[..., 1:]  # credit its customer
             d["rew"] = (-(c + self.srdqn_beta * others) - transfer + credit) / self.reward_scale
+            if "base_cost" in d:
+                # A1: subtract the CondBS baseline's shaped REWARD (= add its shaped cost), same
+                # beta-mixing and scaling as the learner's own term. Action-independent given the
+                # demand path => unbiased; transfer/credit are learner-endogenous and stay as-is.
+                bc = d["base_cost"]
+                bothers = bc.sum(-1, keepdim=True) - bc
+                d["rew"] = d["rew"] + (bc + self.srdqn_beta * bothers) / self.reward_scale
         # (B) advantages from the centralized critic (per-agent) ------------------------------------
         with torch.no_grad():
             for d in episodes:
-                V = self.critic(d["gstate"])                      # [T,N]
+                V = self.critic(self._cin(d["gstate"]))                      # [T,N]
                 adv = torch.stack([self._gae(d["rew"][:, i], V[:, i], d["done"]) for i in range(self.N)], dim=1)
                 d["V"], d["adv"] = V, adv
                 d["vtarget"] = (adv + V).detach()                 # GAE lambda-return
@@ -421,10 +584,12 @@ class SIGNALTrainer:
         a_loss = c_loss = 0.0
         for _ in range(self.k_epochs):
             self.opt.zero_grad()
+            if self.critic_opt is not None:
+                self.critic_opt.zero_grad()
             total = torch.zeros((), device=dev)
             for d in episodes:
                 # critic (shared across agents; messages do not enter the critic)
-                V = self.critic(d["gstate"])                      # [T,N]
+                V = self.critic(self._cin(d["gstate"]))                      # [T,N]
                 closs = F.mse_loss(V, d["vtarget"])
                 ploss = torch.zeros((), device=dev)
                 if self.content == "learned":                     # DIAL: one joint in-graph forward
@@ -439,12 +604,23 @@ class SIGNALTrainer:
                         h_seq, _ = self.actors[i].belief(obs_i, msg_i)
                         h = h_seq.squeeze(1)                      # [T,hidden]
                         msg_i_used = d["msg_in"][:, i, :]
-                    S_mu, S_std = self.actors[i].base_stock(d["obs"][:, i, :], h, msg_i_used)
-                    logp_new = Normal(S_mu, S_std).log_prob(d["S"][:, i, :]).sum(-1)   # [T]
+                    if self.actors[i].head_type == "categorical":
+                        lg = self.actors[i].s_logits(d["obs"][:, i, :], h, msg_i_used)  # [T,bins]
+                        cdist = torch.distributions.Categorical(logits=lg)
+                        logp_new = cdist.log_prob(d["S_idx"][:, i])                     # [T]
+                        g = self.actors[i].s_grid
+                        m1 = (cdist.probs * g).sum(-1)
+                        S_mu = m1                                       # dist mean over the grid,
+                        #                                                 [T] -- telemetry parity
+                        S_std = ((cdist.probs * g * g).sum(-1) - m1 * m1).clamp_min(0).sqrt().mean()
+                    else:
+                        S_mu, S_std = self.actors[i].base_stock(d["obs"][:, i, :], h, msg_i_used)
+                        logp_new = Normal(S_mu, S_std).log_prob(d["S"][:, i, :]).sum(-1)   # [T]
                     ratio = torch.exp(logp_new - d["logp"][:, i])                       # pi_new/pi_old
                     A = d["adv"][:, i]
                     surr = torch.min(ratio * A, torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * A)
-                    ent = Normal(S_mu, S_std).entropy().mean()
+                    ent = (cdist.entropy().mean() if self.actors[i].head_type == "categorical"
+                           else Normal(S_mu, S_std).entropy().mean())
                     ploss = ploss - surr.mean() - self.ent_coef * ent
                     # d_hat grounding: keeps the demand message interpretable as a forecast (light aux
                     # loss). Review 2.0 fix #6: for the LEARNED rung the aux gradient is stopped at the
@@ -453,9 +629,16 @@ class SIGNALTrainer:
                     # representation and can never shape the sender's channel. The policy loss keeps the
                     # coupled in-graph h (DIAL unchanged). learned_aux_detach=false restores the old
                     # coupling as the registered ablation arm.
-                    if self.forecast_mode == "separate_frozen":
-                        # Phase-2 (A7): the forecast is frozen+certified; there is nothing to ground.
-                        # The internal d_head deliberately receives no training signal in this mode.
+                    if self.forecast_mode == "separate_frozen" and not self.actors[i].use_dhat_head:
+                        # Phase-2 (A7): under A18 the internal d_head was UNUSED in frozen mode, so
+                        # grounding it was pointless. Under A19 (v3.2) it drives ACTUATION on every
+                        # arm, and gating its aux loss off here made r4_dhatc the only arm whose
+                        # level scalar had no supervised anchor -- an uncontrolled actuation
+                        # difference. Measured cost of that confound at rho=.9 seed 60:
+                        # dhatc 4904.6 (V=-115.9) vs arpred 3889.1 (V=+899.6) on near-identical
+                        # information content. The gate now applies ONLY when the internal head is
+                        # genuinely unused, so actuation treatment is identical across all arms and
+                        # msg_content remains the sole manipulated variable.
                         aux = torch.zeros((), device=self.device)
                     elif self.content == "learned" and self.learned_aux_detach:
                         h_aux, _ = self.actors[i].belief(d["obs"][:, i, :].unsqueeze(1),
@@ -480,10 +663,18 @@ class SIGNALTrainer:
                 total = total + (ploss + self.vf_coef * closs) / len(episodes)
                 a_loss += float(ploss.item()); c_loss += float(closs.item())
             total.backward()
-            gnorm = nn.utils.clip_grad_norm_(self.params, self.max_grad_norm)   # RETURNS the pre-clip norm
+            if self.split_optimizer:
+                gnorm = nn.utils.clip_grad_norm_(self.actor_params, self.max_grad_norm)
+                gcrit = nn.utils.clip_grad_norm_(self.critic_params, self.max_grad_norm)
+                if self.upd_obs is not None:
+                    self.upd_obs.setdefault("critic_grad_norm", []).append(float(gcrit))
+            else:
+                gnorm = nn.utils.clip_grad_norm_(self.params, self.max_grad_norm)   # RETURNS the pre-clip norm
             if self.upd_obs is not None:          # OBSERVATION: dead-gradient signature (read-only)
                 self.upd_obs.setdefault("grad_norm", []).append(float(gnorm))
             self.opt.step()
+            if self.critic_opt is not None:
+                self.critic_opt.step()
         k = max(1, self.k_epochs * len(episodes))
         return a_loss / k, c_loss / k
 

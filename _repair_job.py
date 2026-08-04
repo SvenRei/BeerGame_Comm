@@ -27,5 +27,33 @@ if r.returncode != 0:
     except OSError:
         pass
 if r.returncode == 0:
+    # COMPLETION INVARIANT (added after a local incident: 4 jobs silently truncated yet
+    # reported ok). rc==0 is NOT sufficient. The job's own trainlog must prove one of:
+    #   (a) legitimate early stop  -- trainer prints "EARLY STOP at ep";
+    #   (b) the final budget milestone was crossed -- "budget milestone <requested>" (SIGNAL
+    #       prints milestones unconditionally; gate prints are improvement-only);
+    #   (c) QMIX: last unconditional gate print "ep N:" reached requested - heldout_every;
+    #   (d) smoke regime: requested below the first milestone (unverifiable, accepted).
+    import re as _re
+    txt = ""
+    try:
+        txt = open(tlog, errors="ignore").read()
+    except OSError:
+        pass
+    req = int(ep) if str(ep).isdigit() else 0
+    is_qmix = any("train_qmix.py" in c for c in cmd)
+    okk = "EARLY STOP at ep" in txt
+    if not okk and is_qmix:
+        gates = [int(g) for g in _re.findall(r"ep (\d+): held-out", txt)]
+        he = next((int(c.split("=", 1)[1]) for c in cmd
+                   if c.startswith("agent.heldout_every=")), 200)
+        okk = bool(gates) and max(gates) >= req - he
+    if not okk and not is_qmix:
+        okk = (f"budget milestone {req}:" in txt) or req < 1000
+    if not okk:
+        print(f"[wrapper] COMPLETION INVARIANT VIOLATED for {tag}: rc=0 but the trainlog "
+              f"shows neither EARLY STOP nor the ep-{req} milestone. Truncated/killed run "
+              f"-- NOT stamping the sentinel. Tail:\n" + txt[-1500:])
+        sys.exit(3)
     open(done, "w").write(str(ep))
 sys.exit(r.returncode)

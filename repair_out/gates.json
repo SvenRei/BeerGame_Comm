@@ -1,0 +1,35 @@
+{
+  "qmix": {
+    "ref_GridCondBS": 3766.435,
+    "abs_threshold": 4519.722,
+    "base_mean": 7251.225,
+    "verdicts": {
+      "qr_base": {
+        "n": 1,
+        "mean": 7251.225,
+        "abs_pass": false,
+        "rel_pass": false
+      },
+      "qr_doubleq": {
+        "n": 1,
+        "mean": 6227.62,
+        "abs_pass": false,
+        "rel_pass": false
+      },
+      "qr_replay": {
+        "n": 1,
+        "mean": 6671.455,
+        "abs_pass": false,
+        "rel_pass": false
+      },
+      "qr_eps": {
+        "n": 1,
+        "mean": 8056.255,
+        "abs_pass": false,
+        "rel_pass": false
+      }
+    },
+    "winner": null,
+    "when": "2026-07-31T16:42:48.491957"
+  }
+}

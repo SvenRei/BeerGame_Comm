@@ -166,6 +166,20 @@ def main(cfg: DictConfig):
            else np.zeros((n, n), dtype=np.float32))
 
     trainer = SIGNALTrainer(A, n_agents=n, obs_dim=obs_dim, state_dim=state_dim, adj=adj, device=device)
+    if str(A.get("baseline_mode", "none")) == "condbs":                        # A1 wiring
+        if str(A.get("train_env", "")) != "ar1":
+            raise ValueError("baseline_mode=condbs requires agent.train_env=ar1 (the analytic "
+                             "CondBS control variate is AR(1)-specific); got "
+                             f"train_env={A.get('train_env')!r}")
+        from scripts.baselines import ARCondBSPolicy
+        _twin = make_train_env(base, A)                       # CRN twin: same ctor, own RNG state
+        _bpol = ARCondBSPolicy(float(A.get("ar1_mu", 12.0)), float(A.get("ar1_rho", 0.9)),
+                               float(A.get("ar1_sigma", 3.0)),
+                               h=float(base["holding_cost"]), b=float(base["backorder_cost"]))
+        trainer.set_baseline(_twin, _bpol)
+        print(f"[signal] A1 control-variate baseline ON: CondBS(mu={A.get('ar1_mu', 12.0)}, "
+              f"rho={A.get('ar1_rho', 0.9)}, sigma={A.get('ar1_sigma', 3.0)}) on a CRN twin env; "
+              "reported/gate costs are UNCHANGED (learning signal only)", flush=True)
     print(f"[signal] obs_dim={obs_dim} state_dim={state_dim} msg_content={A.get('msg_content')} "
           f"topology={A.get('comm_topology') if A.get('use_comm', True) else 'NONE(zeroADJ)'} "
           f"beta={A.get('srdqn_beta')} tau={A.get('tau')} params="
@@ -219,6 +233,19 @@ def main(cfg: DictConfig):
     last_a = last_c = float("nan")
     ep = -1                                                         # defined even if total_episodes == 0 (tail milestones)
     for ep in range(int(cfg.total_episodes)):
+        if str(A.get("head_type", "gaussian")) == "categorical":
+            # v5: reference-style entropy annealing (explore early, sharpen late). Guarded: the
+            # registered gaussian path keeps its constant cfg entropy_coef untouched.
+            _es = float(A.get("entropy_start", 0.05)); _ee = float(A.get("entropy_end", 0.005))
+            _fr = max(1.0, float(A.get("entropy_anneal_frac", 0.5)) * int(cfg.total_episodes))
+            # BUGFIX (caught by CRN determinism): this previously wrote trainer.entropy_coef --
+            # a DEAD attribute; the loss reads trainer.ent_coef (signal_agent line ~248). Every
+            # earlier v5 run therefore trained at entropy coef 0.0, and changing entropy_start
+            # reproduced trajectories bitwise. The anneal is live only through ent_coef.
+            trainer.ent_coef = _es + (_ee - _es) * min(1.0, ep / _fr)
+            if ep == 0:
+                print(f"[signal] v5 entropy anneal LIVE: ent_coef {_es} -> {_ee} "
+                      f"over {int(_fr)} eps", flush=True)
         buf = trainer.collect(train_env, seed=int(train_rng.integers(0, 2**31 - 1)))
         recent_cost.append(float(buf["cost"].sum().item()))
         batch.append(buf)
@@ -284,10 +311,18 @@ def main(cfg: DictConfig):
             if csvlog is not None:
                 csvlog.log_gate(ep, elog, mean_cost, gate_stats, best, best_ep,
                                 (ep - best_ep) if best_ep >= 0 else -1, trainer, A)
+            min_ep = int(A.get("min_train_episodes", 0) or 0)          # A3: stop floor
             if (not improved) and patience and best_ep >= 0 and (ep - best_ep) >= patience:
-                print(f"[signal] EARLY STOP at ep {ep}: no held-out improvement for {ep - best_ep} eps "
-                      f"(best {best:.1f} @ ep {best_ep}; checkpoint kept)", flush=True)
-                break
+                if ep < min_ep:
+                    if not getattr(trainer, "_floor_noted", False):
+                        trainer._floor_noted = True                         # print the deferral once
+                        print(f"[signal] early-stop condition met at ep {ep} (best {best:.1f} @ ep "
+                              f"{best_ep}) but min_train_episodes={min_ep} not reached -- "
+                              "continuing (A3 floor)", flush=True)
+                else:
+                    print(f"[signal] EARLY STOP at ep {ep}: no held-out improvement for {ep - best_ep} eps "
+                          f"(best {best:.1f} @ ep {best_ep}; checkpoint kept)", flush=True)
+                    break
 
         while mi < len(milestones) and (ep + 1) >= milestones[mi]:  # budget milestone crossed
             _save_budget(milestones[mi], ep + 1)
@@ -303,10 +338,31 @@ def main(cfg: DictConfig):
         _save_budget(milestones[mi], ep + 1, truncated=True)
         mi += 1
 
+    # FINAL-WEIGHTS checkpoint (diagnostic only; NOT used for any registered result). Every other
+    # artifact -- best and all budget milestones -- stores the BEST-GATED payload, so the weights the
+    # run actually ended with are otherwise unrecoverable. They are needed to answer one question:
+    # the gate scores rho in {0.15,0.45,0.75} while training and test run at rho=0.9, so a run can
+    # keep improving at the DEPLOYMENT regime while the gate sees nothing and patience kills it
+    # (observed: seed 61 raw, train_team_cost 4802 -> 3436 by ep 1900, gate best still @ ep 200).
+    # Comparing final vs best at rho=0.9 quantifies what that regime split costs. Saving a file
+    # changes no training, no selection, and no reported number.
+    torch.save({"actors": [ac.state_dict() for ac in trainer.actors],
+                "critic": trainer.critic.state_dict(),
+                "config": A, "adj": adj.tolist(), "env": base,
+                "forecaster": (trainer.forecaster_payload()
+                               if hasattr(trainer, "forecaster_payload") else None),
+                "obs_dim": obs_dim, "state_dim": state_dim,
+                "msg_content": A.get("msg_content"), "episode": ep,
+                "seed": int(cfg.seed), "best_heldout_cost": best,
+                "is_final_weights": True},
+               os.path.join(run_dir, "signal_checkpoint_final.pt"))
+
     if csvlog is not None:
         csvlog.close()
     wandb.finish()
     print(f"[signal] done. best held-out mean cost = {best:.1f} @ ep {best_ep}   ->  {run_dir}", flush=True)
+    print(f"[signal] final-weights checkpoint (diagnostic) saved at ep {ep}: "
+          f"signal_checkpoint_final.pt", flush=True)
 
 
 if __name__ == "__main__":

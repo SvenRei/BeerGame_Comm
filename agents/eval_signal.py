@@ -181,8 +181,21 @@ class SIGNALPolicy:
         self.use_dhat_head = bool(cfg.get("use_dhat_head", False))   # must match training (changes head input size)
         self.actors = []
         for sd in ckpt["actors"]:
+            # v5 FIX: the eval-side actor must be built with the SAME head configuration the
+            # checkpoint was trained with, else load_state_dict fails on s_grid/s_logits_head
+            # (categorical ckpts) -- the crash Sven hit on both v5 evals. Backward compatible:
+            # old gaussian ckpts lack these keys and get the defaults.
             a = SIGNALActor(self.obs_dim, self.msg_dim, self.hidden, self.content,
-                            self.learned_msg_dim, use_dhat_head=self.use_dhat_head).to(DEVICE)
+                            self.learned_msg_dim, use_dhat_head=self.use_dhat_head,
+                            obs_scale=float(cfg.get("obs_scale", 100.0)),
+                            head_type=str(cfg.get("head_type", "gaussian")),
+                            act_bins=int(cfg.get("act_bins", 41)),
+                            act_smax=float(cfg.get("act_smax", 160.0))).to(DEVICE)
+            # v3.4 TRAIN/EVAL INPUT PARITY: runs trained with obs_norm scaled every network input;
+            # evaluation must replicate that or the weights see a 100x-shifted distribution.
+            # (For near-init gaussian ckpts the mismatch was numerically mild -- the v3.4 nocomm
+            # evals stand within noise -- but for a trained categorical head it is fatal.)
+            a.in_norm = bool(cfg.get("obs_norm", False))
             a.load_state_dict(sd)
             a.eval()
             self.actors.append(a)
@@ -251,8 +264,14 @@ class SIGNALPolicy:
                                                      incoming[i].view(1, 1, -1), self.h[i])
             hi = h_seq[-1]                           # [1,hidden]
             hi_list.append(hi)
-            S_mu, S_std = self.actors[i].base_stock(o_t[i:i + 1], hi, incoming[i:i + 1])
-            S[i] = S_mu if self.deterministic else torch.distributions.Normal(S_mu, S_std).sample()
+            if getattr(self.actors[i], "head_type", "gaussian") == "categorical":
+                lg = self.actors[i].s_logits(o_t[i:i + 1], hi, incoming[i:i + 1])
+                idx = (lg.argmax(-1) if self.deterministic
+                       else torch.distributions.Categorical(logits=lg).sample())
+                S[i] = self.actors[i].s_grid[idx].view(1, 1)
+            else:
+                S_mu, S_std = self.actors[i].base_stock(o_t[i:i + 1], hi, incoming[i:i + 1])
+                S[i] = S_mu if self.deterministic else torch.distributions.Normal(S_mu, S_std).sample()
             dhat[i] = (float(dhat_ext_all[i, 0].item()) if dhat_ext_all is not None
                        else float(self.actors[i].demand_estimate(hi).reshape(-1)[0].item()))
             m_out[i] = self.actors[i].message(
@@ -280,7 +299,11 @@ class SIGNALPolicy:
         o_t, hi_list, inc = self.last_ctx
         m = inc[agent_idx:agent_idx + 1].clone()    # observed incoming as the baseline
         m[0, int(component)] = float(msg_value)
-        s_mu, _ = self.actors[agent_idx].base_stock(o_t[agent_idx:agent_idx + 1], hi_list[agent_idx], m)
+        if getattr(self.actors[agent_idx], "head_type", "gaussian") == "categorical":
+            _lg = self.actors[agent_idx].s_logits(o_t[agent_idx:agent_idx + 1], hi_list[agent_idx], m)
+            s_mu = self.actors[agent_idx].s_grid[_lg.argmax(-1)].view(1, 1)
+        else:
+            s_mu, _ = self.actors[agent_idx].base_stock(o_t[agent_idx:agent_idx + 1], hi_list[agent_idx], m)
         return float(s_mu.reshape(-1)[0].item())
 
 

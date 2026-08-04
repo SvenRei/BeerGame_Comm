@@ -1,0 +1,20 @@
+{
+  "0.9": {
+    "retailer": {
+      "zero": 0.1317,
+      "max": 0.0002
+    },
+    "wholesaler": {
+      "zero": 0.2125,
+      "max": 0.0001
+    },
+    "distributor": {
+      "zero": 0.21530000000000002,
+      "max": 0.0004
+    },
+    "manufacturer": {
+      "zero": 0.2704,
+      "max": 0.0203
+    }
+  }
+}
